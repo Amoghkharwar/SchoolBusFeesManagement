@@ -1,0 +1,205 @@
+{
+  "app_name": "School Bus Fee Management",
+  "personality": "1 iOS-Native Clean",
+  "personality_one_liner": "A highly readable, trustworthy, and stable financial admin tool that prioritizes clear data hierarchy and functional ease.",
+  "color": {
+    "surface": "#F9FAFB",
+    "onSurface": "#111827",
+    "surfaceSecondary": "#FFFFFF",
+    "onSurfaceSecondary": "#1F2937",
+    "surfaceTertiary": "#F3F4F6",
+    "onSurfaceTertiary": "#374151",
+    "surfaceInverse": "#1F2937",
+    "onSurfaceInverse": "#F9FAFB",
+    "brand": "#2B4C3E",
+    "brandPrimary": "#2B4C3E",
+    "onBrandPrimary": "#FFFFFF",
+    "brandSecondary": "#E1E7E4",
+    "onBrandSecondary": "#2B4C3E",
+    "brandTertiary": "#F2F5F3",
+    "onBrandTertiary": "#2B4C3E",
+    "success": "#059669",
+    "onSuccess": "#FFFFFF",
+    "warning": "#D97706",
+    "onWarning": "#FFFFFF",
+    "error": "#DC2626",
+    "onError": "#FFFFFF",
+    "border": "#E5E7EB",
+    "borderStrong": "#D1D5DB",
+    "divider": "#F3F4F6"
+  },
+  "typography": {
+    "displayFontFamily": "SpaceGrotesk_500Medium",
+    "textFontFamily": "PlusJakartaSans_400Regular",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Generous padding around content. Use standard spacing tokens. Avoid dense dashboard-style layouts.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": "1",
+  "navigation": "bottom_tabs",
+  "icon_set": "Ionicons",
+  "glassmorphism": {
+    "enabled": true,
+    "do's": [
+      "Bottom tab bar when content scrolls behind it",
+      "Sticky headers over scrolling content",
+      "Bottom-sheet headers and drag handles",
+      "Pinned filter rows or segmented controls"
+    ],
+    "dont's": [
+      "Form fields",
+      "Body text regions",
+      "Cards in dense lists"
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Login",
+      "purpose": "Secure entry point for admins.",
+      "states": {
+        "loading": "Centered spinner",
+        "empty": "N/A",
+        "error": "Toast or inline text below input"
+      },
+      "layout": "Hero image at the top (abstract green gradient) with gradient-to-dark scrim. Edge-to-edge section. Inputs in a single column below. Primary CTA sticky at the bottom or below inputs. Forgot Password link below the CTA."
+    },
+    {
+      "name": "Forgot Password",
+      "purpose": "3-step flow (Request OTP, Verify, Reset).",
+      "states": {
+        "loading": "Spinner in CTA",
+        "empty": "N/A",
+        "error": "Inline error message"
+      },
+      "layout": "Clean layout. Step indicator at top. Warning text regarding admin approval for new password prominently displayed in 'warning' color block. Single column inputs. Primary CTA."
+    },
+    {
+      "name": "Dashboard",
+      "purpose": "High-level overview of schools, students, collections, and pending fees.",
+      "states": {
+        "loading": "Skeleton of KPI cards",
+        "empty": "N/A",
+        "error": "Error message with Retry button"
+      },
+      "layout": "Sticky header. 2x2 grid for KPI Cards (Total Schools, Total Students, Total Collected, Total Pending). Cards use `surfaceSecondary`, subtle shadow, icon in a `brandTertiary` circle, large number in Space Grotesk. Below grid, a section for 'Recent Pending Fees' in a horizontal scroll."
+    },
+    {
+      "name": "Schools List",
+      "purpose": "Directory of all managed schools.",
+      "states": {
+        "loading": "List skeleton",
+        "empty": "Empty state illustration + 'No schools added yet' + Add School button",
+        "error": "Error message + Retry"
+      },
+      "layout": "Search bar at top. Vertical list of School Cards. Each card: leading visual (crest or initials avatar), title, subtitle (total students), trailing chevron. FAB at the bottom right to Add School (`brandPrimary` with glass effect)."
+    },
+    {
+      "name": "School Detail",
+      "purpose": "Deep dive into a specific school's fee status.",
+      "states": {
+        "loading": "Skeleton",
+        "empty": "Empty state illustration",
+        "error": "Error message + Retry"
+      },
+      "layout": "Header with school crest and name. Pinned glass segmented tabs: Pending / Completed / Partial. Scrollable vertical list of students beneath. Each student row shows name, status pill, and amount."
+    },
+    {
+      "name": "Students List",
+      "purpose": "Searchable and filterable directory of all students.",
+      "states": {
+        "loading": "List skeleton",
+        "empty": "Empty state illustration",
+        "error": "Error message + Retry"
+      },
+      "layout": "Search bar at top. Horizontal scrollable filter chip row (Pending, Paid, Partial, Standard) pinned below header. Vertical list of Student Rows. Avatar (Initials), Name, Parent Number, Status Pill."
+    },
+    {
+      "name": "Student Detail",
+      "purpose": "View student info, contact parent, and see payment history.",
+      "states": {
+        "loading": "Skeleton",
+        "empty": "N/A",
+        "error": "Error message + Retry"
+      },
+      "layout": "Profile header. Action row with 'Contact Parent' and 'WhatsApp Reminder' buttons (WhatsApp button uses `success` background). Below is a vertical timeline of Payment History. Timeline entries have a left-aligned circular status badge connected by a subtle vertical line, with amount and date on the right. Sticky primary CTA 'Record Payment' at the bottom."
+    },
+    {
+      "name": "Reports",
+      "purpose": "Generate and export financial reports.",
+      "states": {
+        "loading": "N/A",
+        "empty": "N/A",
+        "error": "N/A"
+      },
+      "layout": "Form layout. Dropdown for School selection. Date range picker. Two large action buttons: Primary 'Generate PDF' and Secondary 'Export Excel'."
+    }
+  ],
+  "images": {
+    "auth_hero": {
+      "url": "https://images.unsplash.com/photo-1649861742672-20152f77c1f5?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2NDF8MHwxfHNlYXJjaHwxfHxhYnN0cmFjdCUyMGdyZWVuJTIwZ3JhZGllbnQlMjBmaW5hbmNpYWwlMjBiYWNrZ3JvdW5kfGVufDB8fHx8MTc4MjYyMTA0MHww&ixlib=rb-4.1.0&q=85",
+      "dark": "https://images.unsplash.com/photo-1617957718645-7680362d6312?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2NDF8MHwxfHNlYXJjaHwyfHxhYnN0cmFjdCUyMGdyZWVuJTIwZ3JhZGllbnQlMjBmaW5hbmNpYWwlMjBiYWNrZ3JvdW5kfGVufDB8fHx8MTc4MjYyMTA0MHww&ixlib=rb-4.1.0&q=85",
+      "alt": "Abstract green gradient financial background"
+    },
+    "school_crest_1": {
+      "url": "https://images.unsplash.com/photo-1576497847890-8a825d98b90f?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA2OTV8MHwxfHNlYXJjaHw0fHxzY2hvb2wlMjBjcmVzdCUyMGxvZ28lMjB0cmFuc3BhcmVudHxlbnwwfHx8fDE3ODI2MjEwMjZ8MA&ixlib=rb-4.1.0&q=85",
+      "alt": "School crest logo transparent"
+    },
+    "school_crest_2": {
+      "url": "https://images.unsplash.com/photo-1719067691913-d390fbb06cf9?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA2OTV8MHwxfHNlYXJjaHwxfHxzY2hvb2wlMjBjcmVzdCUyMGxvZ28lMjB0cmFuc3BhcmVudHxlbnwwfHx8fDE3ODI2MjEwMjZ8MA&ixlib=rb-4.1.0&q=85",
+      "alt": "School crest building"
+    },
+    "empty_state_finance": {
+      "url": "https://images.unsplash.com/photo-1706517212966-43695534fe88?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2ODh8MHwxfHNlYXJjaHwxfHxlbXB0eSUyMHN0YXRlJTIwaWxsdXN0cmF0aW9uJTIwZG9jdW1lbnQlMjBmaW5hbmNlfGVufDB8fHx8MTc4MjYyMTAyNXww&ixlib=rb-4.1.0&q=85",
+      "alt": "Empty state illustration document finance"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Strictly follow the 1 iOS-Native Clean personality. Use generous padding and high-contrast typography.",
+    "Implement a light and dark theme toggle. Use the provided surface and brand tokens respectively.",
+    "For WhatsApp Reminder buttons, use the `success` color for the background with the Ionicons 'logo-whatsapp' icon, and implement `Linking.openURL('https://wa.me/...')` with pre-filled message.",
+    "Format all currency figures as INR (₹) using Indian number format (e.g., ₹3,25,000). Use the SpaceGrotesk font for all numeric currency values to ensure tabular readability.",
+    "Payment history timelines must feature a vertical spine line and circular status badges (Green Check for Paid, Amber Clock for Partial, Red X for Pending).",
+    "Always use gradient scrims (transparent to surfaceInverse) over background images like the auth_hero image.",
+    "B2B dashboards require clarity: ensure the KPI cards are highly legible and clearly separated using subtle shadows and clean borders.",
+    "Ensure the Record Payment bottom sheet avoids keyboard overlapping by wrapping it properly."
+  ],
+  "haptics": {
+    "primary_button_press": "impactLight",
+    "tab_switch": "selection",
+    "record_payment_submit": "notificationSuccess",
+    "whatsapp_button_press": "impactMedium",
+    "status_tab_switch": "selection"
+  }
+}

@@ -1,26 +1,30 @@
-# Bus Fee Manager — PRD (Phase 1 enhanced)
+# Bus Fee Manager — PRD (Phase 2 complete)
 
 ## Auth
-- Single admin: `kharwaramog02@gmail.com` / `12345678` (seeded; previous admin removed)
+- Primary admin `kharwaramog02@gmail.com` / `12345678` (protected — cannot be deleted/disabled)
 - Forgot-password OTP via SendGrid (console fallback in dev)
-- JWT (HS256) in AsyncStorage; supports `?token=` query for file downloads
+- JWT (HS256) carries `role`; AsyncStorage; also accepts `?token=` query for downloads
+
+## RBAC
+- **Admin** — every page + every capability
+- **Author** — max **3** accounts; pages: dashboard, students, pending, reports; caps: create/edit/export (no delete, no user management, no archive)
+- **Guest** — unlimited; admin sets per-user page_permissions; no write caps by default
 
 ## Modules
 1. **Schools** CRUD
-2. **Students** CRUD with datetime admission/due dates, FY filter
-3. **Payments** with `next_due_date` (datetime) — drives overdue tracking
-4. **Pending Fees** tab — overdue students with days overdue + last/next dates + WhatsApp
-5. **Dashboard** KPIs + school cards + Financial Year chip selector (FY 2025-2026 / 2026-2027 / 2027-2028)
-6. **Reports** — real PDF (reportlab) + real Excel (.xlsx via openpyxl); FY + school + status + date range filters
-7. **WhatsApp** wa.me deep link reminders
-8. **Skeleton loaders** on Dashboard + Pending screens
+2. **Students** CRUD with datetime admission/due, FY filter
+3. **Payments** with `next_due_date` → drives overdue tracking
+4. **Pending Fees** screen + **Bulk WhatsApp** ("Notify all" sequential wa.me, 2 s rate-limit)
+5. **Dashboard** KPIs + school cards + Financial Year chip selector (Indian Apr–Mar)
+6. **Reports** real PDF (reportlab) + real Excel (.xlsx via openpyxl); FY + school + status + date range filters
+7. **Yearly Archive** — Firebase Storage upload with idempotent restore; auto-fallback to MongoDB when bucket missing
+8. **Users** (admin-only tab) — create / edit / delete / activate-deactivate / reset password / page-permission matrix
+9. **Skeleton loaders** on Dashboard, Pending, Users
 
-## Date / Currency
-- All dates stored as ISO datetime; displayed as `DD/MM/YYYY HH:mm`
-- Currency Indian INR (₹) with Indian grouping
+## Frontend
+- Tabs gated by `page_permissions` + role (Users tab only when role === 'admin')
+- WhatsApp wa.me reminders with Indian INR formatting
 
-## Roadmap (Phase 2)
-- RBAC: Admin / Author (max 3) / Guest (unlimited) + page-permission matrix
-- User Management screen
-- Firebase Storage cloud archive (credentials needed)
-- Custom logo
+## Configuration
+- `/app/backend/.env`: `FIREBASE_CREDENTIALS_PATH`, `FIREBASE_BUCKET`
+- Firebase Storage bucket `fees-management-app-d0025.firebasestorage.app` — user must enable Storage in Firebase Console for cloud archive to engage; otherwise MongoDB fallback used silently with warning field.

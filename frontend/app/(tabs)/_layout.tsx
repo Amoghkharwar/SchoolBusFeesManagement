@@ -1,9 +1,15 @@
 import { Tabs } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '@/src/theme';
+import { useAuth } from '@/src/auth';
 
 export default function TabsLayout() {
   const { palette } = useTheme();
+  const { admin } = useAuth();
+  const perms = admin?.page_permissions || ['dashboard', 'schools', 'students', 'pending', 'reports', 'users'];
+  const can = (key: string) => perms.includes(key);
+  const isAdmin = admin?.role === 'admin';
+
   return (
     <Tabs
       screenOptions={{
@@ -24,6 +30,7 @@ export default function TabsLayout() {
         name="dashboard"
         options={{
           title: 'Dashboard',
+          href: can('dashboard') ? undefined : null,
           tabBarIcon: ({ color, size }) => <Ionicons name="grid" size={size} color={color} />,
         }}
       />
@@ -31,6 +38,7 @@ export default function TabsLayout() {
         name="schools"
         options={{
           title: 'Schools',
+          href: can('schools') ? undefined : null,
           tabBarIcon: ({ color, size }) => <Ionicons name="business" size={size} color={color} />,
         }}
       />
@@ -38,6 +46,7 @@ export default function TabsLayout() {
         name="students"
         options={{
           title: 'Students',
+          href: can('students') ? undefined : null,
           tabBarIcon: ({ color, size }) => <Ionicons name="people" size={size} color={color} />,
         }}
       />
@@ -45,6 +54,7 @@ export default function TabsLayout() {
         name="pending"
         options={{
           title: 'Pending',
+          href: can('pending') ? undefined : null,
           tabBarIcon: ({ color, size }) => <Ionicons name="alert-circle" size={size} color={color} />,
         }}
       />
@@ -52,7 +62,16 @@ export default function TabsLayout() {
         name="reports"
         options={{
           title: 'Reports',
+          href: can('reports') ? undefined : null,
           tabBarIcon: ({ color, size }) => <Ionicons name="document-text" size={size} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="users"
+        options={{
+          title: 'Users',
+          href: isAdmin ? undefined : null,
+          tabBarIcon: ({ color, size }) => <Ionicons name="person-circle" size={size} color={color} />,
         }}
       />
     </Tabs>

@@ -3,9 +3,9 @@ import { Linking, Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { apiFetch, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
+import { apiFetch, API_BASE, TOKEN_STORAGE_KEY, useAuth } from '@/src/auth';
 import { useFY } from '@/src/fy';
-import { useTheme, spacing, fontSize } from '@/src/theme';
+import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { Button, Card, TextField } from '@/src/components/ui';
 
 interface School { id: string; name: string }
@@ -13,6 +13,8 @@ interface School { id: string; name: string }
 export default function Reports() {
   const { palette } = useTheme();
   const { current: fy } = useFY();
+  const { admin } = useAuth();
+  const isAdmin = admin?.role === 'admin';
   const [schools, setSchools] = useState<School[]>([]);
   const [schoolId, setSchoolId] = useState<string>('');
   const [status, setStatus] = useState<string>('all');
@@ -20,6 +22,27 @@ export default function Reports() {
   const [end, setEnd] = useState('');
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState<'pdf' | 'excel' | null>(null);
+  const [archiveMsg, setArchiveMsg] = useState('');
+  const [archiveBusy, setArchiveBusy] = useState<'backup' | 'restore' | null>(null);
+
+  const doArchive = async (action: 'backup' | 'restore') => {
+    if (!fy) { setArchiveMsg('Select a financial year on Dashboard first.'); return; }
+    setArchiveBusy(action);
+    setArchiveMsg('');
+    try {
+      const res: any = await apiFetch(`/archive/${action}?fy=${encodeURIComponent(fy)}`, { method: 'POST' });
+      const where = res.stored_in === 'firebase' ? 'Firebase Storage' : 'local MongoDB';
+      if (action === 'backup') {
+        setArchiveMsg(`Backup saved to ${where}: ${res.counts.schools} schools, ${res.counts.students} students, ${res.counts.payments} payments.${res.warning ? ' (Firebase fallback — bucket not enabled)' : ''}`);
+      } else {
+        setArchiveMsg(`Restore complete: ${res.restored.schools} schools, ${res.restored.students} students, ${res.restored.payments} payments.`);
+      }
+    } catch (e: any) {
+      setArchiveMsg(`Error: ${e.message}`);
+    } finally {
+      setArchiveBusy(null);
+    }
+  };
 
   useEffect(() => {
     apiFetch<School[]>('/schools').then(setSchools).catch(() => {});
@@ -129,6 +152,38 @@ export default function Reports() {
         {msg ? (
           <Text style={{ color: msg.startsWith('Error') ? palette.error : palette.success, marginTop: spacing.md, textAlign: 'center' }} testID="report-msg">{msg}</Text>
         ) : null}
+
+        {isAdmin && (
+          <>
+            <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginTop: spacing.xxl, marginBottom: spacing.md }}>
+              Yearly Archive
+            </Text>
+            <Card>
+              <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: spacing.md }}>
+                Backup the selected financial year ({fy || 'pick one on Dashboard'}) to Firebase Storage (with MongoDB fallback). Restore re-imports records idempotently — no duplicates.
+              </Text>
+              <Button
+                title={archiveBusy === 'backup' ? 'Backing up…' : `Backup ${fy || 'current FY'}`}
+                icon="cloud-upload"
+                onPress={() => doArchive('backup')}
+                loading={archiveBusy === 'backup'}
+                testID="archive-backup"
+              />
+              <View style={{ height: spacing.sm }} />
+              <Button
+                title={archiveBusy === 'restore' ? 'Restoring…' : `Restore ${fy || 'current FY'}`}
+                icon="cloud-download"
+                variant="secondary"
+                onPress={() => doArchive('restore')}
+                loading={archiveBusy === 'restore'}
+                testID="archive-restore"
+              />
+              {archiveMsg ? (
+                <Text style={{ color: archiveMsg.startsWith('Error') ? palette.error : palette.success, marginTop: spacing.md, fontSize: fontSize.sm }} testID="archive-msg">{archiveMsg}</Text>
+              ) : null}
+            </Card>
+          </>
+        )}
       </ScrollView>
     </SafeAreaView>
   );

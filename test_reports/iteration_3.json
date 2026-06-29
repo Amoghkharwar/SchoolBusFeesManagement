@@ -1,0 +1,36 @@
+{
+  "summary": "Phase 2 testing complete. ALL 22 new backend tests PASS plus 22 Phase 1 regression tests still PASS (44/44 total). Coverage: /api/auth/me returns role+status+page_permissions+capabilities (admin caps include manage_users/archive/delete/export); /api/users/roles returns {roles:[admin,author,guest], default_permissions, all_pages, max_authors:3}; /api/users CRUD works as admin; guest creation has NO limit (4 guests created OK); author creation capped — 3 succeed, 4th returns 400 'Maximum 3 Author users are allowed.'; primary admin (kharwaramog02@gmail.com) protected — cannot change role (400), cannot deactivate (400), cannot delete (400); PUT updates partial fields incl. page_permissions; DELETE works for non-admin and verified via list; /api/users/{id}/reset-password updates hash (new pwd logs in, old pwd 401); Author token cannot GET /api/users (403); Guest token also 403; Author cannot POST /api/archive/backup or GET /api/archive/status (403); Author /auth/me returns role=author with create/edit/export=true, delete/manage_users/archive=false; /api/whatsapp/bulk-pending?fy=... returns {count, items[]} each item has phone+pending_amount+overdue_days+parent_name+student_name+school_name+next_due_date; /api/archive/status returns firebase_ready+bucket+archives[]; /api/archive/backup?fy=2026-2027 returns 200 with stored_in='mongodb-local' (Firebase bucket not enabled → warning field has 'The specified bucket does not exist'), counts.schools matches /api/schools count; /api/archive/restore is idempotent (no duplicate students after two restores). Frontend (Expo web, mobile 390x844) verified: Admin login → Dashboard renders, bottom nav shows 6 tabs (Dashboard, Schools, Students, Pending, Reports, Users). Users tab opens User Management screen showing admin self with role badge + 'Edit'/'Deactivate' buttons and '1 total · 0/3 authors used' counter. Tapping FAB opens 'Add user' modal with TextFields, Admin/Author/Guest role chips, and Dashboard/Schools/Students/Pending/Reports/Users permission chips. Filling form (Full Name, Email, Password) + selecting Guest role + Create User successfully creates the user (counter became '2 total', new row visible in list). Pending tab loads without crash (bulk-whatsapp-btn correctly hidden when no overdue exist in selected FY — expected behavior). Reports tab shows new 'Yearly Archive' section with Backup/Restore buttons; tapping Backup 2026-2027 returns success message 'Backup saved to local MongoDB: 2 schools, 0 students, 0 payments. (Firebase fallback — bucket not enabled)'. Logging in as Author user shows tabs [Dashboard, Students, Pending, Reports] — Users tab correctly hidden, Schools tab also hidden (author default_permissions don't include schools, which matches ROLE_DEFAULT_PERMS in server.py line 52). No red screens, no console errors. RBAC, max-author cap, primary-admin protection, archive Firebase fallback, and capability-based UI all working as specified.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_phase2_rbac_archive.py",
+    "/app/backend/tests/test_busfee_api.py",
+    "/app/test_reports/pytest/phase2_results.xml"
+  ],
+  "action_items": [
+    "(Optional, low priority) Author role's default_permissions in ROLE_DEFAULT_PERMS does NOT include 'schools', so Author users see only Dashboard/Students/Pending/Reports tabs. If the product intent was that authors should manage school records too (since they have create/edit caps), add 'schools' to ROLE_AUTHOR default_permissions in server.py line 52. Current behavior matches the code spec exactly — flagging only because the review request said 'Dashboard/Students/Pending/Reports remain accessible' which is what we observed, so this is intentional.",
+    "(Optional, code-review) server.py is now 1227 lines — past the 700-line guideline. Recommend splitting into auth.py / users.py / archive.py / whatsapp.py / reports.py routers.",
+    "(Optional) /api/archive/backup catches firebase upload exceptions correctly but logs WARNING-level only; consider returning a structured warning code (e.g. 'bucket_not_found') alongside the message so frontend can show a more helpful CTA to enable the bucket."
+  ],
+  "critical_code_review_comments": [
+    "server.py file size grew from ~880 to 1227 lines this iteration — split into modules.",
+    "/api/users uses count_documents inside transactional create — small race condition possible (two simultaneous POSTs could both pass the count check and create a 4th author). For production, replace with a unique-counter pattern or a Mongo transaction. Not blocking — admin-only endpoint with low concurrency.",
+    "Firebase bucket exception in archive_backup is caught and logged, but the broad `except Exception` could mask credential errors too. Acceptable for now since storage_url=None is returned.",
+    "/api/whatsapp/bulk-pending iterates ALL students sequentially calling student_to_out (per-row DB queries). Will be slow once student count > a few hundred. Consider an aggregation pipeline.",
+    "ROLE_DEFAULT_PERMS for 'author' omits 'schools' — verify with product owner whether this is intentional (current code is consistent with spec, but UX might confuse authors)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_phase2_rbac_archive.py (new — 22 Phase 2 tests)"
+  ],
+  "success_rate": {"backend": "100% (44/44 — 22 Phase 1 + 22 Phase 2)", "frontend": "100% (login, 6-tab nav incl Users admin-only, Add user modal+role+perm chips, guest creation persists, Pending bulk btn conditional render, Reports Yearly Archive Backup with Mongo fallback message, Author login hides Users tab)"},
+  "seed_data_creation": "Test fixtures auto-clean TEST_/test_/uitest_/uiauthor_ prefixed users via cleanup fixture and post-test page.request.delete loop. No persistent test data remains.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Pydantic EmailStr rejects .test TLD — use @busfeetest.com for synthetic emails. Backend has 3 archive endpoints: /api/archive/status (GET), /api/archive/backup?fy=X (POST), /api/archive/restore?fy=X (POST) — all require 'archive' capability (admin only). Firebase bucket 'fees-management-app-d0025.firebasestorage.app' is NOT enabled in console so backup falls back to mongodb-local with warning field containing 'The specified bucket does not exist'. Bulk WhatsApp button only renders when overdue students exist for the selected FY — to test the click flow, create a student with past due_date in the desired FY first. Author role's default_permissions excludes 'schools' (intentional per current ROLE_DEFAULT_PERMS). Use [data-testid=\"login-submit-button\"] for login button, [data-testid=\"add-user-fab\"] for Users tab FAB, [data-testid=\"user-role-{role}\"] for role chips. TextField testID maps directly to <input data-testid=...> in web — page.fill('[data-testid=\"user-fullname\"]', ...) works directly.",
+  "rca_of_issue": "No bugs found. The only issue encountered during test authoring was Pydantic v2 EmailStr rejecting .test TLD (reserved per RFC 2606) — fixed by switching test emails to @busfeetest.com domain."
+}

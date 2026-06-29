@@ -57,10 +57,34 @@ export default function PendingFees() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <View style={{ paddingHorizontal: spacing.lg, paddingVertical: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-        <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface }} testID="pending-title">Pending Fees</Text>
-        <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4 }}>
-          {fy ? `Financial Year ${fy} · ` : ''}{items.length} student{items.length === 1 ? '' : 's'} overdue
-        </Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+          <View style={{ flex: 1 }}>
+            <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface }} testID="pending-title">Pending Fees</Text>
+            <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4 }}>
+              {fy ? `Financial Year ${fy} · ` : ''}{items.length} student{items.length === 1 ? '' : 's'} overdue
+            </Text>
+          </View>
+          {items.length > 0 && (
+            <Pressable
+              testID="bulk-whatsapp-btn"
+              onPress={async () => {
+                for (const it of items) {
+                  await openWhatsApp(it.parent_mobile, reminderMessage({
+                    studentName: it.name, school: it.school_name,
+                    pending: it.pending_amount,
+                    dueDate: it.next_due_date || it.due_date || '',
+                  }));
+                  // 2-second rate-limit between sends
+                  await new Promise((r) => setTimeout(r, 2000));
+                }
+              }}
+              style={{ backgroundColor: '#25D366', paddingHorizontal: 12, paddingVertical: 10, borderRadius: radii.md, flexDirection: 'row', alignItems: 'center' }}
+            >
+              <Ionicons name="logo-whatsapp" size={16} color="#fff" />
+              <Text style={{ color: '#fff', fontWeight: '700', marginLeft: 6, fontSize: fontSize.sm }}>Notify all</Text>
+            </Pressable>
+          )}
+        </View>
       </View>
 
       {loading ? (

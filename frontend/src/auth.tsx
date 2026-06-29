@@ -10,8 +10,16 @@ const API = `${BACKEND}/api`;
 const TOKEN_KEY = 'busfee:token';
 
 export interface AdminMe {
+  id?: string;
   email: string;
+  full_name?: string;
+  mobile?: string;
+  role?: 'admin' | 'author' | 'guest';
+  status?: string;
+  page_permissions?: string[];
+  capabilities?: Record<string, boolean>;
   created_at?: string;
+  last_login?: string;
 }
 
 interface AuthCtx {
@@ -68,7 +76,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const j = await res.json();
     await AsyncStorage.setItem(TOKEN_KEY, j.token);
     setToken(j.token);
-    setAdmin({ email: j.email });
+    // fetch full me right after login so role/permissions are available
+    try {
+      const meRes = await fetch(`${API}/auth/me`, { headers: { Authorization: `Bearer ${j.token}` } });
+      if (meRes.ok) setAdmin(await meRes.json());
+      else setAdmin({ email: j.email });
+    } catch {
+      setAdmin({ email: j.email });
+    }
   }, []);
 
   const logout = useCallback(async () => {

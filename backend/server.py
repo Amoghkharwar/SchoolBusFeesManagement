@@ -33,11 +33,52 @@ SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "noreply@busfee.app")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "kharwaramog02@gmail.com")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "12345678")
 
+FIREBASE_CREDENTIALS_PATH = os.environ.get("FIREBASE_CREDENTIALS_PATH", "")
+FIREBASE_BUCKET = os.environ.get("FIREBASE_BUCKET", "")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("busfee")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
+
+# ---------- Roles & Permissions ----------
+ROLE_ADMIN = "admin"
+ROLE_AUTHOR = "author"
+ROLE_GUEST = "guest"
+ALL_PAGES = ["dashboard", "schools", "students", "pending", "reports", "users"]
+ROLE_DEFAULT_PERMS: Dict[str, List[str]] = {
+    ROLE_ADMIN: ALL_PAGES,
+    ROLE_AUTHOR: ["dashboard", "students", "pending", "reports"],
+    ROLE_GUEST: ["dashboard"],  # admin can override per user
+}
+# Action permissions
+ROLE_CAPS: Dict[str, Dict[str, bool]] = {
+    ROLE_ADMIN: {"create": True, "edit": True, "delete": True, "export": True, "manage_users": True, "archive": True},
+    ROLE_AUTHOR: {"create": True, "edit": True, "delete": False, "export": True, "manage_users": False, "archive": False},
+    ROLE_GUEST: {"create": False, "edit": False, "delete": False, "export": False, "manage_users": False, "archive": False},
+}
+MAX_AUTHORS = 3
+
+# Firebase Storage lazy init
+_firebase_bucket = None
+def _get_bucket():
+    global _firebase_bucket
+    if _firebase_bucket is not None:
+        return _firebase_bucket
+    if not FIREBASE_CREDENTIALS_PATH or not os.path.exists(FIREBASE_CREDENTIALS_PATH) or not FIREBASE_BUCKET:
+        return None
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, storage as fb_storage
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+            firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_BUCKET})
+        _firebase_bucket = fb_storage.bucket()
+        return _firebase_bucket
+    except Exception as e:
+        logger.error(f"Firebase init failed: {e}")
+        return None
 
 app = FastAPI(title="School Bus Fee Management API")
 api = APIRouter(prefix="/api")
@@ -56,10 +97,11 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-def make_token(email: str) -> str:
+def make_token(email: str, role: str = ROLE_ADMIN) -> str:
     return jwt.encode(
         {
             "sub": email,
+            "role": role,
             "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
             "iat": datetime.now(timezone.utc),
         },
@@ -77,10 +119,12 @@ async def _admin_from_token(token: str) -> Dict[str, Any]:
         payload = decode_token(token)
     except jwt.PyJWTError:
         raise HTTPException(401, "Invalid token")
-    admin = await db.admins.find_one({"email": payload.get("sub")}, {"_id": 0, "password_hash": 0})
-    if not admin:
-        raise HTTPException(401, "Admin not found")
-    return admin
+    user = await db.users.find_one({"email": payload.get("sub")}, {"_id": 0, "password_hash": 0})
+    if not user:
+        raise HTTPException(401, "User not found")
+    if user.get("status") and user["status"] != "active":
+        raise HTTPException(403, "User inactive")
+    return user
 
 
 async def get_current_admin(
@@ -92,6 +136,23 @@ async def get_current_admin(
     if not raw:
         raise HTTPException(401, "Missing token")
     return await _admin_from_token(raw)
+
+
+def require_role(*roles: str):
+    async def dep(user=Depends(get_current_admin)):
+        if user.get("role") not in roles:
+            raise HTTPException(403, "Insufficient permissions")
+        return user
+    return dep
+
+
+def require_cap(cap: str):
+    async def dep(user=Depends(get_current_admin)):
+        caps = ROLE_CAPS.get(user.get("role", ""), {})
+        if not caps.get(cap):
+            raise HTTPException(403, f"Action '{cap}' not allowed for your role")
+        return user
+    return dep
 
 
 def gen_otp() -> str:
@@ -259,20 +320,56 @@ async def student_to_out(doc: Dict[str, Any]) -> Dict[str, Any]:
 # ---------- Startup ----------
 @app.on_event("startup")
 async def startup() -> None:
-    await db.admins.create_index("email", unique=True)
+    await db.users.create_index("email", unique=True)
     await db.schools.create_index("id", unique=True)
     await db.students.create_index("id", unique=True)
     await db.payments.create_index("id", unique=True)
     await db.password_resets.create_index("email")
+    await db.archives.create_index("fy", unique=True)
 
-    # ONLY one admin: kharwaramog02@gmail.com.  Remove any previous seeded admins.
-    await db.admins.delete_many({"email": {"$ne": ADMIN_EMAIL}})
-    existing = await db.admins.find_one({"email": ADMIN_EMAIL})
-    if not existing:
-        await db.admins.insert_one(
-            {"email": ADMIN_EMAIL, "password_hash": hash_password(ADMIN_PASSWORD), "created_at": now_iso()}
+    # Migrate old admins → users
+    async for old in db.admins.find({}):
+        await db.users.update_one(
+            {"email": old["email"]},
+            {"$setOnInsert": {
+                "id": str(uuid.uuid4()),
+                "email": old["email"],
+                "password_hash": old["password_hash"],
+                "full_name": old.get("email", "").split("@")[0].title(),
+                "mobile": "",
+                "role": ROLE_ADMIN,
+                "status": "active",
+                "page_permissions": ALL_PAGES,
+                "created_at": old.get("created_at", now_iso()),
+                "last_login": None,
+            }},
+            upsert=True,
         )
+    await db.admins.drop()
+
+    # Enforce single admin = ADMIN_EMAIL.  Remove any users that aren't ADMIN_EMAIL and have role admin without legit reason.
+    # Seed admin if missing
+    existing = await db.users.find_one({"email": ADMIN_EMAIL})
+    if not existing:
+        await db.users.insert_one({
+            "id": str(uuid.uuid4()),
+            "email": ADMIN_EMAIL,
+            "password_hash": hash_password(ADMIN_PASSWORD),
+            "full_name": "Bus Fee Admin",
+            "mobile": "",
+            "role": ROLE_ADMIN,
+            "status": "active",
+            "page_permissions": ALL_PAGES,
+            "created_at": now_iso(),
+            "last_login": None,
+        })
         logger.info(f"Seeded admin: {ADMIN_EMAIL}")
+    else:
+        # ensure admin is active + has full perms
+        await db.users.update_one(
+            {"email": ADMIN_EMAIL},
+            {"$set": {"role": ROLE_ADMIN, "status": "active", "page_permissions": ALL_PAGES}},
+        )
 
     if await db.schools.count_documents({}) == 0:
         sample_schools = [
@@ -291,21 +388,28 @@ async def shutdown() -> None:
 # ---------- Auth ----------
 @api.post("/auth/login", response_model=TokenOut)
 async def login(body: LoginIn):
-    admin = await db.admins.find_one({"email": body.email})
-    if not admin or not verify_password(body.password, admin["password_hash"]):
+    user = await db.users.find_one({"email": body.email})
+    if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(401, "Invalid email or password")
-    return TokenOut(token=make_token(body.email), email=body.email)
+    if user.get("status") and user["status"] != "active":
+        raise HTTPException(403, "User is inactive")
+    await db.users.update_one({"email": body.email}, {"$set": {"last_login": now_iso()}})
+    return TokenOut(token=make_token(body.email, user.get("role", ROLE_ADMIN)), email=body.email)
 
 
 @api.get("/auth/me")
-async def me(admin=Depends(get_current_admin)):
-    return admin
+async def me(user=Depends(get_current_admin)):
+    role = user.get("role", ROLE_ADMIN)
+    return {
+        **{k: v for k, v in user.items() if k != "password_hash"},
+        "capabilities": ROLE_CAPS.get(role, {}),
+    }
 
 
 @api.post("/auth/forgot-password")
 async def forgot_password(body: ForgotIn):
-    admin = await db.admins.find_one({"email": body.email})
-    if admin:
+    user = await db.users.find_one({"email": body.email})
+    if user:
         otp = gen_otp()
         await db.password_resets.update_one(
             {"email": body.email},
@@ -342,7 +446,7 @@ async def verify_reset(body: VerifyResetIn):
         raise HTTPException(400, "OTP expired")
     if len(body.new_password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
-    await db.admins.update_one({"email": body.email}, {"$set": {"password_hash": hash_password(body.new_password)}})
+    await db.users.update_one({"email": body.email}, {"$set": {"password_hash": hash_password(body.new_password)}})
     await db.password_resets.update_one({"email": body.email}, {"$set": {"consumed": True}})
     return {"ok": True, "message": "Password approved and updated."}
 
@@ -858,6 +962,251 @@ async def report_html(
     <tbody>{''.join(body_rows) or '<tr><td colspan=8>No records</td></tr>'}</tbody></table>
     <div class='tot'><b>Total Yearly:</b> {_format_inr(total_y)} &nbsp; <b>Total Collected:</b> {_format_inr(total_p)} &nbsp; <b>Total Pending:</b> {_format_inr(total_pend)}</div>
     </body></html>"""
+
+
+# ---------- User Management (Admin only) ----------
+class UserIn(BaseModel):
+    full_name: str
+    email: EmailStr
+    mobile: Optional[str] = ""
+    password: str
+    role: str = ROLE_GUEST
+    status: str = "active"
+    page_permissions: Optional[List[str]] = None
+
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = None
+    mobile: Optional[str] = None
+    role: Optional[str] = None
+    status: Optional[str] = None
+    page_permissions: Optional[List[str]] = None
+
+
+class PasswordResetByAdmin(BaseModel):
+    new_password: str
+
+
+def _user_to_out(u: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in u.items() if k not in ("_id", "password_hash")}
+
+
+@api.get("/users")
+async def list_users(_=Depends(require_cap("manage_users"))):
+    docs = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(1000)
+    return docs
+
+
+@api.get("/users/roles")
+async def role_info(_=Depends(require_cap("manage_users"))):
+    return {
+        "roles": [ROLE_ADMIN, ROLE_AUTHOR, ROLE_GUEST],
+        "default_permissions": ROLE_DEFAULT_PERMS,
+        "all_pages": ALL_PAGES,
+        "max_authors": MAX_AUTHORS,
+    }
+
+
+@api.post("/users")
+async def create_user(body: UserIn, _=Depends(require_cap("manage_users"))):
+    if body.role not in (ROLE_ADMIN, ROLE_AUTHOR, ROLE_GUEST):
+        raise HTTPException(400, "Invalid role")
+    if body.role == ROLE_AUTHOR:
+        count = await db.users.count_documents({"role": ROLE_AUTHOR})
+        if count >= MAX_AUTHORS:
+            raise HTTPException(400, f"Maximum {MAX_AUTHORS} Author users are allowed.")
+    existing = await db.users.find_one({"email": body.email})
+    if existing:
+        raise HTTPException(400, "Email already registered")
+    perms = body.page_permissions if body.page_permissions is not None else ROLE_DEFAULT_PERMS.get(body.role, [])
+    doc = {
+        "id": str(uuid.uuid4()),
+        "email": body.email,
+        "full_name": body.full_name,
+        "mobile": body.mobile or "",
+        "password_hash": hash_password(body.password),
+        "role": body.role,
+        "status": body.status if body.status in ("active", "inactive") else "active",
+        "page_permissions": perms,
+        "created_at": now_iso(),
+        "last_login": None,
+    }
+    await db.users.insert_one(dict(doc))
+    return _user_to_out(doc)
+
+
+@api.put("/users/{user_id}")
+async def update_user(user_id: str, body: UserUpdate, admin=Depends(require_cap("manage_users"))):
+    target = await db.users.find_one({"id": user_id})
+    if not target:
+        raise HTTPException(404, "User not found")
+    updates: Dict[str, Any] = {}
+    if body.full_name is not None:
+        updates["full_name"] = body.full_name
+    if body.mobile is not None:
+        updates["mobile"] = body.mobile
+    if body.role is not None:
+        if body.role not in (ROLE_ADMIN, ROLE_AUTHOR, ROLE_GUEST):
+            raise HTTPException(400, "Invalid role")
+        if body.role == ROLE_AUTHOR and target.get("role") != ROLE_AUTHOR:
+            count = await db.users.count_documents({"role": ROLE_AUTHOR})
+            if count >= MAX_AUTHORS:
+                raise HTTPException(400, f"Maximum {MAX_AUTHORS} Author users are allowed.")
+        if target["email"] == ADMIN_EMAIL and body.role != ROLE_ADMIN:
+            raise HTTPException(400, "Cannot change role of the primary admin")
+        updates["role"] = body.role
+        if body.page_permissions is None:
+            updates["page_permissions"] = ROLE_DEFAULT_PERMS.get(body.role, [])
+    if body.status is not None:
+        if target["email"] == ADMIN_EMAIL and body.status != "active":
+            raise HTTPException(400, "Cannot deactivate primary admin")
+        updates["status"] = body.status
+    if body.page_permissions is not None:
+        updates["page_permissions"] = body.page_permissions
+    if updates:
+        await db.users.update_one({"id": user_id}, {"$set": updates})
+    doc = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    return doc
+
+
+@api.delete("/users/{user_id}")
+async def delete_user(user_id: str, admin=Depends(require_cap("manage_users"))):
+    target = await db.users.find_one({"id": user_id})
+    if not target:
+        raise HTTPException(404, "User not found")
+    if target["email"] == ADMIN_EMAIL:
+        raise HTTPException(400, "Cannot delete primary admin")
+    await db.users.delete_one({"id": user_id})
+    return {"ok": True}
+
+
+@api.post("/users/{user_id}/reset-password")
+async def admin_reset_password(user_id: str, body: PasswordResetByAdmin, _=Depends(require_cap("manage_users"))):
+    if len(body.new_password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    target = await db.users.find_one({"id": user_id})
+    if not target:
+        raise HTTPException(404, "User not found")
+    await db.users.update_one({"id": user_id}, {"$set": {"password_hash": hash_password(body.new_password)}})
+    return {"ok": True}
+
+
+# ---------- Bulk WhatsApp ----------
+@api.get("/whatsapp/bulk-pending")
+async def bulk_pending(fy: Optional[str] = None, admin=Depends(get_current_admin)):
+    """Build a list of {phone, message} entries for all overdue students. Client opens wa.me sequentially with delay."""
+    docs = await db.students.find({}, {"_id": 0}).to_list(10000)
+    if fy:
+        docs = [d for d in docs if _in_fy(d.get("admission_date"), fy)]
+    out = []
+    today = datetime.now(timezone.utc)
+    for d in docs:
+        full = await student_to_out(d)
+        if full["status"] == "completed":
+            continue
+        nd = _parse_dt(full.get("next_due_date") or full.get("due_date"))
+        if not nd or nd > today:
+            continue
+        out.append({
+            "student_id": full["id"],
+            "student_name": full["name"],
+            "school_name": full["school_name"],
+            "parent_name": full["parent_name"],
+            "phone": full["parent_mobile"],
+            "pending_amount": full["pending_amount"],
+            "next_due_date": full.get("next_due_date") or full.get("due_date"),
+            "overdue_days": full["overdue_days"],
+        })
+    return {"count": len(out), "items": out}
+
+
+# ---------- Archive (Firebase Storage) ----------
+@api.get("/archive/status")
+async def archive_status(_=Depends(require_cap("archive"))):
+    bucket = _get_bucket()
+    archives = await db.archives.find({}, {"_id": 0}).to_list(100)
+    return {
+        "firebase_ready": bucket is not None,
+        "bucket": FIREBASE_BUCKET if bucket is not None else None,
+        "archives": archives,
+    }
+
+
+@api.post("/archive/backup")
+async def archive_backup(fy: str = Query(..., description="Financial year label e.g. 2026-2027"), _=Depends(require_cap("archive"))):
+    import json as _json
+    bucket = _get_bucket()
+    schools = await db.schools.find({}, {"_id": 0}).to_list(10000)
+    students = await db.students.find({}, {"_id": 0}).to_list(50000)
+    students = [s for s in students if _in_fy(s.get("admission_date"), fy)]
+    sids = [s["id"] for s in students]
+    payments = await db.payments.find({"student_id": {"$in": sids}}, {"_id": 0}).to_list(100000) if sids else []
+    payments = [p for p in payments if _in_fy(p.get("payment_date"), fy)]
+    snapshot = {
+        "fy": fy,
+        "exported_at": now_iso(),
+        "schools": schools,
+        "students": students,
+        "payments": payments,
+        "counts": {"schools": len(schools), "students": len(students), "payments": len(payments)},
+    }
+    payload = _json.dumps(snapshot, default=str).encode("utf-8")
+    storage_url = None
+    storage_error: Optional[str] = None
+    if bucket is not None:
+        try:
+            blob = bucket.blob(f"archives/busfee-{fy}.json")
+            blob.upload_from_string(payload, content_type="application/json")
+            try:
+                storage_url = blob.public_url
+            except Exception:
+                storage_url = f"gs://{FIREBASE_BUCKET}/archives/busfee-{fy}.json"
+        except Exception as exc:
+            storage_error = str(exc).splitlines()[0][:200]
+            logger.warning(f"Firebase upload failed, falling back to MongoDB: {storage_error}")
+    await db.archives.update_one(
+        {"fy": fy},
+        {"$set": {
+            "fy": fy, "exported_at": snapshot["exported_at"],
+            "counts": snapshot["counts"], "storage_url": storage_url,
+            "size_bytes": len(payload),
+            "local_snapshot": snapshot if storage_url is None else None,
+        }},
+        upsert=True,
+    )
+    return {
+        "ok": True, "fy": fy, "counts": snapshot["counts"], "storage_url": storage_url,
+        "stored_in": "firebase" if storage_url else "mongodb-local",
+        "warning": storage_error,
+    }
+
+
+@api.post("/archive/restore")
+async def archive_restore(fy: str = Query(...), _=Depends(require_cap("archive"))):
+    import json as _json
+    bucket = _get_bucket()
+    arch = await db.archives.find_one({"fy": fy}, {"_id": 0})
+    if not arch:
+        raise HTTPException(404, "No archive recorded for that FY")
+    snapshot = None
+    if bucket is not None and arch.get("storage_url"):
+        blob = bucket.blob(f"archives/busfee-{fy}.json")
+        if blob.exists():
+            data = blob.download_as_bytes()
+            snapshot = _json.loads(data.decode("utf-8"))
+    if snapshot is None:
+        snapshot = arch.get("local_snapshot")
+    if not snapshot:
+        raise HTTPException(404, "Archive payload not available")
+
+    # idempotent restore: upsert by id, do not duplicate
+    for s in snapshot.get("schools", []):
+        await db.schools.update_one({"id": s["id"]}, {"$set": s}, upsert=True)
+    for st in snapshot.get("students", []):
+        await db.students.update_one({"id": st["id"]}, {"$set": st}, upsert=True)
+    for p in snapshot.get("payments", []):
+        await db.payments.update_one({"id": p["id"]}, {"$set": p}, upsert=True)
+    return {"ok": True, "fy": fy, "restored": snapshot.get("counts", {})}
 
 
 # ---------- Health ----------

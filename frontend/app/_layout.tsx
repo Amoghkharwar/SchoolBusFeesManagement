@@ -1,20 +1,44 @@
-import { Stack } from "expo-router";
-import * as SplashScreen from "expo-splash-screen";
-import { useEffect } from "react";
-import { LogBox } from "react-native";
+import { Stack, useRouter, useSegments } from 'expo-router';
+import * as SplashScreen from 'expo-splash-screen';
+import { useEffect } from 'react';
+import { LogBox, View } from 'react-native';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
-import { useIconFonts } from "@/src/hooks/use-icon-fonts";
+import { useIconFonts } from '@/src/hooks/use-icon-fonts';
+import { ThemeProvider, useTheme } from '@/src/theme';
+import { AuthProvider, useAuth } from '@/src/auth';
 
-
-// Disable logbox errors etc so that users can see the app
-// and agent works as expected.
-LogBox.ignoreAllLogs(true)
-
-// Keep the native splash visible from cold start until icon fonts register.
-// Required because @expo/vector-icons' componentDidMount fallback fires
-// Font.loadAsync against a broken vendor path if any <Icon> mounts before
-// the family is registered — which throws on Android Expo Go.
+LogBox.ignoreAllLogs(true);
 SplashScreen.preventAutoHideAsync();
+
+function AuthGuard({ children }: { children: React.ReactNode }) {
+  const { token, loading } = useAuth();
+  const segments = useSegments();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (loading) return;
+    const inAuth = segments[0] === '(auth)';
+    if (!token && !inAuth) router.replace('/(auth)/login');
+    else if (token && inAuth) router.replace('/(tabs)/dashboard');
+  }, [token, loading, segments, router]);
+
+  return <>{children}</>;
+}
+
+function RootInner() {
+  const { palette } = useTheme();
+  return (
+    <View style={{ flex: 1, backgroundColor: palette.surface }}>
+      <AuthProvider>
+        <AuthGuard>
+          <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: palette.surface } }} />
+        </AuthGuard>
+      </AuthProvider>
+    </View>
+  );
+}
 
 export default function RootLayout() {
   const [loaded, error] = useIconFonts();
@@ -25,9 +49,15 @@ export default function RootLayout() {
     }
   }, [loaded, error]);
 
-  // If the CDN is unreachable we fall through on error rather than wedging
-  // the app — icons will tofu, but the app still boots.
   if (!loaded && !error) return null;
 
-  return <Stack screenOptions={{ headerShown: false }} />;
+  return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
+        <ThemeProvider>
+          <RootInner />
+        </ThemeProvider>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
+  );
 }

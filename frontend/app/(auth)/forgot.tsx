@@ -19,7 +19,7 @@ type Step = 'request' | 'verify';
 export default function Forgot() {
   const { palette } = useTheme();
   const [step, setStep] = useState<Step>('request');
-  const [email, setEmail] = useState('admin@busfee.com');
+  const [email, setEmail] = useState('kharwaramog02@gmail.com');
   const [otp, setOtp] = useState('');
   const [pwd, setPwd] = useState('');
   const [pwd2, setPwd2] = useState('');

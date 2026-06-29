@@ -7,6 +7,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { Button, TextField } from '@/src/components/ui';
+import { isoToDisplay, displayToIso, nowDisplay } from '@/src/utils/datetime';
 
 interface School { id: string; name: string }
 
@@ -22,7 +23,7 @@ export default function StudentForm() {
   const [standard, setStandard] = useState('');
   const [pickup, setPickup] = useState('');
   const [fee, setFee] = useState('');
-  const [admission, setAdmission] = useState(new Date().toISOString().slice(0, 10));
+  const [admission, setAdmission] = useState(new Date().toISOString());
   const [due, setDue] = useState('');
   const [err, setErr] = useState('');
   const [loading, setLoading] = useState(false);
@@ -33,8 +34,10 @@ export default function StudentForm() {
       apiFetch(`/students/${id}`).then((s: any) => {
         setName(s.name); setParent(s.parent_name); setMobile(s.parent_mobile);
         setSchoolId(s.school_id); setStandard(s.standard); setPickup(s.pickup_location || '');
-        setFee(String(s.yearly_fee)); setAdmission(s.admission_date.slice(0, 10)); setDue(s.due_date.slice(0, 10));
+        setFee(String(s.yearly_fee)); setAdmission(isoToDisplay(s.admission_date)); setDue(isoToDisplay(s.due_date));
       }).catch(() => {});
+    } else {
+      setAdmission(nowDisplay());
     }
   }, [editing, id]);
 
@@ -43,12 +46,16 @@ export default function StudentForm() {
     if (!name.trim() || !parent.trim() || !mobile.trim() || !schoolId || !standard.trim() || !fee || !admission || !due) {
       setErr('Please fill all required fields'); return;
     }
+    const admIso = displayToIso(admission);
+    const dueIso = displayToIso(due);
+    if (!admIso) { setErr('Admission date must be DD/MM/YYYY HH:mm'); return; }
+    if (!dueIso) { setErr('Due date must be DD/MM/YYYY HH:mm'); return; }
     setLoading(true);
     try {
       const body = JSON.stringify({
         name: name.trim(), parent_name: parent.trim(), parent_mobile: mobile.trim(),
         school_id: schoolId, standard: standard.trim(), pickup_location: pickup,
-        yearly_fee: parseFloat(fee), admission_date: admission, due_date: due,
+        yearly_fee: parseFloat(fee), admission_date: admIso, due_date: dueIso,
       });
       if (editing) await apiFetch(`/students/${id}`, { method: 'PUT', body });
       else await apiFetch('/students', { method: 'POST', body });
@@ -92,8 +99,8 @@ export default function StudentForm() {
           <TextField label="Standard / Class *" value={standard} onChangeText={setStandard} testID="student-standard" />
           <TextField label="Pickup Location" value={pickup} onChangeText={setPickup} testID="student-pickup" />
           <TextField label="Yearly Bus Fee (₹) *" value={fee} onChangeText={setFee} keyboardType="numeric" testID="student-fee" />
-          <TextField label="Admission Date (YYYY-MM-DD) *" value={admission} onChangeText={setAdmission} testID="student-admission" />
-          <TextField label="Due Date (YYYY-MM-DD) *" value={due} onChangeText={setDue} testID="student-due" />
+          <TextField label="Admission Date & Time *" placeholder="29/06/2026 10:30" value={admission} onChangeText={setAdmission} testID="student-admission" />
+          <TextField label="Due Date & Time *" placeholder="29/07/2026 10:30" value={due} onChangeText={setDue} testID="student-due" />
 
           {err ? <Text style={{ color: palette.error, marginBottom: spacing.md }}>{err}</Text> : null}
           <Button title={editing ? 'Save Changes' : 'Add Student'} onPress={submit} loading={loading} testID="student-submit" />

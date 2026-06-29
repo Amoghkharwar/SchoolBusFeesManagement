@@ -1,79 +1,62 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Linking, Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import * as Clipboard from 'expo-clipboard';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
-import { useTheme, spacing, fontSize, radii } from '@/src/theme';
+import { useFY } from '@/src/fy';
+import { useTheme, spacing, fontSize } from '@/src/theme';
 import { Button, Card, TextField } from '@/src/components/ui';
 
-interface School {
-  id: string;
-  name: string;
-}
+interface School { id: string; name: string }
 
 export default function Reports() {
   const { palette } = useTheme();
+  const { current: fy } = useFY();
   const [schools, setSchools] = useState<School[]>([]);
   const [schoolId, setSchoolId] = useState<string>('');
   const [status, setStatus] = useState<string>('all');
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
   const [msg, setMsg] = useState('');
+  const [busy, setBusy] = useState<'pdf' | 'excel' | null>(null);
 
   useEffect(() => {
     apiFetch<School[]>('/schools').then(setSchools).catch(() => {});
   }, []);
 
-  const buildUrl = async (format: 'csv' | 'html') => {
-    const token = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
-    const params = new URLSearchParams();
-    if (schoolId) params.set('school_id', schoolId);
-    if (status !== 'all') params.set('status', status);
-    if (start) params.set('start', start);
-    if (end) params.set('end', end);
-    if (token) params.set('token', token); // we'll fall back to Authorization, but token also handy for copy
-    const url = `${API_BASE}/reports/${format}${[...params].length ? '?' + params.toString() : ''}`;
-    return { url, token };
-  };
-
-  const openHtml = async () => {
+  const open = async (format: 'pdf' | 'excel') => {
     setMsg('');
-    const { url, token } = await buildUrl('html');
-    // Fetch HTML server-side then open via data URL (since we need Bearer auth)
+    setBusy(format);
     try {
-      const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
-      const html = await res.text();
-      // open in browser using data URL (works on web; on mobile, share text)
-      const dataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
-      const ok = await Linking.canOpenURL(dataUrl);
-      if (ok) await Linking.openURL(dataUrl);
-      else setMsg('Report generated. Copy URL from below.');
+      const token = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
+      const params = new URLSearchParams();
+      if (schoolId) params.set('school_id', schoolId);
+      if (status !== 'all') params.set('status', status);
+      if (start) params.set('start', start);
+      if (end) params.set('end', end);
+      if (fy) params.set('fy', fy);
+      if (token) params.set('token', token);
+      const url = `${API_BASE}/reports/${format}?${params.toString()}`;
+      const ok = await Linking.canOpenURL(url);
+      if (!ok) throw new Error('Cannot open URL on this device');
+      await Linking.openURL(url);
+      setMsg(format === 'pdf'
+        ? 'PDF opened in your browser — use Share → Save to keep it.'
+        : 'Excel download started — check your Downloads folder.');
     } catch (e: any) {
-      setMsg(e.message);
-    }
-  };
-
-  const copyCsv = async () => {
-    setMsg('');
-    const { url, token } = await buildUrl('csv');
-    try {
-      const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
-      const txt = await res.text();
-      await Clipboard.setStringAsync(txt);
-      setMsg('CSV copied to clipboard. Paste into Excel or Google Sheets.');
-    } catch (e: any) {
-      setMsg(e.message);
+      setMsg(`Error: ${e.message || 'failed'}`);
+    } finally {
+      setBusy(null);
     }
   };
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 80 }}>
-        <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: spacing.lg }}>
-          Reports
+        <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: 4 }}>Reports</Text>
+        <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: spacing.lg }}>
+          {fy ? `Financial Year ${fy}` : 'All financial years'}
         </Text>
 
         <Card>
@@ -90,6 +73,7 @@ export default function Reports() {
                     height: 36, paddingHorizontal: 14, borderRadius: 18, alignItems: 'center', justifyContent: 'center',
                     backgroundColor: active ? palette.brand : palette.surfaceTertiary,
                     borderWidth: 1, borderColor: active ? palette.brand : palette.border,
+                    flexShrink: 0,
                   }}
                 >
                   <Text style={{ color: active ? '#fff' : palette.onSurface, fontSize: fontSize.sm, fontWeight: '600' }}>{s.name}</Text>
@@ -111,6 +95,7 @@ export default function Reports() {
                     height: 36, paddingHorizontal: 14, borderRadius: 18, alignItems: 'center', justifyContent: 'center',
                     backgroundColor: active ? palette.brand : palette.surfaceTertiary,
                     borderWidth: 1, borderColor: active ? palette.brand : palette.border,
+                    flexShrink: 0,
                   }}
                 >
                   <Text style={{ color: active ? '#fff' : palette.onSurface, fontSize: fontSize.sm, fontWeight: '600', textTransform: 'capitalize' }}>{k}</Text>
@@ -119,17 +104,30 @@ export default function Reports() {
             })}
           </ScrollView>
 
-          <TextField label="Start Date (YYYY-MM-DD)" placeholder="2026-04-01" value={start} onChangeText={setStart} testID="report-start" />
-          <TextField label="End Date (YYYY-MM-DD)" placeholder="2026-12-31" value={end} onChangeText={setEnd} testID="report-end" />
+          <TextField label="Start Date (DD/MM/YYYY HH:mm)" placeholder="01/04/2026 00:00" value={start} onChangeText={setStart} testID="report-start" />
+          <TextField label="End Date (DD/MM/YYYY HH:mm)" placeholder="31/03/2027 23:59" value={end} onChangeText={setEnd} testID="report-end" />
         </Card>
 
         <View style={{ height: spacing.lg }} />
-        <Button title="Generate PDF / View Report" icon="document-text" onPress={openHtml} testID="report-generate-pdf" />
+        <Button
+          title={busy === 'pdf' ? 'Opening PDF…' : 'Download PDF Report'}
+          icon="document-text"
+          onPress={() => open('pdf')}
+          loading={busy === 'pdf'}
+          testID="report-generate-pdf"
+        />
         <View style={{ height: spacing.md }} />
-        <Button title="Export Excel (CSV)" icon="grid" variant="secondary" onPress={copyCsv} testID="report-generate-csv" />
+        <Button
+          title={busy === 'excel' ? 'Opening Excel…' : 'Download Excel (.xlsx)'}
+          icon="grid"
+          variant="secondary"
+          onPress={() => open('excel')}
+          loading={busy === 'excel'}
+          testID="report-generate-csv"
+        />
 
         {msg ? (
-          <Text style={{ color: palette.success, marginTop: spacing.md, textAlign: 'center' }} testID="report-msg">{msg}</Text>
+          <Text style={{ color: msg.startsWith('Error') ? palette.error : palette.success, marginTop: spacing.md, textAlign: 'center' }} testID="report-msg">{msg}</Text>
         ) : null}
       </ScrollView>
     </SafeAreaView>

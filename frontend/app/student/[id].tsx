@@ -18,6 +18,7 @@ import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { Button, Card, EmptyState, StatusBadge, TextField } from '@/src/components/ui';
 import { formatDate, formatINR, openWhatsApp, reminderMessage } from '@/src/utils/format';
+import { isoToDisplay, displayToIso, nowDisplay } from '@/src/utils/datetime';
 
 interface Payment {
   id: string;
@@ -25,6 +26,7 @@ interface Payment {
   payment_date: string;
   mode: string;
   note?: string;
+  next_due_date?: string;
   created_at: string;
 }
 
@@ -40,7 +42,8 @@ export default function StudentDetail() {
 
   // payment form
   const [amount, setAmount] = useState('');
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(nowDisplay());
+  const [nextDue, setNextDue] = useState('');
   const [mode, setMode] = useState('cash');
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -66,14 +69,21 @@ export default function StudentDetail() {
     setModalErr('');
     const amt = parseFloat(amount);
     if (!amt || amt <= 0) { setModalErr('Enter a valid amount'); return; }
+    const dateIso = displayToIso(date);
+    if (!dateIso) { setModalErr('Payment date must be DD/MM/YYYY HH:mm'); return; }
+    let nextIso: string | null = null;
+    if (nextDue.trim()) {
+      nextIso = displayToIso(nextDue);
+      if (!nextIso) { setModalErr('Next due date must be DD/MM/YYYY HH:mm'); return; }
+    }
     setSubmitting(true);
     try {
       await apiFetch(`/students/${id}/payments`, {
         method: 'POST',
-        body: JSON.stringify({ amount: amt, payment_date: date, mode, note }),
+        body: JSON.stringify({ amount: amt, payment_date: dateIso, mode, note, next_due_date: nextIso }),
       });
       setShowModal(false);
-      setAmount(''); setNote(''); setMode('cash');
+      setAmount(''); setNote(''); setMode('cash'); setNextDue('');
       await load();
     } catch (e: any) {
       setModalErr(e.message);
@@ -129,8 +139,11 @@ export default function StudentDetail() {
           <View style={{ marginTop: spacing.lg, gap: 6 }}>
             <InfoRow icon="call" label="Parent" value={`${student.parent_name} · ${student.parent_mobile}`} />
             <InfoRow icon="location" label="Pickup" value={student.pickup_location || '—'} />
-            <InfoRow icon="calendar" label="Admission" value={formatDate(student.admission_date)} />
-            <InfoRow icon="time" label="Due" value={formatDate(student.due_date)} />
+            <InfoRow icon="calendar" label="Admission" value={isoToDisplay(student.admission_date) || '—'} />
+            <InfoRow icon="time" label="Next Due" value={isoToDisplay(student.next_due_date || student.due_date) || '—'} />
+            {student.overdue_days > 0 ? (
+              <InfoRow icon="warning" label="Overdue" value={`${student.overdue_days} days`} />
+            ) : null}
           </View>
 
           <View style={{ flexDirection: 'row', marginTop: spacing.lg, gap: spacing.md }}>
@@ -175,7 +188,12 @@ export default function StudentDetail() {
                   <Text style={{ color: palette.onSurface, fontWeight: '700', fontSize: fontSize.lg }}>{formatINR(p.amount)}</Text>
                   <Text style={{ color: palette.muted, fontSize: fontSize.sm, textTransform: 'uppercase' }}>{p.mode}</Text>
                 </View>
-                <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4 }}>{formatDate(p.payment_date)}</Text>
+                <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4 }}>{isoToDisplay(p.payment_date)}</Text>
+                {p.next_due_date ? (
+                  <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>
+                    Next due: {isoToDisplay(p.next_due_date)}
+                  </Text>
+                ) : null}
                 {p.note ? <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: 4 }}>{p.note}</Text> : null}
               </Card>
             </View>
@@ -194,7 +212,8 @@ export default function StudentDetail() {
             <View style={{ alignSelf: 'center', width: 40, height: 4, backgroundColor: palette.border, borderRadius: 2, marginBottom: spacing.md }} />
             <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: spacing.md }}>Record Payment</Text>
             <TextField label="Amount (₹) *" value={amount} onChangeText={setAmount} keyboardType="numeric" testID="payment-amount" />
-            <TextField label="Date (YYYY-MM-DD)" value={date} onChangeText={setDate} testID="payment-date" />
+            <TextField label="Payment Date & Time (DD/MM/YYYY HH:mm)" value={date} onChangeText={setDate} placeholder="29/06/2026 10:30" testID="payment-date" />
+            <TextField label="Next Fee Due Date (DD/MM/YYYY HH:mm)" value={nextDue} onChangeText={setNextDue} placeholder="29/07/2026 10:30" testID="payment-next-due" />
             <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>Mode</Text>
             <View style={{ flexDirection: 'row', gap: 8, marginBottom: spacing.md }}>
               {MODES.map((m) => {

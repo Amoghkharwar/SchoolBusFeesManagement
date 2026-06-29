@@ -8,6 +8,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useIconFonts } from '@/src/hooks/use-icon-fonts';
 import { ThemeProvider, useTheme } from '@/src/theme';
 import { AuthProvider, useAuth } from '@/src/auth';
+import { FYProvider } from '@/src/fy';
 
 LogBox.ignoreAllLogs(true);
 SplashScreen.preventAutoHideAsync();
@@ -32,9 +33,11 @@ function RootInner() {
   return (
     <View style={{ flex: 1, backgroundColor: palette.surface }}>
       <AuthProvider>
-        <AuthGuard>
-          <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: palette.surface } }} />
-        </AuthGuard>
+        <FYProvider>
+          <AuthGuard>
+            <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: palette.surface } }} />
+          </AuthGuard>
+        </FYProvider>
       </AuthProvider>
     </View>
   );

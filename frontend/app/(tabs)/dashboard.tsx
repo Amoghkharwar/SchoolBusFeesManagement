@@ -1,6 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import {
-  ActivityIndicator,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -13,9 +12,11 @@ import { router, useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch, useAuth } from '@/src/auth';
+import { useFY } from '@/src/fy';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { formatINR } from '@/src/utils/format';
 import { Card, EmptyState } from '@/src/components/ui';
+import { Skeleton, SkeletonCard, SkeletonKPI } from '@/src/components/Skeleton';
 
 interface Summary {
   total_schools: number;
@@ -37,6 +38,7 @@ interface SchoolStat {
 export default function Dashboard() {
   const { palette, isDark, mode, setMode } = useTheme();
   const { admin, logout } = useAuth();
+  const { current: fy, years, setCurrent, refresh: refreshFY } = useFY();
   const [summary, setSummary] = useState<Summary | null>(null);
   const [schools, setSchools] = useState<SchoolStat[]>([]);
   const [loading, setLoading] = useState(true);
@@ -44,33 +46,31 @@ export default function Dashboard() {
 
   const load = useCallback(async () => {
     try {
+      const q = fy ? `?fy=${fy}` : '';
       const [s, by] = await Promise.all([
-        apiFetch<Summary>('/dashboard/summary'),
-        apiFetch<SchoolStat[]>('/dashboard/by-school'),
+        apiFetch<Summary>(`/dashboard/summary${q}`),
+        apiFetch<SchoolStat[]>(`/dashboard/by-school${q}`),
       ]);
       setSummary(s);
       setSchools(by);
-    } catch (e) {
-      // ignore
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [fy]);
 
-  useFocusEffect(useCallback(() => { load(); }, [load]));
+  useFocusEffect(useCallback(() => { setLoading(true); if (years.length === 0) refreshFY(); load(); }, [load, years.length, refreshFY]));
 
   const cycleTheme = () => {
-    const next = mode === 'light' ? 'dark' : mode === 'dark' ? 'system' : 'light';
-    setMode(next);
+    setMode(mode === 'light' ? 'dark' : mode === 'dark' ? 'system' : 'light');
   };
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <View style={[styles.header, { backgroundColor: palette.surface, borderBottomColor: palette.border }]}>
-        <View>
+        <View style={{ flex: 1 }}>
           <Text style={{ fontSize: fontSize.sm, color: palette.muted }}>Welcome back</Text>
-          <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface }} testID="dashboard-title">
+          <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface }} numberOfLines={1} testID="dashboard-title">
             {admin?.email ?? 'Admin'}
           </Text>
         </View>
@@ -92,12 +92,54 @@ export default function Dashboard() {
         </View>
       </View>
 
+      {/* Financial Year chip row */}
+      <View style={{ borderBottomWidth: 1, borderBottomColor: palette.border, paddingVertical: spacing.sm }}>
+        <View style={{ paddingHorizontal: spacing.lg, marginBottom: 6, flexDirection: 'row', alignItems: 'center' }}>
+          <Ionicons name="calendar-outline" size={14} color={palette.muted} />
+          <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginLeft: 6, fontWeight: '600' }}>Financial Year</Text>
+        </View>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={{ gap: 8, paddingHorizontal: spacing.lg }}
+        >
+          {years.length === 0 ? (
+            <Skeleton width={140} height={36} radius={18} />
+          ) : (
+            years.map((y) => {
+              const active = fy === y;
+              return (
+                <Pressable
+                  key={y}
+                  testID={`fy-chip-${y}`}
+                  onPress={() => setCurrent(y)}
+                  style={{
+                    height: 36, paddingHorizontal: 14, borderRadius: 18, alignItems: 'center', justifyContent: 'center',
+                    backgroundColor: active ? palette.brand : palette.surfaceTertiary,
+                    borderWidth: 1, borderColor: active ? palette.brand : palette.border,
+                    flexShrink: 0,
+                  }}
+                >
+                  <Text style={{ color: active ? '#fff' : palette.onSurface, fontWeight: '600', fontSize: fontSize.sm }}>FY {y}</Text>
+                </Pressable>
+              );
+            })
+          )}
+        </ScrollView>
+      </View>
+
       <ScrollView
         contentContainerStyle={{ padding: spacing.lg, paddingBottom: 80 }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}
       >
         {loading ? (
-          <ActivityIndicator color={palette.brand} style={{ marginTop: 40 }} />
+          <>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: spacing.md, marginBottom: spacing.lg }}>
+              <SkeletonKPI /><SkeletonKPI /><SkeletonKPI /><SkeletonKPI />
+            </View>
+            <Skeleton width="40%" height={18} style={{ marginBottom: spacing.md }} />
+            <SkeletonCard /><SkeletonCard />
+          </>
         ) : (
           <>
             <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: spacing.md, marginBottom: spacing.lg }}>

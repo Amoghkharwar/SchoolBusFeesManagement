@@ -1,0 +1,29 @@
+{
+  "summary": "Phase 1 testing complete. All 22 backend pytest tests PASS (auth with new admin kharwaramog02@gmail.com, old admin removed → 401, /api/auth/me, OTP forgot-password cycle, /api/financial-years returns current+years, /api/students fy filter, /api/dashboard/summary & /by-school fy filter, /api/pending-fees with overdue tracking, POST payments persist next_due_date and surface last_payment_date/next_due_date/overdue_days on GET /api/students/{id}, /api/reports/pdf returns %PDF with both Authorization header and ?token= query, /api/reports/excel returns PK xlsx with same auth modes, status/fy filters on reports work, legacy CSV/HTML reports still work, schools/students/payments CRUD intact, due=today/week filters work, search works). Frontend (Expo web, mobile viewport 390x844) verified: Login screen pre-fills kharwaramog02@gmail.com / 12345678 → tapping Login navigates to Dashboard; Dashboard renders skeleton loaders briefly then KPIs and school-wise summary; 3 FY chips visible and selecting one re-filters the dashboard counts (FY 2025-2026 shows 2 students / ₹32,000 pending; FY 2026-2027 active); bottom nav order is Dashboard / Schools / Students / Pending / Reports with Pending tab positioned between Students and Reports as required; Pending Fees screen renders the overdue student (Amogh, JB School, Class 7, 2d overdue, ₹10,250) with Next Due 27/06/2026 00:00 and Send Reminder WhatsApp button; Reports tab shows both Download PDF and Download Excel buttons that open URLs containing /api/reports/pdf and /api/reports/excel with ?token= for mobile-friendly auth. No red screens, no console errors beyond the expected 401 before login.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Reports > Excel button", "issue": "testID of the Excel button is 'report-generate-csv' (legacy name) even though it now downloads .xlsx — confusing but functional", "testID": "report-generate-csv", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": ["/app/backend/tests/test_busfee_api.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Optional: rename Excel button testID from 'report-generate-csv' to 'report-generate-excel' in /app/frontend/app/(tabs)/reports.tsx for clarity.",
+    "Optional: add data-testid passthrough for FY chips on web — the Pressable testID renders but the chip queried by [data-testid^=\"fy-chip-\"] returned 0 (chips visually present and clickable via text); not blocking but would help automated tests."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~880 lines — consider splitting into modules (auth.py, students.py, reports.py, dashboard.py) per the file-size guideline.",
+    "/api/pending-fees and dashboard endpoints load all students into memory and call student_to_out per row (extra DB queries per student). Acceptable at current scale but will degrade past a few thousand students — consider an aggregation pipeline.",
+    "fy_range() falls back to datetime.min/max on malformed labels and _in_fy returns False on unparseable dates — silent skip. Consider 400 error for clearer feedback when fy param is invalid.",
+    "Reports endpoints accept ?token= query param (good for mobile) — token is logged in nginx access logs; acceptable trade-off but worth noting for future hardening."
+  ],
+  "updated_files": ["/app/backend/tests/test_busfee_api.py"],
+  "success_rate": {"backend": "100% (22/22)", "frontend": "100% (login prefill, dashboard skeleton, FY chip filter, Pending tab + screen, Reports buttons all working)"},
+  "seed_data_creation": "No persistent seed data left. Test fixtures create TEST_* schools/students and clean up via cascade delete in fixtures.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Admin credentials are kharwaramog02@gmail.com / 12345678 (old admin@busfee.com is intentionally removed on startup). Use EXPO_PUBLIC_BACKEND_URL from /app/frontend/.env. Reports support Authorization header AND ?token=<jwt> query string. Mobile viewport 390x844. Expo dev server keeps long-polling open so use wait_until='domcontentloaded' (not 'networkidle') in Playwright. FY chip testIDs do not bubble to web DOM — select chips by text 'FY 2026-2027' etc. Pending tab is at route /pending."
+}

@@ -22,8 +22,8 @@ const HERO = 'https://images.unsplash.com/photo-1649861742672-20152f77c1f5?crop=
 export default function Login() {
   const { login } = useAuth();
   const { palette } = useTheme();
-  const [email, setEmail] = useState('admin@busfee.com');
-  const [password, setPassword] = useState('Admin@123');
+  const [email, setEmail] = useState('kharwaramog02@gmail.com');
+  const [password, setPassword] = useState('12345678');
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -81,7 +81,7 @@ export default function Login() {
 
           <TextField
             label="Email"
-            placeholder="admin@busfee.com"
+            placeholder="your@email.com"
             value={email}
             onChangeText={setEmail}
             keyboardType="email-address"

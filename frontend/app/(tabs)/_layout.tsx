@@ -42,6 +42,13 @@ export default function TabsLayout() {
         }}
       />
       <Tabs.Screen
+        name="pending"
+        options={{
+          title: 'Pending',
+          tabBarIcon: ({ color, size }) => <Ionicons name="alert-circle" size={size} color={color} />,
+        }}
+      />
+      <Tabs.Screen
         name="reports"
         options={{
           title: 'Reports',

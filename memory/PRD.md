@@ -1,21 +1,26 @@
-# School Bus Fee Manager — PRD
-
-## Purpose
-Admin-only mobile app (Expo / FastAPI / MongoDB) to manage students, yearly bus fees, payments, and WhatsApp reminders across multiple schools.
+# Bus Fee Manager — PRD (Phase 1 enhanced)
 
 ## Auth
-- Email + password login (`admin@busfee.com` / `Admin@123` seeded)
-- Forgot password = 6-digit OTP emailed via SendGrid (falls back to backend logs in dev)
-- JWT (HS256) stored in AsyncStorage
+- Single admin: `kharwaramog02@gmail.com` / `12345678` (seeded; previous admin removed)
+- Forgot-password OTP via SendGrid (console fallback in dev)
+- JWT (HS256) in AsyncStorage; supports `?token=` query for file downloads
 
-## Core Modules
-1. **Schools** — CRUD with address & contact
-2. **Students** — registration with parent name, WhatsApp mobile, school, class, yearly fee, admission/due dates
-3. **Payments** — record cash / UPI / bank with date and note; auto-computed paid + pending
-4. **Dashboard** — KPI cards (schools, students, collected, pending) + school-wise cards
-5. **School Detail** — segmented tabs Pending / Partial / Paid
-6. **Student Detail** — payment history timeline + Record Payment bottom modal + WhatsApp reminder button
-7. **WhatsApp** — `wa.me` deep-link with auto-generated reminder text (₹ INR formatted)
-8. **Reports** — by school / status / date range; "View Report" (HTML) and "Export Excel" (CSV → clipboard)
-9. **Search & Filters** — name / parent / mobile, status chips, Due Today / Due This Week
-10. **Theme** — Light / Dark / System cyclable from dashboard
+## Modules
+1. **Schools** CRUD
+2. **Students** CRUD with datetime admission/due dates, FY filter
+3. **Payments** with `next_due_date` (datetime) — drives overdue tracking
+4. **Pending Fees** tab — overdue students with days overdue + last/next dates + WhatsApp
+5. **Dashboard** KPIs + school cards + Financial Year chip selector (FY 2025-2026 / 2026-2027 / 2027-2028)
+6. **Reports** — real PDF (reportlab) + real Excel (.xlsx via openpyxl); FY + school + status + date range filters
+7. **WhatsApp** wa.me deep link reminders
+8. **Skeleton loaders** on Dashboard + Pending screens
+
+## Date / Currency
+- All dates stored as ISO datetime; displayed as `DD/MM/YYYY HH:mm`
+- Currency Indian INR (₹) with Indian grouping
+
+## Roadmap (Phase 2)
+- RBAC: Admin / Author (max 3) / Guest (unlimited) + page-permission matrix
+- User Management screen
+- Firebase Storage cloud archive (credentials needed)
+- Custom logo

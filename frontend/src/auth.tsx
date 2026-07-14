@@ -8,6 +8,9 @@ import { router } from 'expo-router';
 const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL || '';
 const API = `${BACKEND}/api`;
 const TOKEN_KEY = 'busfee:token';
+console.log('[DEBUG] EXPO_PUBLIC_BACKEND_URL =', process.env.EXPO_PUBLIC_BACKEND_URL);
+console.log('[DEBUG] BACKEND =', BACKEND);
+console.log('[DEBUG] API =', API);
 
 export interface AdminMe {
   id?: string;

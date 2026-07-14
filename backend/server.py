@@ -24,7 +24,7 @@ from starlette.middleware.cors import CORSMiddleware
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-MONGO_URL = os.environ["EXPO_PUBLIC_BACKEND_URL"]
+MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = "schoolbusfees"
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", "720"))

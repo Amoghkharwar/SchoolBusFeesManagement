@@ -37,8 +37,8 @@ const AuthContext = createContext<AuthCtx>({
   token: null,
   admin: null,
   loading: true,
-  login: async () => {},
-  logout: async () => {},
+  login: async () => { },
+  logout: async () => { },
 });
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {

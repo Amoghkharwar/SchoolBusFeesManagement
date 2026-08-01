@@ -81,6 +81,14 @@ def _get_bucket():
         return None
 
 app = FastAPI(title="School Bus Fee Management API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
 api = APIRouter(prefix="/api")
 security = HTTPBearer(auto_error=False)
 
@@ -181,10 +189,11 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ---------- Financial Year (Indian: April → March) ----------
-def fy_label(dt: datetime) -> str:
+# ---------- Financial Year (Indian Default: April → March) ----------
+def fy_label(dt: datetime, start_month: int = 4) -> str:
+    """Computes FY label for a datetime according to the configured start month."""
     y = dt.year
-    if dt.month < 4:
+    if dt.month < start_month:
         return f"{y - 1}-{y}"
     return f"{y}-{y + 1}"
 
@@ -227,6 +236,10 @@ def _in_fy(value: Optional[str], fy: Optional[str]) -> bool:
 
 
 # ---------- Models ----------
+class CreateFY(BaseModel):
+    label: str
+
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
@@ -252,6 +265,8 @@ class SchoolIn(BaseModel):
     address: Optional[str] = ""
     contact_person: Optional[str] = ""
     contact_phone: Optional[str] = ""
+    fy_start_month: Optional[int] = 4  # 1-12 (e.g. 3=March for JB School, 4=April default, 5=May for DSilva School)
+    fy_end_month: Optional[int] = 3    # 1-12 (e.g. 2=Feb for JB School, 3=March default, 6=June for DSilva School)
 
 
 class StudentIn(BaseModel):
@@ -689,23 +704,220 @@ async def dashboard_by_school(fy: Optional[str] = None, admin=Depends(get_curren
 # ---------- Financial Years ----------
 @api.get("/financial-years")
 async def financial_years(admin=Depends(get_current_admin)):
-    """List FY labels derived from admission/payment dates, plus current and next."""
-    years: set = set()
+    """
+    Returns exactly 2 FYs: current year + 1 most-recent past year.
+    NEVER includes future financial years, even if student records have future admission dates.
+    Includes per-FY status metadata from the financial_years collection.
+    """
     cur = datetime.now(timezone.utc)
-    years.add(fy_label(cur))
-    # next year
-    next_fy = datetime(cur.year + 1 if cur.month >= 4 else cur.year, 4, 1, tzinfo=timezone.utc)
-    years.add(fy_label(next_fy))
-    # previous year
-    prev = datetime(cur.year - 1 if cur.month < 4 else cur.year, 3, 1, tzinfo=timezone.utc)
-    years.add(fy_label(prev))
-    for coll, field in [("students", "admission_date"), ("payments", "payment_date")]:
-        async for doc in db[coll].find({}, {field: 1, "_id": 0}):
-            dt = _parse_dt(doc.get(field))
-            if dt:
-                years.add(fy_label(dt))
-    sorted_years = sorted(years, key=lambda x: int(x.split("-")[0]), reverse=True)
-    return {"current": fy_label(cur), "years": sorted_years}
+    current_label = fy_label(cur)
+    current_start = int(current_label.split("-")[0])  # e.g. 2026
+
+    # Always seed with current and immediately previous FY
+    candidate_labels: set = {current_label}
+
+    # Previous year's label: go back exactly one Indian FY
+    prev_start = current_start - 1
+    candidate_labels.add(f"{prev_start}-{prev_start + 1}")
+
+    # Add any FYs explicitly created in the financial_years collection
+    # (may include past years older than prev; they'll be filtered below)
+    async for fydoc in db.financial_years.find({}, {"label": 1, "_id": 0}):
+        lbl = fydoc.get("label", "")
+        try:
+            s = int(lbl.split("-")[0])
+            # STRICT: only include if it's current or in the past
+            if s <= current_start:
+                candidate_labels.add(lbl)
+        except Exception:
+            pass
+
+    # Do NOT auto-add labels from student/payment records —
+    # admission/payment dates may lie in the future and would
+    # pollute the FY list. Only explicit creation matters.
+
+    # Sort descending and take current + at most 1 past year
+    sorted_labels = sorted(
+        candidate_labels,
+        key=lambda x: int(x.split("-")[0]),
+        reverse=True,
+    )
+
+    limited: list = []
+    past_count = 0
+    for y in sorted_labels:
+        if y == current_label:
+            limited.append(y)
+        elif past_count < 1:
+            limited.append(y)
+            past_count += 1
+        else:
+            break
+
+    # Fetch status metadata for the limited labels
+    meta_map: Dict[str, Any] = {}
+    async for fydoc in db.financial_years.find({"label": {"$in": limited}}, {"_id": 0}):
+        meta_map[fydoc["label"]] = fydoc
+
+    years_with_meta = []
+    for y in limited:
+        meta = meta_map.get(y, {})
+        years_with_meta.append({
+            "label": y,
+            "status": meta.get("status", "open"),
+            "closed_at": meta.get("closed_at"),
+            "created_at": meta.get("created_at"),
+        })
+
+    return {
+        "current": current_label,
+        "years": [m["label"] for m in years_with_meta],
+        "meta": years_with_meta,
+    }
+
+
+@api.post("/financial-years")
+async def create_financial_year(payload: CreateFY, admin=Depends(get_current_admin)):
+    """Manually add a current or past financial year (sets status=open)."""
+    label = payload.label.strip()
+    import re
+    if not re.match(r"^\d{4}-\d{4}$", label):
+        raise HTTPException(400, "Financial year must be in format YYYY-YYYY (e.g. 2025-2026)")
+
+    try:
+        a_str, b_str = label.split("-")
+        a, b = int(a_str), int(b_str)
+    except Exception:
+        raise HTTPException(400, "Invalid year format")
+
+    if b != a + 1:
+        raise HTTPException(400, "Financial year years must be consecutive (e.g. 2025-2026)")
+
+    # Check if future year
+    cur = datetime.now(timezone.utc)
+    current_label = fy_label(cur)
+    current_start = int(current_label.split("-")[0])
+
+    if a > current_start:
+        raise HTTPException(400, "Future financial years are not allowed")
+
+    # Strict Validation: Check if any older financial year is still open
+    async for fydoc in db.financial_years.find({"status": "open"}, {"_id": 0, "label": 1}):
+        old_lbl = fydoc.get("label", "")
+        try:
+            old_start = int(old_lbl.split("-")[0])
+            if old_start < a:
+                raise HTTPException(
+                    400,
+                    f"Cannot create FY {label} because older financial year FY {old_lbl} is still OPEN. Please close FY {old_lbl} and download its financial records first."
+                )
+        except Exception:
+            pass
+
+    # Upsert — create if missing, preserve existing status
+    exists = await db.financial_years.find_one({"label": label})
+    if not exists:
+        await db.financial_years.insert_one({
+            "label": label,
+            "status": "open",
+            "closed_at": None,
+            "created_at": now_iso(),
+        })
+    return {"status": "success", "label": label}
+
+
+class FYActionIn(BaseModel):
+    label: Optional[str] = None
+
+
+@api.patch("/financial-years/close")
+@api.post("/financial-years/close")
+@api.patch("/financial-years/{label}/close")
+@api.post("/financial-years/{label}/close")
+async def close_financial_year(
+    label: Optional[str] = None,
+    body: Optional[FYActionIn] = None,
+    fy: Optional[str] = Query(None),
+    admin=Depends(get_current_admin),
+):
+    """Mark a financial year as closed. Cannot re-open once closed."""
+    target = label or fy or (body and body.label)
+    if not target:
+        raise HTTPException(400, "Missing financial year label")
+    target = target.strip()
+    import re
+    if not re.match(r"^\d{4}-\d{4}$", target):
+        raise HTTPException(400, "Invalid financial year label format (expected YYYY-YYYY)")
+
+    # Ensure the FY doc exists; create if it was auto-derived
+    exists = await db.financial_years.find_one({"label": target})
+    if not exists:
+        await db.financial_years.insert_one({
+            "label": target,
+            "status": "open",
+            "closed_at": None,
+            "created_at": now_iso(),
+        })
+
+    doc = await db.financial_years.find_one({"label": target})
+    if doc and doc.get("status") == "closed":
+        raise HTTPException(400, "Financial year is already closed")
+
+    await db.financial_years.update_one(
+        {"label": target},
+        {"$set": {"status": "closed", "closed_at": now_iso()}},
+        upsert=True,
+    )
+    return {"ok": True, "label": target, "status": "closed"}
+
+
+@api.delete("/financial-years/records")
+@api.post("/financial-years/records")
+@api.post("/financial-years/delete")
+@api.delete("/financial-years/{label}/records")
+@api.post("/financial-years/{label}/records")
+@api.post("/financial-years/{label}/delete")
+async def delete_fy_records(
+    label: Optional[str] = None,
+    body: Optional[FYActionIn] = None,
+    fy: Optional[str] = Query(None),
+    admin=Depends(get_current_admin),
+):
+    """Delete all students and their payments that belong to the given closed financial year."""
+    target = label or fy or (body and body.label)
+    if not target:
+        raise HTTPException(400, "Missing financial year label")
+    target = target.strip()
+    import re
+    if not re.match(r"^\d{4}-\d{4}$", target):
+        raise HTTPException(400, "Invalid financial year label format")
+
+    # Require FY to be closed before deleting
+    fy_doc = await db.financial_years.find_one({"label": target})
+    if not fy_doc or fy_doc.get("status") != "closed":
+        raise HTTPException(400, "Financial year must be closed before deleting its records")
+
+    # Find students in this FY (filtered by admission_date)
+    all_students = await db.students.find({}, {"_id": 0, "id": 1, "admission_date": 1}).to_list(50000)
+    target_sids = [s["id"] for s in all_students if _in_fy(s.get("admission_date"), target)]
+
+    deleted_payments = 0
+    deleted_students = 0
+    if target_sids:
+        res_p = await db.payments.delete_many({"student_id": {"$in": target_sids}})
+        deleted_payments = res_p.deleted_count
+        res_s = await db.students.delete_many({"id": {"$in": target_sids}})
+        deleted_students = res_s.deleted_count
+
+    # Also remove the FY doc itself so it no longer appears
+    await db.financial_years.delete_one({"label": target})
+
+    return {
+        "ok": True,
+        "label": target,
+        "deleted_students": deleted_students,
+        "deleted_payments": deleted_payments,
+    }
 
 
 # ---------- Reports: real PDF + real Excel ----------
@@ -1216,11 +1428,3 @@ async def root():
 
 
 app.include_router(api)
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
-)

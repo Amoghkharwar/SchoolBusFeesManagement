@@ -298,9 +298,12 @@ def compute_status(yearly: float, paid: float) -> str:
     return "partial"
 
 
-async def student_to_out(doc: Dict[str, Any]) -> Dict[str, Any]:
+async def student_to_out(doc: Dict[str, Any], fy: Optional[str] = None) -> Dict[str, Any]:
     school = await db.schools.find_one({"id": doc["school_id"]}, {"_id": 0, "name": 1})
     payments = await db.payments.find({"student_id": doc["id"]}, {"_id": 0}).to_list(1000)
+    # Scope payments to the financial year when requested (so paid/pending are FY-accurate)
+    if fy:
+        payments = [p for p in payments if _in_fy(p.get("payment_date"), fy)]
     paid = sum(float(p["amount"]) for p in payments)
     yearly = float(doc["yearly_fee"])
     status_ = compute_status(yearly, paid)
@@ -666,7 +669,7 @@ async def dashboard_summary(fy: Optional[str] = None, admin=Depends(get_current_
     for p in payments:
         by_student[p["student_id"]] = by_student.get(p["student_id"], 0.0) + float(p["amount"])
     completed_total = sum(float(d["yearly_fee"]) for d in docs if by_student.get(d["id"], 0.0) + 0.0001 >= float(d["yearly_fee"]))
-    pending_total = sum(max(float(d["yearly_fee"]) - by_student.get(d["id"], 0.0), 0) for d in docs)
+    pending_total = max(total_yearly - total_collected, 0)
     return {
         "total_schools": total_schools,
         "total_students": total_students,
@@ -961,7 +964,7 @@ async def _gather_report_rows(
     s_dt = _parse_dt(start)
     e_dt = _parse_dt(end)
     for d in docs:
-        s = await student_to_out(d)
+        s = await student_to_out(d, fy=fy)
         if status_filter and s["status"] != status_filter:
             continue
         nd = _parse_dt(s.get("next_due_date") or s.get("due_date"))
@@ -1030,7 +1033,7 @@ async def report_excel(
     ws.cell(row=tot_row, column=5, value="TOTAL").font = Font(bold=True)
     ws.cell(row=tot_row, column=6, value=total_y).number_format = '"₹"#,##0'
     ws.cell(row=tot_row, column=7, value=total_p).number_format = '"₹"#,##0'
-    ws.cell(row=tot_row, column=8, value=total_pend).number_format = '"₹"#,##0'
+    ws.cell(row=tot_row, column=8, value=max(total_y - total_p, 0)).number_format = '"₹"#,##0'
     for col in range(5, 9):
         ws.cell(row=tot_row, column=col).font = Font(bold=True)
 
@@ -1095,7 +1098,7 @@ async def report_pdf(
         total_y += s["yearly_fee"]
         total_p += s["paid_amount"]
         total_pend += s["pending_amount"]
-    data.append(["", "", "", "", "TOTAL", _format_inr(total_y), _format_inr(total_p), _format_inr(total_pend), "", ""])
+    data.append(["", "", "", "", "TOTAL", _format_inr(total_y), _format_inr(total_p), _format_inr(max(total_y - total_p, 0)), "", ""])
 
     tbl = Table(data, repeatRows=1, colWidths=[28*mm, 28*mm, 14*mm, 28*mm, 24*mm, 22*mm, 22*mm, 22*mm, 18*mm, 26*mm])
     tbl.setStyle(TableStyle([
@@ -1172,7 +1175,7 @@ async def report_html(
     <body><h1>Bus Fee Report</h1><p>Generated: {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
     <table><thead><tr><th>Student</th><th>School</th><th>Class</th><th>Yearly</th><th>Paid</th><th>Pending</th><th>Status</th><th>Next Due</th></tr></thead>
     <tbody>{''.join(body_rows) or '<tr><td colspan=8>No records</td></tr>'}</tbody></table>
-    <div class='tot'><b>Total Yearly:</b> {_format_inr(total_y)} &nbsp; <b>Total Collected:</b> {_format_inr(total_p)} &nbsp; <b>Total Pending:</b> {_format_inr(total_pend)}</div>
+    <div class='tot'><b>Total Yearly:</b> {_format_inr(total_y)} &nbsp; <b>Total Collected:</b> {_format_inr(total_p)} &nbsp; <b>Total Pending:</b> {_format_inr(max(total_y - total_p, 0))}</div>
     </body></html>"""
 
 

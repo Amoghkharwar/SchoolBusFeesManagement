@@ -502,7 +502,9 @@ async def verify_reset(body: VerifyResetIn):
         raise HTTPException(400, "OTP expired")
     if len(body.new_password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
-    await db.users.update_one({"email": body.email}, {"$set": {"password_hash": hash_password(body.new_password)}})
+    res = await db.users.update_one({"email": body.email}, {"$set": {"password_hash": hash_password(body.new_password)}})
+    if res.matched_count == 0:
+        raise HTTPException(404, "No account found for that email")
     await db.password_resets.update_one({"email": body.email}, {"$set": {"consumed": True}})
     return {"ok": True, "message": "Password approved and updated."}
 

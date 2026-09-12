@@ -24,6 +24,7 @@ interface FYCtx {
   refresh: () => Promise<void>;
   closeFY: (label: string) => Promise<void>;
   deleteRecords: (label: string) => Promise<{ deleted_students: number; deleted_payments: number }>;
+  resetData: (label: string) => Promise<{ deleted_students: number; deleted_payments: number }>;
 }
 
 const FYContext = createContext<FYCtx>({
@@ -34,6 +35,7 @@ const FYContext = createContext<FYCtx>({
   refresh: async () => {},
   closeFY: async () => {},
   deleteRecords: async () => ({ deleted_students: 0, deleted_payments: 0 }),
+  resetData: async () => ({ deleted_students: 0, deleted_payments: 0 }),
 });
 
 const KEY = 'busfee:fy';
@@ -168,8 +170,34 @@ export function FYProvider({ children }: { children: React.ReactNode }) {
     return { deleted_students: deletedStudents, deleted_payments: deletedPayments };
   }, [refresh]);
 
+  // Reset (wipe) a FY's student + payment data without closing it — the FY stays
+  // open/registered and can immediately be used again with fresh data.
+  const resetData = useCallback(async (label: string) => {
+    let deletedStudents = 0;
+    let deletedPayments = 0;
+
+    try {
+      const res = await apiFetch(`/financial-years/${encodeURIComponent(label)}/reset`, { method: 'DELETE' });
+      deletedStudents = res.deleted_students ?? 0;
+      deletedPayments = res.deleted_payments ?? 0;
+    } catch {
+      try {
+        const res = await apiFetch(`/financial-years/reset`, {
+          method: 'POST',
+          body: JSON.stringify({ label }),
+        });
+        deletedStudents = res.deleted_students ?? 0;
+        deletedPayments = res.deleted_payments ?? 0;
+      } catch {
+        /* remote backend reset endpoint not yet deployed */
+      }
+    }
+    await refresh();
+    return { deleted_students: deletedStudents, deleted_payments: deletedPayments };
+  }, [refresh]);
+
   return (
-    <FYContext.Provider value={{ current, years, fyMeta, setCurrent, refresh, closeFY, deleteRecords }}>
+    <FYContext.Provider value={{ current, years, fyMeta, setCurrent, refresh, closeFY, deleteRecords, resetData }}>
       {children}
     </FYContext.Provider>
   );

@@ -931,6 +931,46 @@ async def delete_fy_records(
     }
 
 
+@api.delete("/financial-years/reset")
+@api.post("/financial-years/reset")
+@api.delete("/financial-years/{label}/reset")
+@api.post("/financial-years/{label}/reset")
+async def reset_fy_data(
+    label: Optional[str] = None,
+    body: Optional[FYActionIn] = None,
+    fy: Optional[str] = Query(None),
+    admin=Depends(get_current_admin),
+):
+    """Delete all students and payments belonging to a financial year, independent of its
+    open/closed status. Unlike delete_fy_records, the FY registration itself is kept (stays
+    open) so the year can immediately be used again with fresh data."""
+    target = label or fy or (body and body.label)
+    if not target:
+        raise HTTPException(400, "Missing financial year label")
+    target = target.strip()
+    import re
+    if not re.match(r"^\d{4}-\d{4}$", target):
+        raise HTTPException(400, "Invalid financial year label format")
+
+    all_students = await db.students.find({}, {"_id": 0, "id": 1, "admission_date": 1}).to_list(50000)
+    target_sids = [s["id"] for s in all_students if _in_fy(s.get("admission_date"), target)]
+
+    deleted_payments = 0
+    deleted_students = 0
+    if target_sids:
+        res_p = await db.payments.delete_many({"student_id": {"$in": target_sids}})
+        deleted_payments = res_p.deleted_count
+        res_s = await db.students.delete_many({"id": {"$in": target_sids}})
+        deleted_students = res_s.deleted_count
+
+    return {
+        "ok": True,
+        "label": target,
+        "deleted_students": deleted_students,
+        "deleted_payments": deleted_payments,
+    }
+
+
 # ---------- Reports: real PDF + real Excel ----------
 def _format_inr(n: float) -> str:
     s = f"{int(round(n)):,}"

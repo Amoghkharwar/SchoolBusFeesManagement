@@ -40,12 +40,12 @@ interface SchoolStat {
 }
 
 // Confirm step shown inline inside the action sheet (no Alert.alert — works on web + mobile)
-type ConfirmStep = 'close' | 'delete' | null;
+type ConfirmStep = 'close' | 'delete' | 'reset' | null;
 
 export default function Dashboard() {
   const { palette, isDark, mode, setMode } = useTheme();
   const { admin, logout } = useAuth();
-  const { current: fy, years, fyMeta, setCurrent, refresh: refreshFY, closeFY, deleteRecords } = useFY();
+  const { current: fy, years, fyMeta, setCurrent, refresh: refreshFY, closeFY, deleteRecords, resetData } = useFY();
   const [summary, setSummary] = useState<Summary | null>(null);
   const [schools, setSchools] = useState<SchoolStat[]>([]);
   const [loading, setLoading] = useState(true);
@@ -58,7 +58,7 @@ export default function Dashboard() {
 
   // FY action bottom-sheet
   const [actionFY, setActionFY] = useState<FYMeta | null>(null);
-  const [actionBusy, setActionBusy] = useState<'close' | 'delete' | 'pdf' | 'excel' | null>(null);
+  const [actionBusy, setActionBusy] = useState<'close' | 'delete' | 'reset' | 'pdf' | 'excel' | null>(null);
   const [actionMsg, setActionMsg] = useState('');
   // Inline confirm step (replaces Alert.alert so it works on web too)
   const [confirmStep, setConfirmStep] = useState<ConfirmStep>(null);
@@ -192,6 +192,23 @@ export default function Dashboard() {
       setTimeout(() => closeActionSheet(), 2500);
     } catch (e: any) {
       setActionMsg(`Error: ${e.message || 'Failed to delete records'}`);
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  // ── Reset FY data — wipes students/payments but keeps the FY open ──
+  const doResetData = async () => {
+    if (!actionFY) return;
+    const label = actionFY.label;
+    setActionBusy('reset');
+    setActionMsg('');
+    setConfirmStep(null);
+    try {
+      const res = await resetData(label);
+      setActionMsg(`✓ Reset FY ${label}: removed ${res.deleted_students} students & ${res.deleted_payments} payments. FY remains open.`);
+    } catch (e: any) {
+      setActionMsg(`Error: ${e.message || 'Failed to reset FY data'}`);
     } finally {
       setActionBusy(null);
     }
@@ -538,6 +555,19 @@ export default function Dashboard() {
               />
             )}
 
+            {/* ─── Confirm: Reset ─── */}
+            {confirmStep === 'reset' && (
+              <ConfirmPanel
+                title={`Reset student data for FY ${actionFY?.label}?`}
+                body="This will permanently delete ALL students and their payment history for this financial year, but the FY stays OPEN so you can start entering fresh data right away. This CANNOT be undone."
+                confirmLabel="Reset Data"
+                confirmColor={palette.error}
+                onConfirm={doResetData}
+                onCancel={() => setConfirmStep(null)}
+                palette={palette}
+              />
+            )}
+
             {/* ─── Normal action rows ─── */}
             {confirmStep === null && (
               <>
@@ -574,6 +604,19 @@ export default function Dashboard() {
                   busy={actionBusy === 'excel'}
                   onPress={() => handleDownloadReport('excel')}
                   palette={palette}
+                />
+
+                {/* RESET DATA — available anytime, independent of open/closed status */}
+                <View style={{ height: 1, backgroundColor: palette.border, marginVertical: spacing.sm }} />
+                <ActionRow
+                  icon="refresh-outline"
+                  label="Reset Student Data"
+                  description="Wipe all students & payments for this FY without closing it."
+                  color={palette.error}
+                  busy={actionBusy === 'reset'}
+                  onPress={() => setConfirmStep('reset')}
+                  palette={palette}
+                  destructive
                 />
 
                 {/* DELETE — only for closed FYs */}

@@ -235,6 +235,18 @@ def _in_fy(value: Optional[str], fy: Optional[str]) -> bool:
     return s <= dt < e
 
 
+async def _closed_fy_for(value: Optional[str]) -> Optional[str]:
+    """If the financial year containing this ISO date string is closed, return its label."""
+    dt = _parse_dt(value)
+    if not dt:
+        return None
+    label = fy_label(dt)
+    doc = await db.financial_years.find_one({"label": label}, {"_id": 0, "status": 1})
+    if doc and doc.get("status") == "closed":
+        return label
+    return None
+
+
 # ---------- Models ----------
 class CreateFY(BaseModel):
     label: str
@@ -564,6 +576,9 @@ async def create_student(body: StudentIn, admin=Depends(get_current_admin)):
     school = await db.schools.find_one({"id": body.school_id}, {"_id": 0})
     if not school:
         raise HTTPException(400, "Invalid school_id")
+    closed_fy = await _closed_fy_for(body.admission_date)
+    if closed_fy:
+        raise HTTPException(400, f"Cannot add student: Financial Year {closed_fy} is closed")
     doc = {**body.model_dump(), "id": str(uuid.uuid4()), "created_at": now_iso()}
     await db.students.insert_one(dict(doc))
     return await student_to_out(doc)
@@ -610,6 +625,9 @@ async def add_payment(student_id: str, body: PaymentIn, admin=Depends(get_curren
         raise HTTPException(404, "Student not found")
     if body.amount <= 0:
         raise HTTPException(400, "Amount must be positive")
+    closed_fy = await _closed_fy_for(body.payment_date)
+    if closed_fy:
+        raise HTTPException(400, f"Cannot record payment: Financial Year {closed_fy} is closed")
     existing_payments = await db.payments.find({"student_id": student_id}, {"_id": 0}).to_list(1000)
     already_paid = sum(float(p["amount"]) for p in existing_payments)
     yearly_fee = float(student["yearly_fee"])

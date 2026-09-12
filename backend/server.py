@@ -610,6 +610,14 @@ async def add_payment(student_id: str, body: PaymentIn, admin=Depends(get_curren
         raise HTTPException(404, "Student not found")
     if body.amount <= 0:
         raise HTTPException(400, "Amount must be positive")
+    existing_payments = await db.payments.find({"student_id": student_id}, {"_id": 0}).to_list(1000)
+    already_paid = sum(float(p["amount"]) for p in existing_payments)
+    yearly_fee = float(student["yearly_fee"])
+    remaining = round(yearly_fee - already_paid, 2)
+    if body.amount > remaining:
+        if remaining <= 0:
+            raise HTTPException(400, "Yearly fee is already fully paid; no balance remaining")
+        raise HTTPException(400, f"Payment exceeds remaining balance of Rs. {remaining}")
     doc = {
         **body.model_dump(),
         "id": str(uuid.uuid4()),

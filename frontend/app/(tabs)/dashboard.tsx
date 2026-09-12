@@ -189,6 +189,7 @@ export default function Dashboard() {
     try {
       const res = await deleteRecords(label);
       setActionMsg(`✓ Deleted ${res.deleted_students} students & ${res.deleted_payments} payments for FY ${label}.`);
+      await load();
       setTimeout(() => closeActionSheet(), 2500);
     } catch (e: any) {
       setActionMsg(`Error: ${e.message || 'Failed to delete records'}`);
@@ -207,6 +208,7 @@ export default function Dashboard() {
     try {
       const res = await resetData(label);
       setActionMsg(`✓ Reset FY ${label}: removed ${res.deleted_students} students & ${res.deleted_payments} payments. FY remains open.`);
+      await load();
     } catch (e: any) {
       setActionMsg(`Error: ${e.message || 'Failed to reset FY data'}`);
     } finally {

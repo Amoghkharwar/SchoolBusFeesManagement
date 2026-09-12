@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import random
+import re
 import string
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -18,7 +19,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from starlette.middleware.cors import CORSMiddleware
 
 ROOT_DIR = Path(__file__).parent
@@ -235,16 +236,27 @@ def _in_fy(value: Optional[str], fy: Optional[str]) -> bool:
     return s <= dt < e
 
 
-async def _closed_fy_for(value: Optional[str]) -> Optional[str]:
-    """If the financial year containing this ISO date string is closed, return its label."""
+async def _fy_entry_error(value: Optional[str], action: str) -> Optional[str]:
+    """Returns an error message if a record dated `value` should not be allowed
+    in, else None. Only the current financial year (unless explicitly closed) or
+    a past year explicitly reopened (status == "open" in financial_years) may
+    receive new students/payments. Any other year — explicitly closed, or simply
+    never registered (e.g. a stray 2024 date picked by mistake) — is rejected,
+    since only the currently tracked FY window is meant to be editable."""
     dt = _parse_dt(value)
     if not dt:
         return None
     label = fy_label(dt)
+    current_label = fy_label(datetime.now(timezone.utc))
     doc = await db.financial_years.find_one({"label": label}, {"_id": 0, "status": 1})
-    if doc and doc.get("status") == "closed":
-        return label
-    return None
+    fy_status = doc.get("status") if doc else None
+    if fy_status == "closed":
+        return f"Cannot {action}: Financial Year {label} is closed"
+    if label == current_label:
+        return None
+    if fy_status == "open":
+        return None
+    return f"Cannot {action}: Financial Year {label} is not open for new entries"
 
 
 # ---------- Models ----------
@@ -291,6 +303,20 @@ class StudentIn(BaseModel):
     yearly_fee: float
     admission_date: str  # ISO datetime
     due_date: str  # ISO datetime
+
+    @field_validator("parent_mobile")
+    @classmethod
+    def validate_parent_mobile(cls, v: str) -> str:
+        digits = v.strip()
+        if digits.startswith("+91"):
+            digits = digits[3:]
+        elif digits.startswith("91") and len(digits) == 12:
+            digits = digits[2:]
+        elif digits.startswith("0") and len(digits) == 11:
+            digits = digits[1:]
+        if not re.fullmatch(r"[6-9]\d{9}", digits):
+            raise ValueError("Parent mobile must be a valid 10-digit Indian mobile number")
+        return digits
 
 
 class PaymentIn(BaseModel):
@@ -571,14 +597,34 @@ async def list_students(
     return out
 
 
+def _duplicate_student_query(body: StudentIn, exclude_id: Optional[str] = None) -> Dict[str, Any]:
+    """Matches an existing student with the same name, parent, mobile, class,
+    pickup location, and fee within the same school — a near-certain sign the
+    same enrollment is being entered twice."""
+    q: Dict[str, Any] = {
+        "school_id": body.school_id,
+        "name": {"$regex": f"^{re.escape(body.name.strip())}$", "$options": "i"},
+        "parent_name": {"$regex": f"^{re.escape(body.parent_name.strip())}$", "$options": "i"},
+        "parent_mobile": body.parent_mobile,
+        "standard": {"$regex": f"^{re.escape(body.standard.strip())}$", "$options": "i"},
+        "pickup_location": {"$regex": f"^{re.escape((body.pickup_location or '').strip())}$", "$options": "i"},
+        "yearly_fee": body.yearly_fee,
+    }
+    if exclude_id:
+        q["id"] = {"$ne": exclude_id}
+    return q
+
+
 @api.post("/students")
 async def create_student(body: StudentIn, admin=Depends(get_current_admin)):
     school = await db.schools.find_one({"id": body.school_id}, {"_id": 0})
     if not school:
         raise HTTPException(400, "Invalid school_id")
-    closed_fy = await _closed_fy_for(body.admission_date)
-    if closed_fy:
-        raise HTTPException(400, f"Cannot add student: Financial Year {closed_fy} is closed")
+    fy_err = await _fy_entry_error(body.admission_date, "add student")
+    if fy_err:
+        raise HTTPException(400, fy_err)
+    if await db.students.find_one(_duplicate_student_query(body)):
+        raise HTTPException(400, "A student with the same name, parent, mobile, class, pickup location, and fee already exists")
     doc = {**body.model_dump(), "id": str(uuid.uuid4()), "created_at": now_iso()}
     await db.students.insert_one(dict(doc))
     return await student_to_out(doc)
@@ -597,6 +643,8 @@ async def update_student(student_id: str, body: StudentIn, admin=Depends(get_cur
     school = await db.schools.find_one({"id": body.school_id}, {"_id": 0})
     if not school:
         raise HTTPException(400, "Invalid school_id")
+    if await db.students.find_one(_duplicate_student_query(body, exclude_id=student_id)):
+        raise HTTPException(400, "A student with the same name, parent, mobile, class, pickup location, and fee already exists")
     res = await db.students.update_one({"id": student_id}, {"$set": body.model_dump()})
     if res.matched_count == 0:
         raise HTTPException(404, "Student not found")
@@ -625,9 +673,9 @@ async def add_payment(student_id: str, body: PaymentIn, admin=Depends(get_curren
         raise HTTPException(404, "Student not found")
     if body.amount <= 0:
         raise HTTPException(400, "Amount must be positive")
-    closed_fy = await _closed_fy_for(body.payment_date)
-    if closed_fy:
-        raise HTTPException(400, f"Cannot record payment: Financial Year {closed_fy} is closed")
+    fy_err = await _fy_entry_error(body.payment_date, "record payment")
+    if fy_err:
+        raise HTTPException(400, fy_err)
     existing_payments = await db.payments.find({"student_id": student_id}, {"_id": 0}).to_list(1000)
     already_paid = sum(float(p["amount"]) for p in existing_payments)
     yearly_fee = float(student["yearly_fee"])

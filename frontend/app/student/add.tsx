@@ -6,7 +6,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize } from '@/src/theme';
-import { Button, TextField, DateTimeField } from '@/src/components/ui';
+import { AlertModal, Button, TextField, DateTimeField } from '@/src/components/ui';
 
 interface School { id: string; name: string }
 
@@ -25,6 +25,7 @@ export default function StudentForm() {
   const [admission, setAdmission] = useState(new Date().toISOString());
   const [due, setDue] = useState('');
   const [err, setErr] = useState('');
+  const [successMsg, setSuccessMsg] = useState('');
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -47,16 +48,23 @@ export default function StudentForm() {
     }
     if (!admission) { setErr('Please select an admission date'); return; }
     if (!due) { setErr('Please select a due date'); return; }
+    const feeNum = parseFloat(fee);
+    if (!Number.isFinite(feeNum) || feeNum <= 0) {
+      setErr('Enter a valid yearly fee amount'); return;
+    }
+    if (!/^[6-9]\d{9}$/.test(mobile.trim())) {
+      setErr('Enter a valid 10-digit mobile number'); return;
+    }
     setLoading(true);
     try {
       const body = JSON.stringify({
         name: name.trim(), parent_name: parent.trim(), parent_mobile: mobile.trim(),
         school_id: schoolId, standard: standard.trim(), pickup_location: pickup,
-        yearly_fee: parseFloat(fee), admission_date: admission, due_date: due,
+        yearly_fee: feeNum, admission_date: admission, due_date: due,
       });
       if (editing) await apiFetch(`/students/${id}`, { method: 'PUT', body });
       else await apiFetch('/students', { method: 'POST', body });
-      router.back();
+      setSuccessMsg(editing ? 'Student updated successfully' : 'Student created successfully');
     } catch (e: any) {
       setErr(e.message);
     } finally {
@@ -74,7 +82,13 @@ export default function StudentForm() {
         <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 60 }} keyboardShouldPersistTaps="handled">
           <TextField label="Student Name *" value={name} onChangeText={setName} testID="student-name" />
           <TextField label="Parent Name *" value={parent} onChangeText={setParent} testID="student-parent" />
-          <TextField label="Parent Mobile (WhatsApp) *" value={mobile} onChangeText={setMobile} keyboardType="phone-pad" testID="student-mobile" />
+          <TextField
+            label="Parent Mobile (WhatsApp) *"
+            value={mobile}
+            onChangeText={(t) => setMobile(t.replace(/[^0-9]/g, '').slice(0, 10))}
+            keyboardType="phone-pad"
+            testID="student-mobile"
+          />
 
           <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>School *</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }} style={{ marginBottom: spacing.md }}>
@@ -95,14 +109,40 @@ export default function StudentForm() {
 
           <TextField label="Standard / Class *" value={standard} onChangeText={setStandard} testID="student-standard" />
           <TextField label="Pickup Location" value={pickup} onChangeText={setPickup} testID="student-pickup" />
-          <TextField label="Yearly Bus Fee (₹) *" value={fee} onChangeText={setFee} keyboardType="numeric" testID="student-fee" />
+          <TextField
+            label="Yearly Bus Fee (₹) *"
+            value={fee}
+            onChangeText={(t) => setFee(t.replace(/[^0-9.]/g, ''))}
+            keyboardType="numeric"
+            testID="student-fee"
+          />
           <DateTimeField label="Admission Date & Time" value={admission} onChange={setAdmission} required testID="student-admission" />
           <DateTimeField label="Due Date & Time" value={due} onChange={setDue} required testID="student-due" />
 
-          {err ? <Text style={{ color: palette.error, marginBottom: spacing.md }}>{err}</Text> : null}
           <Button title={editing ? 'Save Changes' : 'Add Student'} onPress={submit} loading={loading} testID="student-submit" />
         </ScrollView>
       </KeyboardAvoidingView>
+
+      <AlertModal
+        visible={!!err}
+        title="Cannot Save Student"
+        message={err}
+        onClose={() => setErr('')}
+        testID="student-form-error"
+      />
+
+      <AlertModal
+        visible={!!successMsg}
+        variant="success"
+        title="Success"
+        message={successMsg}
+        onClose={() => {
+          setSuccessMsg('');
+          if (editing) router.back();
+          else router.replace('/(tabs)/students');
+        }}
+        testID="student-form-success"
+      />
     </SafeAreaView>
   );
 }

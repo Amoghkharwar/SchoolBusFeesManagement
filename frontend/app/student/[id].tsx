@@ -16,7 +16,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
-import { Button, Card, EmptyState, StatusBadge, TextField, DateTimeField } from '@/src/components/ui';
+import { AlertModal, Button, Card, EmptyState, StatusBadge, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR, openWhatsApp, reminderMessage } from '@/src/utils/format';
 import { isoToDisplay } from '@/src/utils/datetime';
 
@@ -48,6 +48,7 @@ export default function StudentDetail() {
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [modalErr, setModalErr] = useState('');
+  const [successMsg, setSuccessMsg] = useState('');
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -83,6 +84,7 @@ export default function StudentDetail() {
       setShowModal(false);
       setAmount(''); setNote(''); setMode('cash'); setNextDue(''); setDate(new Date().toISOString());
       await load();
+      setSuccessMsg('Payment recorded successfully');
     } catch (e: any) {
       setModalErr(e.message);
     } finally {
@@ -209,7 +211,13 @@ export default function StudentDetail() {
           <View style={{ backgroundColor: palette.surfaceSecondary, padding: spacing.lg, borderTopLeftRadius: 24, borderTopRightRadius: 24 }}>
             <View style={{ alignSelf: 'center', width: 40, height: 4, backgroundColor: palette.border, borderRadius: 2, marginBottom: spacing.md }} />
             <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: spacing.md }}>Record Payment</Text>
-            <TextField label="Amount (₹) *" value={amount} onChangeText={setAmount} keyboardType="numeric" testID="payment-amount" />
+            <TextField
+              label="Amount (₹) *"
+              value={amount}
+              onChangeText={(t) => setAmount(t.replace(/[^0-9.]/g, ''))}
+              keyboardType="numeric"
+              testID="payment-amount"
+            />
             <DateTimeField label="Payment Date & Time" value={date} onChange={setDate} required testID="payment-date" />
             <DateTimeField label="Next Fee Due Date" value={nextDue} onChange={setNextDue} testID="payment-next-due" />
             <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>Mode</Text>
@@ -229,13 +237,29 @@ export default function StudentDetail() {
               })}
             </View>
             <TextField label="Note (optional)" value={note} onChangeText={setNote} testID="payment-note" />
-            {modalErr ? <Text style={{ color: palette.error, marginBottom: 8 }}>{modalErr}</Text> : null}
             <Button title="Save Payment" onPress={submitPayment} loading={submitting} testID="payment-save" />
             <View style={{ height: spacing.sm }} />
             <Button title="Cancel" variant="ghost" onPress={() => setShowModal(false)} />
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
+      <AlertModal
+        visible={!!modalErr}
+        title="Cannot Save Payment"
+        message={modalErr}
+        onClose={() => setModalErr('')}
+        testID="payment-form-error"
+      />
+
+      <AlertModal
+        visible={!!successMsg}
+        variant="success"
+        title="Success"
+        message={successMsg}
+        onClose={() => setSuccessMsg('')}
+        testID="payment-form-success"
+      />
     </SafeAreaView>
   );
 }

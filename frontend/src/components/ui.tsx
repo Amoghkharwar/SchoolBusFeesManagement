@@ -188,6 +188,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
 
   const [open, setOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<'date' | 'time'>('date');
+  const [yearPickerOpen, setYearPickerOpen] = useState(false);
 
   // Local state for navigation (month & year)
   const initialDate = value ? new Date(value) : new Date();
@@ -224,6 +225,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
     setSelMin(curr.getMinutes());
     setSelAmPm(getAmPm(curr.getHours()));
     setActiveTab('date');
+    setYearPickerOpen(false);
     setOpen(true);
   };
 
@@ -283,6 +285,12 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
       isCurrentMonth: false,
     });
   }
+
+  // Wide-but-bounded range so the year can be jumped to directly instead of
+  // clicking the month arrow up to a hundred times.
+  const realCurrentYear = new Date().getFullYear();
+  const yearOptions: number[] = [];
+  for (let y = realCurrentYear + 5; y >= realCurrentYear - 50; y--) yearOptions.push(y);
 
   const handleMonthPrev = () => {
     if (navMonth === 0) {
@@ -421,10 +429,16 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
               {(isLargeScreen || activeTab === 'date') && (
                 <View style={{ flex: 1, minWidth: 260 }}>
                   {/* Calendar Navigation */}
-                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: spacing.md }}>
-                    <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>
-                      {CAL_MONTHS[navMonth]} {navYear}
-                    </Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: yearPickerOpen ? spacing.sm : spacing.md }}>
+                    <Pressable
+                      onPress={() => setYearPickerOpen((o) => !o)}
+                      style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}
+                    >
+                      <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>
+                        {CAL_MONTHS[navMonth]} {navYear}
+                      </Text>
+                      <Ionicons name={yearPickerOpen ? 'chevron-up' : 'chevron-down'} size={16} color={palette.muted} />
+                    </Pressable>
                     <View style={{ flexDirection: 'row', gap: 6 }}>
                       <Pressable onPress={handleMonthPrev} style={{ padding: 6, borderRadius: radii.pill, backgroundColor: palette.surfaceTertiary }}>
                         <Ionicons name="chevron-back" size={18} color={palette.onSurface} />
@@ -434,6 +448,35 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
                       </Pressable>
                     </View>
                   </View>
+
+                  {/* Year picker — tap a year to jump straight to it */}
+                  {yearPickerOpen && (
+                    <ScrollView
+                      style={{ maxHeight: 160, marginBottom: spacing.md, borderWidth: 1, borderColor: palette.border, borderRadius: radii.md }}
+                      contentContainerStyle={{ padding: 6 }}
+                    >
+                      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+                        {yearOptions.map((y) => {
+                          const isSel = y === navYear;
+                          return (
+                            <Pressable
+                              key={y}
+                              onPress={() => { setNavYear(y); setYearPickerOpen(false); }}
+                              style={{
+                                paddingHorizontal: 12, paddingVertical: 8, borderRadius: radii.sm,
+                                backgroundColor: isSel ? palette.brand : palette.surfaceTertiary,
+                                minWidth: 64, alignItems: 'center',
+                              }}
+                            >
+                              <Text style={{ color: isSel ? '#fff' : palette.onSurface, fontWeight: '600', fontSize: fontSize.sm }}>
+                                {y}
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                    </ScrollView>
+                  )}
 
                   {/* Weekday headers */}
                   <View style={{ flexDirection: 'row', marginBottom: spacing.xs }}>
@@ -793,6 +836,85 @@ export function FAB({
     >
       <Ionicons name={icon} size={28} color="#fff" />
     </Pressable>
+  );
+}
+
+// ── Alert popup — for surfacing a single error/success message as a modal ──
+// (native Alert.alert doesn't render on web, so this is the app's dialog for
+// anything more attention-grabbing than inline field text.)
+export function AlertModal({
+  visible,
+  title,
+  message,
+  variant = 'error',
+  onClose,
+  testID,
+}: {
+  visible: boolean;
+  title?: string;
+  message: string;
+  variant?: 'error' | 'success';
+  onClose: () => void;
+  testID?: string;
+}) {
+  const { palette } = useTheme();
+  const { width } = useWindowDimensions();
+  const isLargeScreen = width >= 700;
+  const color = variant === 'success' ? palette.success : palette.error;
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={{
+        flex: 1,
+        backgroundColor: 'rgba(0, 0, 0, 0.45)',
+        justifyContent: 'center',
+        alignItems: 'center',
+        padding: spacing.lg,
+      }}>
+        <Pressable style={{ ...StyleSheet.absoluteFillObject }} onPress={onClose} />
+        <View
+          testID={testID}
+          style={{
+            width: isLargeScreen ? 420 : '100%',
+            maxWidth: '100%',
+            backgroundColor: palette.surfaceSecondary,
+            borderRadius: radii.lg,
+            padding: spacing.lg,
+            shadowColor: '#000',
+            shadowOpacity: 0.25,
+            shadowRadius: 15,
+            elevation: 10,
+          }}
+        >
+          <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 10, marginBottom: spacing.md }}>
+            <View style={{
+              width: 34, height: 34, borderRadius: 17, backgroundColor: `${color}18`,
+              alignItems: 'center', justifyContent: 'center',
+            }}>
+              <Ionicons name={variant === 'success' ? 'checkmark-circle' : 'alert-circle'} size={20} color={color} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: palette.onSurface, fontWeight: '700', fontSize: fontSize.lg }}>
+                {title || (variant === 'success' ? 'Success' : 'Something went wrong')}
+              </Text>
+              <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4, lineHeight: 19 }}>
+                {message}
+              </Text>
+            </View>
+          </View>
+          <Pressable
+            onPress={onClose}
+            testID={testID ? `${testID}-ok` : undefined}
+            style={{
+              paddingVertical: 12, borderRadius: radii.md,
+              backgroundColor: color, alignItems: 'center',
+            }}
+          >
+            <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm }}>OK</Text>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
   );
 }
 

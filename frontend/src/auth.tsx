@@ -8,6 +8,28 @@ import { router } from 'expo-router';
 const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL || '';
 const API = `${BACKEND}/api`;
 const TOKEN_KEY = 'busfee:token';
+
+// FastAPI sends { detail: "some message" } for our own HTTPExceptions, but
+// { detail: [{ type, loc, msg, ... }, ...] } for Pydantic request-validation
+// errors (422) — turn either shape into one readable string instead of
+// letting `[object Object]` leak into the UI.
+function extractErrorMessage(data: any, fallback: string): string {
+  const detail = data && data.detail;
+  if (!detail) return fallback;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d: any) => {
+        if (typeof d === 'string') return d;
+        const loc = Array.isArray(d?.loc) ? d.loc : [];
+        const field = loc.length ? String(loc[loc.length - 1]).replace(/_/g, ' ') : '';
+        const msg = String(d?.msg || 'Invalid value').replace(/^Value error,\s*/, '');
+        return field ? `${field}: ${msg}` : msg;
+      })
+      .join('; ');
+  }
+  return fallback;
+}
 console.log('[DEBUG] EXPO_PUBLIC_BACKEND_URL =', process.env.EXPO_PUBLIC_BACKEND_URL);
 console.log('[DEBUG] BACKEND =', BACKEND);
 console.log('[DEBUG] API =', API);
@@ -74,7 +96,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      throw new Error(j.detail || 'Login failed');
+      throw new Error(extractErrorMessage(j, 'Login failed'));
     }
     const j = await res.json();
     await AsyncStorage.setItem(TOKEN_KEY, j.token);
@@ -124,7 +146,7 @@ export async function apiFetch<T = any>(path: string, opts: RequestInit = {}): P
   const isJson = (res.headers.get('content-type') || '').includes('application/json');
   const data = isJson && text ? JSON.parse(text) : (text as any);
   if (!res.ok) {
-    throw new Error((data && (data as any).detail) || 'Request failed');
+    throw new Error(extractErrorMessage(data, 'Request failed'));
   }
   return data as T;
 }

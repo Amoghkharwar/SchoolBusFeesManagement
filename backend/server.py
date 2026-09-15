@@ -37,9 +37,24 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "12345678")
 FIREBASE_CREDENTIALS_PATH = os.environ.get("FIREBASE_CREDENTIALS_PATH", "")
 FIREBASE_BUCKET = os.environ.get("FIREBASE_BUCKET", "")
 
-VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
-VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
-VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:admin@busfee.app")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
+
+
+def _vapid_subject(raw: str) -> str:
+    """Push services reject a `sub` claim that isn't a mailto:/https: URL, and an
+    env var that is set-but-blank never falls back to a default — so normalise
+    both here rather than trusting how the value was typed into a dashboard.
+    """
+    value = (raw or "").strip()
+    if not value:
+        value = ADMIN_EMAIL or "admin@busfee.app"
+    if value.startswith(("mailto:", "http://", "https://")):
+        return value
+    return f"mailto:{value}"
+
+
+VAPID_SUBJECT = _vapid_subject(os.environ.get("VAPID_SUBJECT", ""))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("busfee")

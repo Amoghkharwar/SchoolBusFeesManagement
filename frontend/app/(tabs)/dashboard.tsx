@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   Linking,
   Modal,
@@ -19,7 +19,9 @@ import type { FYMeta } from '@/src/fy';
 import { useFY } from '@/src/fy';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { formatINR } from '@/src/utils/format';
-import { Card, EmptyState } from '@/src/components/ui';
+import { AlertModal, Card, EmptyState } from '@/src/components/ui';
+import type { PushState } from '@/src/push';
+import { disablePush, enablePush, pushPermission, syncPush } from '@/src/push';
 import { Skeleton, SkeletonCard, SkeletonKPI } from '@/src/components/Skeleton';
 
 interface Summary {
@@ -62,6 +64,36 @@ export default function Dashboard() {
   const [actionMsg, setActionMsg] = useState('');
   // Inline confirm step (replaces Alert.alert so it works on web too)
   const [confirmStep, setConfirmStep] = useState<ConfirmStep>(null);
+
+  const [pushState, setPushState] = useState<PushState>('unsupported');
+  const [pushMsg, setPushMsg] = useState('');
+
+  useEffect(() => {
+    setPushState(pushPermission());
+    syncPush();
+  }, []);
+
+  const togglePush = async () => {
+    if (pushState === 'granted') {
+      await disablePush();
+      setPushState('default');
+      setPushMsg('Notifications turned off on this device.');
+      return;
+    }
+    try {
+      const next = await enablePush();
+      setPushState(next);
+      setPushMsg(
+        next === 'granted'
+          ? 'Notifications are on. You will be alerted when a student or school is added.'
+          : next === 'denied'
+            ? 'Notifications are blocked. Enable them for this site in your browser settings.'
+            : 'Notification permission was dismissed.',
+      );
+    } catch (e: any) {
+      setPushMsg(e?.message || 'Could not enable notifications.');
+    }
+  };
 
   const isAdmin = admin?.role === 'admin';
 
@@ -254,6 +286,16 @@ export default function Dashboard() {
           </Text>
         </View>
         <View style={{ flexDirection: 'row', gap: spacing.sm }}>
+          {pushState !== 'unsupported' && (
+            <Pressable onPress={togglePush} testID="push-toggle"
+              style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: palette.surfaceTertiary, alignItems: 'center', justifyContent: 'center' }}>
+              <Ionicons
+                name={pushState === 'granted' ? 'notifications' : 'notifications-off-outline'}
+                size={18}
+                color={pushState === 'granted' ? palette.brand : palette.onSurface}
+              />
+            </Pressable>
+          )}
           <Pressable onPress={cycleTheme} testID="theme-toggle"
             style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: palette.surfaceTertiary, alignItems: 'center', justifyContent: 'center' }}>
             <Ionicons name={isDark ? 'sunny' : 'moon'} size={18} color={palette.onSurface} />
@@ -660,6 +702,15 @@ export default function Dashboard() {
           </Pressable>
         </Pressable>
       </Modal>
+
+      <AlertModal
+        visible={!!pushMsg}
+        variant={pushState === 'granted' ? 'success' : 'error'}
+        title="Notifications"
+        message={pushMsg}
+        onClose={() => setPushMsg('')}
+        testID="push-status"
+      />
     </SafeAreaView>
   );
 }

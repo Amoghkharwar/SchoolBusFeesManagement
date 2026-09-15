@@ -30,6 +30,41 @@ if (Platform.OS === 'web' && typeof document !== 'undefined') {
     `;
     document.head.appendChild(style);
   }
+
+  // Same reason: the manifest and theme-color tags that make the site
+  // installable have to be added here rather than in +html.tsx.
+  const head = (rel: string, attrs: Record<string, string>) => {
+    if (document.querySelector(`link[rel="${rel}"]`)) return;
+    const el = document.createElement('link');
+    el.rel = rel;
+    Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+    document.head.appendChild(el);
+  };
+
+  head('manifest', { href: '/manifest.json' });
+  head('apple-touch-icon', { href: '/icon-192.png' });
+
+  if (!document.querySelector('meta[name="theme-color"]')) {
+    const meta = document.createElement('meta');
+    meta.name = 'theme-color';
+    meta.content = '#0f172a';
+    document.head.appendChild(meta);
+  }
+
+  if (!document.querySelector('meta[name="apple-mobile-web-app-capable"]')) {
+    const meta = document.createElement('meta');
+    meta.name = 'apple-mobile-web-app-capable';
+    meta.content = 'yes';
+    document.head.appendChild(meta);
+  }
+
+  // Registered up front, not on first notification opt-in: the browser only
+  // offers "Install app" once a service worker is active.
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    });
+  }
 }
 
 function AuthGuard({ children }: { children: React.ReactNode }) {

@@ -31,6 +31,35 @@ interface Payment {
 
 const MODES = ['cash', 'upi', 'bank'];
 
+const dayLabel = (n: number) => `${n} day${n === 1 ? '' : 's'}`;
+
+// Spells out what the payment did to an overdue record, so clearing an overdue
+// reads differently from merely denting it.
+function paymentSummary(paidLabel: string, overdueBefore: number, s: any): string {
+  if (!s) return `${paidLabel} recorded successfully.`;
+
+  const stillOverdue = (s.overdue_days ?? 0) > 0;
+
+  if (s.status === 'completed') {
+    return overdueBefore > 0
+      ? `${paidLabel} recorded. Overdue of ${dayLabel(overdueBefore)} is cleared and the yearly fee is now fully paid.`
+      : `${paidLabel} recorded. The yearly fee is now fully paid.`;
+  }
+
+  const pending = `${formatINR(s.pending_amount)} still pending`;
+
+  if (overdueBefore > 0 && !stillOverdue) {
+    const nextDue = isoToDisplay(s.next_due_date || s.due_date);
+    return `${paidLabel} recorded. Overdue of ${dayLabel(overdueBefore)} is cleared — ${pending}${nextDue ? `, next due ${nextDue}` : ''}.`;
+  }
+
+  if (stillOverdue) {
+    return `${paidLabel} recorded, but this record is still overdue by ${dayLabel(s.overdue_days)} — ${pending}.`;
+  }
+
+  return `${paidLabel} recorded. ${pending}.`;
+}
+
 export default function StudentDetail() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { palette } = useTheme();
@@ -51,14 +80,15 @@ export default function StudentDetail() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   const load = useCallback(async () => {
-    if (!id) return;
+    if (!id) return null;
     try {
       const [s, p] = await Promise.all([
-        apiFetch(`/students/${id}`),
+        apiFetch<any>(`/students/${id}`),
         apiFetch<Payment[]>(`/students/${id}/payments`),
       ]);
       setStudent(s);
       setPayments(p);
+      return s;
     } finally {
       setLoading(false);
     }
@@ -75,6 +105,7 @@ export default function StudentDetail() {
     if (nextDue.trim()) {
       nextIso = nextDue || null;
     }
+    const overdueBefore = student?.overdue_days ?? 0;
     setSubmitting(true);
     try {
       await apiFetch(`/students/${id}/payments`, {
@@ -83,8 +114,8 @@ export default function StudentDetail() {
       });
       setShowModal(false);
       setAmount(''); setNote(''); setMode('cash'); setNextDue(''); setDate(new Date().toISOString());
-      await load();
-      setSuccessMsg('Payment recorded successfully');
+      const fresh = await load();
+      setSuccessMsg(paymentSummary(formatINR(amt), overdueBefore, fresh));
     } catch (e: any) {
       setModalErr(e.message);
     } finally {

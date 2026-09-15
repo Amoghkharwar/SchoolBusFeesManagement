@@ -6,7 +6,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize } from '@/src/theme';
-import { Button, TextField } from '@/src/components/ui';
+import { AlertModal, Button, TextField } from '@/src/components/ui';
 
 export default function SchoolForm() {
   const { id } = useLocalSearchParams<{ id?: string }>();
@@ -18,6 +18,7 @@ export default function SchoolForm() {
   const [phone, setPhone] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
+  const [successMsg, setSuccessMsg] = useState('');
   const [hydrating, setHydrating] = useState(editing);
 
   useEffect(() => {
@@ -36,7 +37,11 @@ export default function SchoolForm() {
       const body = JSON.stringify({ name: name.trim(), address, contact_person: contact, contact_phone: phone });
       if (editing) await apiFetch(`/schools/${id}`, { method: 'PUT', body });
       else await apiFetch('/schools', { method: 'POST', body });
-      router.back();
+      setSuccessMsg(
+        editing
+          ? `${name.trim()} updated successfully`
+          : `${name.trim()} added successfully. You can now add students to this school.`,
+      );
     } catch (e: any) {
       setErr(e.message);
     } finally {
@@ -59,11 +64,27 @@ export default function SchoolForm() {
           <TextField label="Address" value={address} onChangeText={setAddress} testID="school-address" />
           <TextField label="Contact Person" value={contact} onChangeText={setContact} testID="school-contact" />
           <TextField label="Contact Phone" value={phone} onChangeText={setPhone} keyboardType="phone-pad" testID="school-phone" />
-          {err ? <Text style={{ color: palette.error, marginBottom: spacing.md }}>{err}</Text> : null}
           <Button title={editing ? 'Save Changes' : 'Add School'} onPress={submit} loading={loading} testID="school-submit" />
         </ScrollView>
       </KeyboardAvoidingView>
       )}
+
+      <AlertModal
+        visible={!!err}
+        title="Cannot Save School"
+        message={err}
+        onClose={() => setErr('')}
+        testID="school-form-error"
+      />
+
+      <AlertModal
+        visible={!!successMsg}
+        variant="success"
+        title={editing ? 'School Updated' : 'School Added'}
+        message={successMsg}
+        onClose={() => { setSuccessMsg(''); router.back(); }}
+        testID="school-form-success"
+      />
     </SafeAreaView>
   );
 }

@@ -37,6 +37,10 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "12345678")
 FIREBASE_CREDENTIALS_PATH = os.environ.get("FIREBASE_CREDENTIALS_PATH", "")
 FIREBASE_BUCKET = os.environ.get("FIREBASE_BUCKET", "")
 
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:admin@busfee.app")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("busfee")
 
@@ -188,6 +192,67 @@ def send_email(to: str, subject: str, html: str) -> bool:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------- Web Push ----------
+async def send_push_to_all(title: str, body: str, url: str = "/") -> int:
+    """Fans a notification out to every stored subscription.
+
+    Subscriptions the push service reports as gone (404/410) are deleted, which
+    is the only way they ever get cleaned up — browsers rotate them silently.
+    """
+    if not VAPID_PRIVATE_KEY:
+        logger.warning("[DEV] No VAPID_PRIVATE_KEY — skipping push: %s", title)
+        return 0
+
+    try:
+        from pywebpush import WebPushException, webpush
+    except ImportError:
+        logger.error("pywebpush not installed — skipping push")
+        return 0
+
+    import asyncio
+    import json
+
+    subs = await db.push_subscriptions.find({}, {"_id": 0}).to_list(2000)
+    if not subs:
+        return 0
+
+    payload = json.dumps({"title": title, "body": body, "url": url})
+    stale: List[str] = []
+
+    def deliver(sub: Dict[str, Any]) -> bool:
+        try:
+            webpush(
+                subscription_info=sub["subscription"],
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": VAPID_SUBJECT},
+                timeout=10,
+            )
+            return True
+        except WebPushException as e:
+            code = getattr(e.response, "status_code", None)
+            if code in (404, 410):
+                stale.append(sub["endpoint"])
+            else:
+                logger.warning("Push failed (%s): %s", code, e)
+            return False
+        except Exception as e:
+            logger.warning("Push error: %s", e)
+            return False
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(deliver, s) for s in subs), return_exceptions=True
+    )
+    sent = sum(1 for r in results if r is True)
+
+    if stale:
+        await db.push_subscriptions.delete_many({"endpoint": {"$in": stale}})
+        logger.info("Pruned %d stale push subscriptions", len(stale))
+
+    logger.info("Push '%s' delivered to %d/%d subscriptions", title, sent, len(subs))
+    return sent
 
 
 # ---------- Financial Year (Indian Default: April → March) ----------
@@ -525,6 +590,8 @@ async def list_schools(admin=Depends(get_current_admin)):
 async def create_school(body: SchoolIn, admin=Depends(get_current_admin)):
     doc = {**body.model_dump(), "id": str(uuid.uuid4()), "created_at": now_iso()}
     await db.schools.insert_one(dict(doc))
+    actor = admin.get("full_name") or admin.get("email") or "Someone"
+    await send_push_to_all("New school added", f"{actor} added {doc['name']}.", "/schools")
     return {k: v for k, v in doc.items() if k != "_id"}
 
 
@@ -629,6 +696,12 @@ async def create_student(body: StudentIn, admin=Depends(get_current_admin)):
         raise HTTPException(400, "A student with the same name, parent, mobile, class, pickup location, and fee already exists")
     doc = {**body.model_dump(), "id": str(uuid.uuid4()), "created_at": now_iso()}
     await db.students.insert_one(dict(doc))
+    actor = admin.get("full_name") or admin.get("email") or "Someone"
+    await send_push_to_all(
+        "New student added",
+        f"{actor} added {doc['name']} to {school['name']}.",
+        "/students",
+    )
     return await student_to_out(doc)
 
 
@@ -659,6 +732,55 @@ async def delete_student(student_id: str, admin=Depends(get_current_admin)):
     await db.payments.delete_many({"student_id": student_id})
     await db.students.delete_one({"id": student_id})
     return {"ok": True}
+
+
+# ---------- Web Push subscriptions ----------
+class PushSubscriptionIn(BaseModel):
+    endpoint: str
+    keys: Dict[str, str]
+
+
+@api.get("/push/public-key")
+async def push_public_key():
+    return {"public_key": VAPID_PUBLIC_KEY, "enabled": bool(VAPID_PRIVATE_KEY)}
+
+
+@api.post("/push/subscribe")
+async def push_subscribe(body: PushSubscriptionIn, admin=Depends(get_current_admin)):
+    sub = {"endpoint": body.endpoint, "keys": body.keys}
+    await db.push_subscriptions.update_one(
+        {"endpoint": body.endpoint},
+        {
+            "$set": {
+                "endpoint": body.endpoint,
+                "subscription": sub,
+                "user_id": admin.get("id"),
+                "user_email": admin.get("email"),
+                "updated_at": now_iso(),
+            },
+            "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now_iso()},
+        },
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+@api.post("/push/unsubscribe")
+async def push_unsubscribe(body: Dict[str, str], admin=Depends(get_current_admin)):
+    endpoint = body.get("endpoint")
+    if endpoint:
+        await db.push_subscriptions.delete_one({"endpoint": endpoint})
+    return {"ok": True}
+
+
+@api.post("/push/test")
+async def push_test(admin=Depends(get_current_admin)):
+    sent = await send_push_to_all(
+        "Test notification",
+        f"Push is working — sent by {admin.get('full_name') or admin.get('email')}.",
+        "/",
+    )
+    return {"ok": True, "sent": sent}
 
 
 # ---------- Payments ----------

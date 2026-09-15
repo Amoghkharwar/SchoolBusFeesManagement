@@ -418,6 +418,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
 
             {/* Main selection content */}
             <ScrollView
+              keyboardShouldPersistTaps="handled"
               contentContainerStyle={{
                 flexDirection: isLargeScreen ? 'row' : 'column',
                 padding: spacing.md,
@@ -452,6 +453,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
                   {/* Year picker — tap a year to jump straight to it */}
                   {yearPickerOpen && (
                     <ScrollView
+                      keyboardShouldPersistTaps="handled"
                       style={{ maxHeight: 160, marginBottom: spacing.md, borderWidth: 1, borderColor: palette.border, borderRadius: radii.md }}
                       contentContainerStyle={{ padding: 6 }}
                     >
@@ -631,6 +633,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
                       </Text>
                       <ScrollView
                         showsVerticalScrollIndicator={true}
+                        keyboardShouldPersistTaps="handled"
                         style={{ height: 160 }}
                         contentContainerStyle={{ gap: 6 }}
                       >
@@ -912,6 +915,97 @@ export function AlertModal({
           >
             <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm }}>OK</Text>
           </Pressable>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+// ── Confirm popup — Cancel/Confirm dialog (native Alert.alert doesn't render
+// on web, so this is used anywhere a destructive action needs confirmation) ──
+export function ConfirmModal({
+  visible,
+  title,
+  message,
+  confirmLabel = 'Delete',
+  onConfirm,
+  onCancel,
+  testID,
+}: {
+  visible: boolean;
+  title?: string;
+  message: string;
+  confirmLabel?: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+  testID?: string;
+}) {
+  const { palette } = useTheme();
+  const { width } = useWindowDimensions();
+  const isLargeScreen = width >= 700;
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
+      <View style={{
+        flex: 1,
+        backgroundColor: 'rgba(0, 0, 0, 0.45)',
+        justifyContent: 'center',
+        alignItems: 'center',
+        padding: spacing.lg,
+      }}>
+        <Pressable style={{ ...StyleSheet.absoluteFillObject }} onPress={onCancel} />
+        <View
+          testID={testID}
+          style={{
+            width: isLargeScreen ? 420 : '100%',
+            maxWidth: '100%',
+            backgroundColor: palette.surfaceSecondary,
+            borderRadius: radii.lg,
+            padding: spacing.lg,
+            shadowColor: '#000',
+            shadowOpacity: 0.25,
+            shadowRadius: 15,
+            elevation: 10,
+          }}
+        >
+          <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 10, marginBottom: spacing.md }}>
+            <View style={{
+              width: 34, height: 34, borderRadius: 17, backgroundColor: `${palette.error}18`,
+              alignItems: 'center', justifyContent: 'center',
+            }}>
+              <Ionicons name="warning-outline" size={20} color={palette.error} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: palette.onSurface, fontWeight: '700', fontSize: fontSize.lg }}>
+                {title || 'Are you sure?'}
+              </Text>
+              <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4, lineHeight: 19 }}>
+                {message}
+              </Text>
+            </View>
+          </View>
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <Pressable
+              onPress={onCancel}
+              testID={testID ? `${testID}-cancel` : undefined}
+              style={{
+                flex: 1, paddingVertical: 12, borderRadius: radii.md,
+                borderWidth: 1, borderColor: palette.border, alignItems: 'center',
+              }}
+            >
+              <Text style={{ color: palette.onSurface, fontWeight: '600', fontSize: fontSize.sm }}>Cancel</Text>
+            </Pressable>
+            <Pressable
+              onPress={onConfirm}
+              testID={testID ? `${testID}-confirm` : undefined}
+              style={{
+                flex: 1, paddingVertical: 12, borderRadius: radii.md,
+                backgroundColor: palette.error, alignItems: 'center',
+              }}
+            >
+              <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm }}>{confirmLabel}</Text>
+            </Pressable>
+          </View>
         </View>
       </View>
     </Modal>

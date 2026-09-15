@@ -1,7 +1,7 @@
 import { Stack, useRouter, useSegments } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import { useEffect } from 'react';
-import { LogBox, View } from 'react-native';
+import { LogBox, Platform, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
@@ -12,6 +12,25 @@ import { FYProvider } from '@/src/fy';
 
 LogBox.ignoreAllLogs(true);
 SplashScreen.preventAutoHideAsync();
+
+// app/+html.tsx is ignored while app.json sets web.output to "single", so the
+// web-only resets have to be injected at runtime instead. `contain` on every
+// element stops a ScrollView/FlatList overscroll from chaining to the viewport
+// and firing the mobile browser's pull-to-refresh.
+if (Platform.OS === 'web' && typeof document !== 'undefined') {
+  const STYLE_ID = 'app-web-resets';
+  if (!document.getElementById(STYLE_ID)) {
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+      html, body { overscroll-behavior: none; height: 100%; }
+      * { overscroll-behavior-y: contain; }
+      input:focus, textarea:focus, select:focus,
+      button:focus, [role="button"]:focus { outline: none; box-shadow: none; }
+    `;
+    document.head.appendChild(style);
+  }
+}
 
 function AuthGuard({ children }: { children: React.ReactNode }) {
   const { token, loading } = useAuth();

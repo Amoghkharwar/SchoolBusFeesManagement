@@ -60,6 +60,7 @@ export default function Schools() {
         <FlatList
           data={filtered}
           keyExtractor={(s) => s.id}
+          keyboardShouldPersistTaps="handled"
           contentContainerStyle={{ padding: spacing.lg, paddingBottom: 100 }}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}
           ListEmptyComponent={

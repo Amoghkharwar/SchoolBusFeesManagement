@@ -50,7 +50,7 @@ export default function SchoolForm() {
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>{editing ? 'Edit School' : 'Add School'}</Text>
       </View>
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <ScrollView contentContainerStyle={{ padding: spacing.lg }}>
+        <ScrollView contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
           <TextField label="School Name *" value={name} onChangeText={setName} testID="school-name" />
           <TextField label="Address" value={address} onChangeText={setAddress} testID="school-address" />
           <TextField label="Contact Person" value={contact} onChangeText={setContact} testID="school-contact" />

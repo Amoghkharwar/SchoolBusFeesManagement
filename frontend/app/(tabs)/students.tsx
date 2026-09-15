@@ -76,6 +76,7 @@ export default function Students() {
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
           contentContainerStyle={{ gap: 8, paddingVertical: 6 }}
           style={{ marginBottom: 4 }}
         >
@@ -111,6 +112,7 @@ export default function Students() {
         <FlatList
           data={items}
           keyExtractor={(s) => s.id}
+          keyboardShouldPersistTaps="handled"
           contentContainerStyle={{ padding: spacing.lg, paddingBottom: 100 }}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}
           ListEmptyComponent={

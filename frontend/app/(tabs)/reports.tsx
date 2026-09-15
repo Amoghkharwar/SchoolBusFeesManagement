@@ -76,7 +76,7 @@ export default function Reports() {
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
-      <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 80 }}>
+      <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 80 }} keyboardShouldPersistTaps="handled">
         <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: 4 }}>Reports</Text>
         <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: spacing.lg }}>
           {fy ? `Financial Year ${fy}` : 'All financial years'}
@@ -84,7 +84,7 @@ export default function Reports() {
 
         <Card>
           <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>School</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }} style={{ marginBottom: spacing.md }}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} keyboardShouldPersistTaps="handled" contentContainerStyle={{ gap: 8 }} style={{ marginBottom: spacing.md }}>
             {[{ id: '', name: 'All' }, ...schools].map((s) => {
               const active = schoolId === s.id;
               return (
@@ -106,7 +106,7 @@ export default function Reports() {
           </ScrollView>
 
           <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>Status</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }} style={{ marginBottom: spacing.md }}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} keyboardShouldPersistTaps="handled" contentContainerStyle={{ gap: 8 }} style={{ marginBottom: spacing.md }}>
             {['all', 'pending', 'partial', 'completed'].map((k) => {
               const active = status === k;
               return (

@@ -1,12 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Pressable, ScrollView, Text, View, ActivityIndicator, Alert } from 'react-native';
+import { Pressable, ScrollView, Text, View, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
-import { Card, EmptyState } from '@/src/components/ui';
+import { Card, ConfirmModal, EmptyState } from '@/src/components/ui';
 import { formatINR, openWhatsApp, reminderMessage, formatDate } from '@/src/utils/format';
 
 interface Student {
@@ -29,6 +29,7 @@ export default function SchoolDetail() {
   const [students, setStudents] = useState<Student[]>([]);
   const [tab, setTab] = useState<'pending' | 'partial' | 'completed'>('pending');
   const [loading, setLoading] = useState(true);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -60,15 +61,8 @@ export default function SchoolDetail() {
   );
 
   const remove = async () => {
-    Alert.alert?.('Delete school?', 'This will remove all students and payments.', [
-      { text: 'Cancel' },
-      {
-        text: 'Delete', style: 'destructive', onPress: async () => {
-          await apiFetch(`/schools/${id}`, { method: 'DELETE' });
-          router.back();
-        },
-      },
-    ]);
+    await apiFetch(`/schools/${id}`, { method: 'DELETE' });
+    router.back();
   };
 
   if (loading || !school) return <ActivityIndicator color={palette.brand} style={{ flex: 1, marginTop: 80 }} />;
@@ -83,7 +77,7 @@ export default function SchoolDetail() {
         <Pressable testID="school-edit" onPress={() => router.push(`/school/edit/${id}` as any)} style={{ padding: 6, marginRight: 4 }}>
           <Ionicons name="create-outline" size={22} color={palette.onSurface} />
         </Pressable>
-        <Pressable testID="school-delete" onPress={remove} style={{ padding: 6 }}>
+        <Pressable testID="school-delete" onPress={() => setShowDeleteConfirm(true)} style={{ padding: 6 }}>
           <Ionicons name="trash-outline" size={22} color={palette.error} />
         </Pressable>
       </View>
@@ -147,6 +141,16 @@ export default function SchoolDetail() {
           ))}
         </View>
       </ScrollView>
+
+      <ConfirmModal
+        visible={showDeleteConfirm}
+        title="Delete school?"
+        message="This will remove all students and payments."
+        confirmLabel="Delete"
+        onCancel={() => setShowDeleteConfirm(false)}
+        onConfirm={() => { setShowDeleteConfirm(false); remove(); }}
+        testID="school-delete-confirm"
+      />
     </SafeAreaView>
   );
 }

@@ -90,6 +90,7 @@ export default function Users() {
         <FlatList
           data={users}
           keyExtractor={(u) => u.id}
+          keyboardShouldPersistTaps="handled"
           contentContainerStyle={{ padding: spacing.lg, paddingBottom: 100 }}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}
           ListEmptyComponent={<Card><EmptyState icon="person-add-outline" title="No users yet" subtitle="Tap + to add an Author or Guest." /></Card>}

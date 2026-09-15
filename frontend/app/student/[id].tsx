@@ -6,7 +6,6 @@ import {
   ScrollView,
   Text,
   View,
-  Alert,
   KeyboardAvoidingView,
   Platform,
 } from 'react-native';
@@ -16,7 +15,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
-import { AlertModal, Button, Card, EmptyState, StatusBadge, TextField, DateTimeField } from '@/src/components/ui';
+import { AlertModal, Button, Card, ConfirmModal, EmptyState, StatusBadge, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR, openWhatsApp, reminderMessage } from '@/src/utils/format';
 import { isoToDisplay } from '@/src/utils/datetime';
 
@@ -49,6 +48,7 @@ export default function StudentDetail() {
   const [submitting, setSubmitting] = useState(false);
   const [modalErr, setModalErr] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -93,13 +93,8 @@ export default function StudentDetail() {
   };
 
   const remove = async () => {
-    Alert.alert?.('Delete student?', 'This will remove all payment history.', [
-      { text: 'Cancel' },
-      { text: 'Delete', style: 'destructive', onPress: async () => {
-          await apiFetch(`/students/${id}`, { method: 'DELETE' });
-          router.back();
-        } },
-    ]);
+    await apiFetch(`/students/${id}`, { method: 'DELETE' });
+    router.back();
   };
 
   if (loading || !student) {
@@ -116,7 +111,7 @@ export default function StudentDetail() {
         <Pressable onPress={() => router.push(`/student/edit/${id}` as any)} testID="student-edit" style={{ padding: 6 }}>
           <Ionicons name="create-outline" size={22} color={palette.onSurface} />
         </Pressable>
-        <Pressable onPress={remove} testID="student-delete" style={{ padding: 6, marginLeft: 4 }}>
+        <Pressable onPress={() => setShowDeleteConfirm(true)} testID="student-delete" style={{ padding: 6, marginLeft: 4 }}>
           <Ionicons name="trash-outline" size={22} color={palette.error} />
         </Pressable>
       </View>
@@ -259,6 +254,16 @@ export default function StudentDetail() {
         message={successMsg}
         onClose={() => setSuccessMsg('')}
         testID="payment-form-success"
+      />
+
+      <ConfirmModal
+        visible={showDeleteConfirm}
+        title="Delete student?"
+        message="This will remove all payment history."
+        confirmLabel="Delete"
+        onCancel={() => setShowDeleteConfirm(false)}
+        onConfirm={() => { setShowDeleteConfirm(false); remove(); }}
+        testID="student-delete-confirm"
       />
     </SafeAreaView>
   );

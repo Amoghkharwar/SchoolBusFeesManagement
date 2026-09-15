@@ -195,31 +195,34 @@ def now_iso() -> str:
 
 
 # ---------- Web Push ----------
-async def send_push_to_all(title: str, body: str, url: str = "/") -> int:
-    """Fans a notification out to every stored subscription.
+async def push_report(title: str, body: str, url: str = "/") -> Dict[str, Any]:
+    """Fans a notification out to every stored subscription and reports the outcome.
 
     Subscriptions the push service reports as gone (404/410) are deleted, which
     is the only way they ever get cleaned up — browsers rotate them silently.
+    The per-attempt reasons are returned so a failure can be diagnosed from the
+    API alone, without shell access to the host's logs.
     """
     if not VAPID_PRIVATE_KEY:
-        logger.warning("[DEV] No VAPID_PRIVATE_KEY — skipping push: %s", title)
-        return 0
+        logger.warning("No VAPID_PRIVATE_KEY — skipping push: %s", title)
+        return {"sent": 0, "total": 0, "reason": "VAPID_PRIVATE_KEY is not set"}
 
     try:
         from pywebpush import WebPushException, webpush
-    except ImportError:
-        logger.error("pywebpush not installed — skipping push")
-        return 0
+    except ImportError as e:
+        logger.error("pywebpush import failed — skipping push: %s", e)
+        return {"sent": 0, "total": 0, "reason": f"pywebpush import failed: {e}"}
 
     import asyncio
     import json
 
     subs = await db.push_subscriptions.find({}, {"_id": 0}).to_list(2000)
     if not subs:
-        return 0
+        return {"sent": 0, "total": 0, "reason": "no subscriptions stored"}
 
     payload = json.dumps({"title": title, "body": body, "url": url})
     stale: List[str] = []
+    errors: List[str] = []
 
     def deliver(sub: Dict[str, Any]) -> bool:
         try:
@@ -235,16 +238,22 @@ async def send_push_to_all(title: str, body: str, url: str = "/") -> int:
             code = getattr(e.response, "status_code", None)
             if code in (404, 410):
                 stale.append(sub["endpoint"])
+                errors.append(f"{code} gone — pruned")
             else:
+                errors.append(f"{code}: {e}"[:200])
                 logger.warning("Push failed (%s): %s", code, e)
             return False
         except Exception as e:
+            errors.append(f"{type(e).__name__}: {e}"[:200])
             logger.warning("Push error: %s", e)
             return False
 
     results = await asyncio.gather(
         *(asyncio.to_thread(deliver, s) for s in subs), return_exceptions=True
     )
+    for r in results:
+        if isinstance(r, BaseException):
+            errors.append(f"{type(r).__name__}: {r}"[:200])
     sent = sum(1 for r in results if r is True)
 
     if stale:
@@ -252,7 +261,11 @@ async def send_push_to_all(title: str, body: str, url: str = "/") -> int:
         logger.info("Pruned %d stale push subscriptions", len(stale))
 
     logger.info("Push '%s' delivered to %d/%d subscriptions", title, sent, len(subs))
-    return sent
+    return {"sent": sent, "total": len(subs), "errors": errors}
+
+
+async def send_push_to_all(title: str, body: str, url: str = "/") -> int:
+    return (await push_report(title, body, url))["sent"]
 
 
 # ---------- Financial Year (Indian Default: April → March) ----------
@@ -775,12 +788,12 @@ async def push_unsubscribe(body: Dict[str, str], admin=Depends(get_current_admin
 
 @api.post("/push/test")
 async def push_test(admin=Depends(get_current_admin)):
-    sent = await send_push_to_all(
+    report = await push_report(
         "Test notification",
         f"Push is working — sent by {admin.get('full_name') or admin.get('email')}.",
         "/",
     )
-    return {"ok": True, "sent": sent}
+    return {"ok": True, **report}
 
 
 # ---------- Payments ----------

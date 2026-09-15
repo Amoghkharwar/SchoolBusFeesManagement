@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, View } from 'react-native';
+import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useLocalSearchParams } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
@@ -27,6 +27,7 @@ export default function StudentForm() {
   const [err, setErr] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [loading, setLoading] = useState(false);
+  const [hydrating, setHydrating] = useState(editing);
 
   useEffect(() => {
     apiFetch<School[]>('/schools').then(setSchools).catch(() => {});
@@ -35,7 +36,7 @@ export default function StudentForm() {
         setName(s.name); setParent(s.parent_name); setMobile(s.parent_mobile);
         setSchoolId(s.school_id); setStandard(s.standard); setPickup(s.pickup_location || '');
         setFee(String(s.yearly_fee)); setAdmission(s.admission_date); setDue(s.due_date);
-      }).catch(() => {});
+      }).catch(() => {}).finally(() => setHydrating(false));
     } else {
       setAdmission(new Date().toISOString());
     }
@@ -78,6 +79,9 @@ export default function StudentForm() {
         <Pressable onPress={() => router.back()} style={{ padding: 6 }}><Ionicons name="chevron-back" size={24} color={palette.onSurface} /></Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>{editing ? 'Edit Student' : 'Add Student'}</Text>
       </View>
+      {hydrating ? (
+        <ActivityIndicator color={palette.brand} style={{ flex: 1 }} />
+      ) : (
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 60 }} keyboardShouldPersistTaps="handled">
           <TextField label="Student Name *" value={name} onChangeText={setName} testID="student-name" />
@@ -91,7 +95,7 @@ export default function StudentForm() {
           />
 
           <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>School *</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }} style={{ marginBottom: spacing.md }}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} keyboardShouldPersistTaps="handled" contentContainerStyle={{ gap: 8 }} style={{ marginBottom: spacing.md }}>
             {schools.map((s) => {
               const active = schoolId === s.id;
               return (
@@ -122,6 +126,7 @@ export default function StudentForm() {
           <Button title={editing ? 'Save Changes' : 'Add Student'} onPress={submit} loading={loading} testID="student-submit" />
         </ScrollView>
       </KeyboardAvoidingView>
+      )}
 
       <AlertModal
         visible={!!err}

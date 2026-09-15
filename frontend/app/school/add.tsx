@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, View } from 'react-native';
+import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useLocalSearchParams } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
@@ -18,12 +18,13 @@ export default function SchoolForm() {
   const [phone, setPhone] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
+  const [hydrating, setHydrating] = useState(editing);
 
   useEffect(() => {
     if (editing) {
       apiFetch(`/schools/${id}`).then((s: any) => {
         setName(s.name); setAddress(s.address || ''); setContact(s.contact_person || ''); setPhone(s.contact_phone || '');
-      }).catch(() => {});
+      }).catch(() => {}).finally(() => setHydrating(false));
     }
   }, [editing, id]);
 
@@ -49,6 +50,9 @@ export default function SchoolForm() {
         <Pressable onPress={() => router.back()} style={{ padding: 6 }}><Ionicons name="chevron-back" size={24} color={palette.onSurface} /></Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>{editing ? 'Edit School' : 'Add School'}</Text>
       </View>
+      {hydrating ? (
+        <ActivityIndicator color={palette.brand} style={{ flex: 1 }} />
+      ) : (
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
           <TextField label="School Name *" value={name} onChangeText={setName} testID="school-name" />
@@ -59,6 +63,7 @@ export default function SchoolForm() {
           <Button title={editing ? 'Save Changes' : 'Add School'} onPress={submit} loading={loading} testID="school-submit" />
         </ScrollView>
       </KeyboardAvoidingView>
+      )}
     </SafeAreaView>
   );
 }

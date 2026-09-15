@@ -28,6 +28,8 @@ interface StudentRow {
   paid_amount: number;
   pending_amount: number;
   status: string;
+  due_date?: string;
+  next_due_date?: string;
 }
 
 const FILTERS = [
@@ -47,26 +49,56 @@ export default function Students() {
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState('all');
 
+  // The server applies search/status/due over the full collection in memory
+  // anyway, so fetching once and narrowing here keeps chip taps and typing
+  // instant instead of costing a round-trip each.
   const load = useCallback(async () => {
     try {
-      let path = '/students';
-      const params = new URLSearchParams();
-      if (q) params.set('search', q);
-      if (filter === 'pending' || filter === 'partial' || filter === 'completed') {
-        params.set('status', filter);
-      }
-      if (filter === 'due_today') params.set('due', 'today');
-      if (filter === 'due_week') params.set('due', 'week');
-      if ([...params].length) path += `?${params.toString()}`;
-      const list = await apiFetch<StudentRow[]>(path);
+      const list = await apiFetch<StudentRow[]>('/students');
       setItems(list);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [q, filter]);
+  }, []);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
+
+  const visible = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const weekEnd = new Date(today);
+    weekEnd.setDate(weekEnd.getDate() + 7);
+
+    return items.filter((s) => {
+      if (
+        needle &&
+        !s.name.toLowerCase().includes(needle) &&
+        !s.parent_name.toLowerCase().includes(needle) &&
+        !s.parent_mobile.toLowerCase().includes(needle)
+      ) {
+        return false;
+      }
+
+      if (filter === 'pending' || filter === 'partial' || filter === 'completed') {
+        return s.status === filter;
+      }
+
+      if (filter === 'due_today' || filter === 'due_week') {
+        const raw = s.next_due_date || s.due_date;
+        if (!raw) return false;
+        const d = new Date(raw);
+        if (Number.isNaN(d.getTime())) return false;
+        d.setHours(0, 0, 0, 0);
+        return filter === 'due_today'
+          ? d.getTime() === today.getTime()
+          : d >= today && d <= weekEnd;
+      }
+
+      return true;
+    });
+  }, [items, q, filter]);
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
@@ -110,7 +142,7 @@ export default function Students() {
         <ActivityIndicator color={palette.brand} style={{ marginTop: 40 }} />
       ) : (
         <FlatList
-          data={items}
+          data={visible}
           keyExtractor={(s) => s.id}
           keyboardShouldPersistTaps="handled"
           contentContainerStyle={{ padding: spacing.lg, paddingBottom: 100 }}

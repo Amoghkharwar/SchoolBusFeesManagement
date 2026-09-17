@@ -10,6 +10,7 @@ import string
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import bcrypt
@@ -1292,82 +1293,90 @@ def _fmt_day(value: Optional[str]) -> str:
     return d.strftime("%d/%m/%Y") if d else "—"
 
 
-@api.get("/workers/{worker_id}/report/pdf")
-async def worker_report_pdf(worker_id: str, admin=Depends(get_current_admin)):
-    """A worker's full salary record as a PDF — the paper trail to keep before
-    deleting history, since nothing here is recoverable once it is gone."""
+def _pdf_kit():
+    """reportlab pieces plus this report's shared styling. Imported lazily so the
+    module keeps loading fast for every request that never renders a PDF."""
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.platypus import (
+        PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+    )
 
-    doc_worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
-    if not doc_worker:
-        raise HTTPException(404, "Worker not found")
+    base = getSampleStyleSheet()
+    brand = colors.HexColor("#2B4C3E")
+    return SimpleNamespace(
+        colors=colors, A4=A4, mm=mm, brand=brand,
+        PageBreak=PageBreak, Paragraph=Paragraph, SimpleDocTemplate=SimpleDocTemplate,
+        Spacer=Spacer, Table=Table, TableStyle=TableStyle,
+        title=ParagraphStyle("T", parent=base["Title"], fontSize=18, textColor=brand, alignment=0),
+        sub=ParagraphStyle("S", parent=base["Normal"], fontSize=9, textColor=colors.HexColor("#6B7280")),
+        h2=ParagraphStyle("H2", parent=base["Heading2"], fontSize=13, textColor=brand,
+                          spaceBefore=14, spaceAfter=4),
+        h3=ParagraphStyle("H3", parent=base["Heading3"], fontSize=10.5, textColor=colors.HexColor("#374151"),
+                          spaceBefore=10, spaceAfter=3),
+        warn=ParagraphStyle("W", parent=base["Normal"], fontSize=9, textColor=colors.HexColor("#DC2626")),
+    )
 
+
+def _pdf_table(kit, rows: List[List[Any]], widths: List[float],
+               money_from: int, money_to: int, has_total_row: bool):
+    t = kit.Table(rows, repeatRows=1, colWidths=widths)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), kit.brand),
+        ("TEXTCOLOR", (0, 0), (-1, 0), kit.colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 8.5),
+        ("FONTSIZE", (0, 1), (-1, -1), 7.8),
+        ("ALIGN", (money_from, 1), (money_to, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, 0), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+    ]
+    last_body = -2 if has_total_row else -1
+    style.append(("GRID", (0, 0), (-1, last_body), 0.4, kit.colors.HexColor("#E5E7EB")))
+    style.append(("ROWBACKGROUNDS", (0, 1), (-1, last_body), [kit.colors.white, kit.colors.HexColor("#F9FAFB")]))
+    if has_total_row:
+        style += [
+            ("BACKGROUND", (0, -1), (-1, -1), kit.colors.HexColor("#F2F5F3")),
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("LINEABOVE", (0, -1), (-1, -1), 0.8, kit.brand),
+        ]
+    t.setStyle(kit.TableStyle(style))
+    return t
+
+
+async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool) -> List[Any]:
+    """One worker's full record: summary, every salary month, every payment and
+    the months each payment was applied to. Shared by the single-worker report
+    and the whole-module export so the two can never drift apart."""
+    mm = kit.mm
     worker = await worker_to_out(doc_worker)
-    periods = list(reversed(await _worker_periods(worker_id)))  # newest first
-    payments = await db.salary_payments.find({"worker_id": worker_id}, {"_id": 0}) \
+    periods = list(reversed(await _worker_periods(doc_worker["id"])))  # newest first
+    payments = await db.salary_payments.find({"worker_id": doc_worker["id"]}, {"_id": 0}) \
         .sort("payment_date", -1).to_list(2000)
     labels = {p["id"]: p["label"] for p in periods}
 
-    buf = io.BytesIO()
-    pdf = SimpleDocTemplate(
-        buf, pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm,
-        topMargin=14 * mm, bottomMargin=14 * mm,
-        title=f"Salary record - {worker['name']}",
-    )
-    styles = getSampleStyleSheet()
-    brand = colors.HexColor("#2B4C3E")
-    title_style = ParagraphStyle("T", parent=styles["Title"], fontSize=18, textColor=brand, alignment=0)
-    sub_style = ParagraphStyle("S", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#6B7280"))
-    h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=12, textColor=brand, spaceBefore=12, spaceAfter=4)
-
-    story: List[Any] = [
-        Paragraph("Salary Record", title_style),
-        Paragraph(
+    out: List[Any] = []
+    if with_heading:
+        out.append(kit.Paragraph(
             f"{worker['name']}"
-            f"{' · ' + worker['designation'] if worker.get('designation') else ''}"
-            f"{' · ' + worker['mobile'] if worker.get('mobile') else ''}"
-            f" · Generated {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-            sub_style,
-        ),
-        Spacer(1, 10),
-    ]
+            f"{' — ' + worker['designation'] if worker.get('designation') else ''}",
+            kit.h2,
+        ))
+        meta = []
+        if worker.get("mobile"):
+            meta.append(worker["mobile"])
+        meta.append(f"Joined {_fmt_day(worker.get('join_date'))}")
+        meta.append(f"{_format_inr(worker.get('monthly_salary', 0))}/month")
+        if worker.get("active") is False:
+            meta.append("INACTIVE")
+        out.append(kit.Paragraph(" · ".join(meta), kit.sub))
 
-    def money_table(rows: List[List[Any]], widths: List[float], money_from: int, money_to: int,
-                    has_total_row: bool) -> Table:
-        t = Table(rows, repeatRows=1, colWidths=widths)
-        style = [
-            ("BACKGROUND", (0, 0), (-1, 0), brand),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 9),
-            ("FONTSIZE", (0, 1), (-1, -1), 8),
-            ("ALIGN", (money_from, 1), (money_to, -1), "RIGHT"),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("TOPPADDING", (0, 0), (-1, 0), 7),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 7),
-        ]
-        last_body = -2 if has_total_row else -1
-        style.append(("GRID", (0, 0), (-1, last_body), 0.4, colors.HexColor("#E5E7EB")))
-        style.append(("ROWBACKGROUNDS", (0, 1), (-1, last_body), [colors.white, colors.HexColor("#F9FAFB")]))
-        if has_total_row:
-            style += [
-                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#F2F5F3")),
-                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-                ("LINEABOVE", (0, -1), (-1, -1), 0.8, brand),
-            ]
-        t.setStyle(TableStyle(style))
-        return t
-
-    # ---- Summary ----
-    story.append(Paragraph("Summary", h2))
     summary_rows = [
-        ["Monthly salary", "Salary months", "Total salary", "Paid", "Pending", "Due now"],
+        ["Salary months", "Total salary", "Paid", "Pending", "Due now"],
         [
-            _format_inr(worker.get("monthly_salary", 0)),
             str(worker["period_count"]),
             _format_inr(worker["total_salary"]),
             _format_inr(worker["total_paid"]),
@@ -1375,36 +1384,34 @@ async def worker_report_pdf(worker_id: str, admin=Depends(get_current_admin)):
             _format_inr(worker["matured_pending"]),
         ],
     ]
-    st = Table(summary_rows, colWidths=[30 * mm, 25 * mm, 28 * mm, 28 * mm, 28 * mm, 28 * mm])
-    st.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F5F3")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#6B7280")),
-        ("FONTSIZE", (0, 0), (-1, 0), 8),
+    st = kit.Table(summary_rows, colWidths=[28 * mm, 32 * mm, 32 * mm, 32 * mm, 32 * mm])
+    st.setStyle(kit.TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), kit.colors.HexColor("#F2F5F3")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), kit.colors.HexColor("#6B7280")),
+        ("FONTSIZE", (0, 0), (-1, 0), 7.5),
         ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 1), (-1, 1), 10),
+        ("FONTSIZE", (0, 1), (-1, 1), 9.5),
         ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#E5E7EB")),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("GRID", (0, 0), (-1, -1), 0.4, kit.colors.HexColor("#E5E7EB")),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    story.append(st)
+    out.append(kit.Spacer(1, 6))
+    out.append(st)
 
     if worker["pending_months"]:
-        story.append(Spacer(1, 6))
-        story.append(Paragraph(
-            f"Unpaid months: {', '.join(worker['pending_months'])}"
-            f"{' · most overdue by ' + str(worker['max_overdue_days']) + ' days' if worker['max_overdue_days'] else ''}",
-            ParagraphStyle("W", parent=sub_style, textColor=colors.HexColor("#DC2626")),
-        ))
+        out.append(kit.Spacer(1, 5))
+        overdue = f" · most overdue by {worker['max_overdue_days']} days" if worker["max_overdue_days"] else ""
+        out.append(kit.Paragraph(f"Unpaid: {', '.join(worker['pending_months'])}{overdue}", kit.warn))
 
-    # ---- Salary months ----
-    story.append(Paragraph("Salary Months", h2))
+    out.append(kit.Paragraph("Salary Months", kit.h3))
     if not periods:
-        story.append(Paragraph("No salary months recorded.", sub_style))
+        out.append(kit.Paragraph("No salary months recorded.", kit.sub))
     else:
         rows: List[List[Any]] = [["Month", "From", "To", "Total", "Paid", "Pending", "Status"]]
         for p in periods:
-            state = "Paid" if p["status"] == "completed" else ("In progress" if not p["matured"] else p["status"].title())
+            state = "Paid" if p["status"] == "completed" else (
+                "In progress" if not p["matured"] else p["status"].title())
             if p["overdue_days"]:
                 state += f" ({p['overdue_days']}d late)"
             rows.append([
@@ -1412,16 +1419,13 @@ async def worker_report_pdf(worker_id: str, admin=Depends(get_current_admin)):
                 _format_inr(p["total_salary"]), _format_inr(p["paid_amount"]),
                 _format_inr(p["pending_amount"]), state,
             ])
-        rows.append([
-            "TOTAL", "", "", _format_inr(worker["total_salary"]),
-            _format_inr(worker["total_paid"]), _format_inr(worker["total_pending"]), "",
-        ])
-        story.append(money_table(rows, [34*mm, 22*mm, 22*mm, 24*mm, 24*mm, 24*mm, 32*mm], 3, 5, True))
+        rows.append(["TOTAL", "", "", _format_inr(worker["total_salary"]),
+                     _format_inr(worker["total_paid"]), _format_inr(worker["total_pending"]), ""])
+        out.append(_pdf_table(kit, rows, [32*mm, 21*mm, 21*mm, 24*mm, 24*mm, 24*mm, 32*mm], 3, 5, True))
 
-    # ---- Payments ----
-    story.append(Paragraph("Payment History", h2))
+    out.append(kit.Paragraph("Payment History", kit.h3))
     if not payments:
-        story.append(Paragraph("No payments recorded.", sub_style))
+        out.append(kit.Paragraph("No payments recorded.", kit.sub))
     else:
         rows = [["Date", "Amount", "Mode", "Applied to", "Note"]]
         for pay in payments:
@@ -1434,23 +1438,122 @@ async def worker_report_pdf(worker_id: str, admin=Depends(get_current_admin)):
                 str(pay.get("mode", "")).upper(), applied, pay.get("note") or "",
             ])
         rows.append(["TOTAL", _format_inr(worker["total_paid"]), "", "", ""])
-        story.append(money_table(rows, [26*mm, 24*mm, 16*mm, 68*mm, 48*mm], 1, 1, True))
+        out.append(_pdf_table(kit, rows, [26*mm, 24*mm, 15*mm, 64*mm, 49*mm], 1, 1, True))
 
-    story.append(Spacer(1, 14))
-    story.append(Paragraph(
-        "This document is a point-in-time record produced by Bus Fee Management.",
-        sub_style,
-    ))
+    return out
 
-    pdf.build(story)
-    buf.seek(0)
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", worker["name"]).strip("-") or "worker"
-    fname = f"salary-{safe}-{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
+
+def _pdf_response(buf: io.BytesIO, name: str):
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "report"
+    fname = f"{safe}-{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
     return Response(
         content=buf.getvalue(),
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{fname}"'},
     )
+
+
+@api.get("/workers/{worker_id}/report/pdf")
+async def worker_report_pdf(worker_id: str, admin=Depends(get_current_admin)):
+    """One worker's salary record — the paper trail to keep before deleting."""
+    doc_worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not doc_worker:
+        raise HTTPException(404, "Worker not found")
+
+    kit = _pdf_kit()
+    mm = kit.mm
+    buf = io.BytesIO()
+    pdf = kit.SimpleDocTemplate(
+        buf, pagesize=kit.A4, leftMargin=14 * mm, rightMargin=14 * mm,
+        topMargin=14 * mm, bottomMargin=14 * mm,
+        title=f"Salary record - {doc_worker.get('name', '')}",
+    )
+    story: List[Any] = [
+        kit.Paragraph("Salary Record", kit.title),
+        kit.Paragraph(f"Generated {datetime.now().strftime('%d/%m/%Y %H:%M')}", kit.sub),
+    ]
+    story += await _worker_flowables(kit, doc_worker, with_heading=True)
+    story.append(kit.Spacer(1, 14))
+    story.append(kit.Paragraph(
+        "This document is a point-in-time record produced by Bus Fee Management.", kit.sub))
+    pdf.build(story)
+    buf.seek(0)
+    return _pdf_response(buf, f"salary-{doc_worker.get('name', 'worker')}")
+
+
+@api.get("/work/report/pdf")
+async def work_report_pdf(admin=Depends(get_current_admin)):
+    """Every worker's full salary history in one document — the export to take
+    before clearing work management, since nothing here is recoverable after."""
+    docs = await db.workers.find({}, {"_id": 0}).to_list(2000)
+    docs.sort(key=lambda w: str(w.get("name", "")).lower())
+
+    kit = _pdf_kit()
+    mm = kit.mm
+    buf = io.BytesIO()
+    pdf = kit.SimpleDocTemplate(
+        buf, pagesize=kit.A4, leftMargin=14 * mm, rightMargin=14 * mm,
+        topMargin=14 * mm, bottomMargin=14 * mm,
+        title="Work Management Record",
+    )
+
+    story: List[Any] = [
+        kit.Paragraph("Work Management Record", kit.title),
+        kit.Paragraph(
+            f"All workers and their complete salary history · "
+            f"Generated {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+            kit.sub,
+        ),
+    ]
+
+    if not docs:
+        story.append(kit.Spacer(1, 12))
+        story.append(kit.Paragraph("No workers recorded.", kit.sub))
+        pdf.build(story)
+        buf.seek(0)
+        return _pdf_response(buf, "work-management")
+
+    # An overview table first, so the totals are readable without paging through.
+    workers = [await worker_to_out(d) for d in docs]
+    overview: List[List[Any]] = [["Worker", "Role", "Months", "Total", "Paid", "Pending", "Due now"]]
+    for w in workers:
+        overview.append([
+            w["name"] + ("" if w.get("active", True) else " (inactive)"),
+            w.get("designation") or "—",
+            str(w["period_count"]),
+            _format_inr(w["total_salary"]), _format_inr(w["total_paid"]),
+            _format_inr(w["total_pending"]), _format_inr(w["matured_pending"]),
+        ])
+    overview.append([
+        "TOTAL", "", str(sum(w["period_count"] for w in workers)),
+        _format_inr(sum(w["total_salary"] for w in workers)),
+        _format_inr(sum(w["total_paid"] for w in workers)),
+        _format_inr(sum(w["total_pending"] for w in workers)),
+        _format_inr(sum(w["matured_pending"] for w in workers)),
+    ])
+    story.append(kit.Paragraph("Overview", kit.h2))
+    story.append(_pdf_table(kit, overview, [38*mm, 26*mm, 16*mm, 25*mm, 25*mm, 25*mm, 25*mm], 3, 6, True))
+
+    owed = [w for w in workers if w["matured_pending"] > 0]
+    if owed:
+        story.append(kit.Spacer(1, 6))
+        story.append(kit.Paragraph(
+            f"{len(owed)} worker(s) owed matured salary: "
+            + "; ".join(f"{w['name']} ({', '.join(w['pending_months'])})" for w in owed),
+            kit.warn,
+        ))
+
+    # Then one page per worker, so a record can be filed or handed over on its own.
+    for doc_worker in docs:
+        story.append(kit.PageBreak())
+        story += await _worker_flowables(kit, doc_worker, with_heading=True)
+
+    story.append(kit.Spacer(1, 14))
+    story.append(kit.Paragraph(
+        "This document is a point-in-time record produced by Bus Fee Management.", kit.sub))
+    pdf.build(story)
+    buf.seek(0)
+    return _pdf_response(buf, "work-management")
 
 # ---------- Bulk deletes ----------
 # Each of these is irreversible and scoped deliberately: the caller picks how

@@ -1,6 +1,8 @@
 import React, { useCallback, useMemo, useState } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ActivityIndicator,
+  Linking,
   FlatList,
   Pressable,
   RefreshControl,
@@ -12,7 +14,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
-import { apiFetch } from '@/src/auth';
+import { apiFetch, useAuth, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { AlertModal, Card, DangerConfirmModal, EmptyState, FAB, TextField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
@@ -59,6 +61,9 @@ const FILTERS = [
 
 export default function Work() {
   const { palette } = useTheme();
+  const { admin } = useAuth();
+  // The reset endpoint needs the server's "delete" capability, which is admin-only.
+  const isAdmin = admin?.role === 'admin';
   const [items, setItems] = useState<WorkerRow[]>([]);
   const [summary, setSummary] = useState<WorkSummary | null>(null);
   const [loading, setLoading] = useState(true);
@@ -69,6 +74,7 @@ export default function Work() {
   const [showPurge, setShowPurge] = useState(false);
   const [purging, setPurging] = useState(false);
   const [notice, setNotice] = useState('');
+  const [downloading, setDownloading] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -94,6 +100,21 @@ export default function Work() {
   }, []);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
+
+  // Streams the file, so it goes through the URL with the token as a query param
+  // rather than apiFetch — the same route the fee reports take.
+  const downloadAll = async () => {
+    setDownloading(true);
+    try {
+      const token = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
+      const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+      await Linking.openURL(`${API_BASE}/work/report/pdf${qs}`);
+    } catch (e: any) {
+      setError(e?.message || 'Could not open the PDF.');
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   const purgeAll = async () => {
     setPurging(true);
@@ -141,6 +162,15 @@ export default function Work() {
             Work Management
           </Text>
           {items.length > 0 ? (
+            <Pressable onPress={downloadAll} testID="download-all-work" style={{ padding: 6 }}>
+              <Ionicons
+                name={downloading ? 'hourglass-outline' : 'download-outline'}
+                size={20}
+                color={palette.onSurface}
+              />
+            </Pressable>
+          ) : null}
+          {isAdmin && items.length > 0 ? (
             <Pressable onPress={() => setShowPurge(true)} testID="purge-all-work" style={{ padding: 6 }}>
               <Ionicons name="trash-outline" size={20} color={palette.error} />
             </Pressable>
@@ -235,6 +265,9 @@ export default function Work() {
             : []
         }
         busy={purging}
+        note="Download the full record first — this is the only copy, and it cannot be recovered afterwards."
+        actionLabel={downloading ? 'Opening PDF…' : 'Download all data as PDF'}
+        onAction={downloadAll}
         onCancel={() => setShowPurge(false)}
         onConfirm={purgeAll}
         testID="work-purge-confirm"

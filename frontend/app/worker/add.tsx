@@ -25,6 +25,12 @@ export default function WorkerForm() {
   const [hydrating, setHydrating] = useState(editing);
   const [createdId, setCreatedId] = useState<string | null>(null);
 
+  // Same reason as the worker screen: this route can be the first history entry.
+  const goBack = () => {
+    if (router.canGoBack()) router.back();
+    else router.replace('/(tabs)/work' as any);
+  };
+
   useEffect(() => {
     if (!editing) {
       setJoinDate(new Date().toISOString());
@@ -86,7 +92,7 @@ export default function WorkerForm() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-        <Pressable onPress={() => router.back()} style={{ padding: 6 }} testID="worker-form-back">
+        <Pressable onPress={goBack} style={{ padding: 6 }} testID="worker-form-back">
           <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
         </Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>
@@ -180,7 +186,7 @@ export default function WorkerForm() {
         message={successMsg}
         onClose={() => {
           setSuccessMsg('');
-          if (editing) router.back();
+          if (editing) goBack();
           else if (createdId) router.replace(`/worker/${createdId}` as any);
           else router.replace('/(tabs)/work' as any);
         }}

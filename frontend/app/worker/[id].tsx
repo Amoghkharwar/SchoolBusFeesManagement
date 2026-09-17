@@ -15,7 +15,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
-import { apiFetch, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
+import { apiFetch, useAuth, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { AlertModal, Button, Card, ConfirmModal, DangerConfirmModal, EmptyState, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
@@ -73,6 +73,10 @@ function settlementSummary(paidLabel: string, allocs: AllocationLabel[], worker:
 export default function WorkerDetail() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { palette } = useTheme();
+  const { admin } = useAuth();
+  // Every delete endpoint here is behind the server's "delete" capability, which
+  // only an admin holds — so hide what a non-admin would only get a 403 from.
+  const isAdmin = admin?.role === 'admin';
 
   const [worker, setWorker] = useState<any>(null);
   const [periods, setPeriods] = useState<Period[]>([]);
@@ -108,6 +112,14 @@ export default function WorkerDetail() {
   const [downloading, setDownloading] = useState(false);
 
   const [loadError, setLoadError] = useState('');
+
+  // router.back() quietly does nothing when there is no history to pop — which
+  // is the normal case here, since creating a worker lands on this screen via
+  // replace(), and a page reload on the web build starts a fresh history.
+  const goBack = () => {
+    if (router.canGoBack()) router.back();
+    else router.replace('/(tabs)/work' as any);
+  };
 
   const load = useCallback(async () => {
     if (!id) return null;
@@ -241,7 +253,8 @@ export default function WorkerDetail() {
 
   const removeWorker = async () => {
     await apiFetch(`/workers/${id}`, { method: 'DELETE' });
-    router.back();
+    // Replace rather than pop: the entry behind this one is the deleted worker.
+    router.replace('/(tabs)/work' as any);
   };
 
   const removePeriod = async (p: Period) => {
@@ -308,7 +321,7 @@ export default function WorkerDetail() {
     return (
       <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
         <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-          <Pressable onPress={() => router.back()} style={{ padding: 6 }} testID="worker-back">
+          <Pressable onPress={goBack} style={{ padding: 6 }} testID="worker-back">
             <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
           </Pressable>
           <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>Worker</Text>
@@ -332,7 +345,7 @@ export default function WorkerDetail() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-        <Pressable onPress={() => router.back()} style={{ padding: 6 }} testID="worker-back">
+        <Pressable onPress={goBack} style={{ padding: 6 }} testID="worker-back">
           <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
         </Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>Worker</Text>
@@ -342,9 +355,11 @@ export default function WorkerDetail() {
         <Pressable onPress={() => router.push(`/worker/edit/${id}` as any)} testID="worker-edit" style={{ padding: 6 }}>
           <Ionicons name="create-outline" size={22} color={palette.onSurface} />
         </Pressable>
-        <Pressable onPress={() => setConfirmDeleteWorker(true)} testID="worker-delete" style={{ padding: 6, marginLeft: 4 }}>
-          <Ionicons name="trash-outline" size={22} color={palette.error} />
-        </Pressable>
+        {isAdmin ? (
+          <Pressable onPress={() => setConfirmDeleteWorker(true)} testID="worker-delete" style={{ padding: 6, marginLeft: 4 }}>
+            <Ionicons name="trash-outline" size={22} color={palette.error} />
+          </Pressable>
+        ) : null}
       </View>
 
       <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 140 }}>
@@ -441,6 +456,7 @@ export default function WorkerDetail() {
             <PeriodCard
               key={p.id}
               period={p}
+              canDelete={isAdmin}
               onEdit={() => openMonthModal(p)}
               onDelete={() => setConfirmDeletePeriod(p)}
             />
@@ -464,13 +480,15 @@ export default function WorkerDetail() {
                   <Text style={{ color: palette.onSurface, fontWeight: '700', fontSize: fontSize.lg }}>{formatINR(p.amount)}</Text>
                   <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                     <Text style={{ color: palette.muted, fontSize: fontSize.sm, textTransform: 'uppercase' }}>{p.mode}</Text>
-                    <Pressable
-                      onPress={() => setConfirmDeletePayment(p)}
-                      testID={`delete-salary-payment-${p.id}`}
-                      style={{ padding: 4, marginLeft: 8 }}
-                    >
-                      <Ionicons name="trash-outline" size={16} color={palette.error} />
-                    </Pressable>
+                    {isAdmin ? (
+                      <Pressable
+                        onPress={() => setConfirmDeletePayment(p)}
+                        testID={`delete-salary-payment-${p.id}`}
+                        style={{ padding: 4, marginLeft: 8 }}
+                      >
+                        <Ionicons name="trash-outline" size={16} color={palette.error} />
+                      </Pressable>
+                    ) : null}
                   </View>
                 </View>
                 <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4 }}>{isoToDisplay(p.payment_date)}</Text>
@@ -489,7 +507,7 @@ export default function WorkerDetail() {
           ))
         )}
 
-        {periods.length > 0 || payments.length > 0 ? (
+        {isAdmin && (periods.length > 0 || payments.length > 0) ? (
           <View style={{ marginTop: spacing.xl, borderWidth: 1, borderColor: palette.error + '40', borderRadius: radii.md, padding: spacing.md }}>
             <Text style={{ color: palette.error, fontWeight: '700', fontSize: fontSize.base }}>Danger zone</Text>
             <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4, marginBottom: spacing.md }}>
@@ -720,7 +738,9 @@ export default function WorkerDetail() {
               ]
         }
         busy={purging}
-        note="Tip: cancel and use Download record as PDF first if you want a copy."
+        note="Download the record first — this is the only copy, and it cannot be recovered afterwards."
+        actionLabel={downloading ? 'Opening PDF…' : 'Download record as PDF'}
+        onAction={downloadPdf}
         onCancel={() => setPurgeScope(null)}
         onConfirm={runPurge}
         testID="worker-purge-confirm"
@@ -739,7 +759,7 @@ export default function WorkerDetail() {
   );
 }
 
-function PeriodCard({ period, onEdit, onDelete }: { period: Period; onEdit: () => void; onDelete: () => void }) {
+function PeriodCard({ period, canDelete, onEdit, onDelete }: { period: Period; canDelete: boolean; onEdit: () => void; onDelete: () => void }) {
   const { palette } = useTheme();
   const meta =
     period.status === 'completed'
@@ -767,9 +787,11 @@ function PeriodCard({ period, onEdit, onDelete }: { period: Period; onEdit: () =
         <Pressable onPress={onEdit} testID={`edit-period-${period.id}`} style={{ padding: 6, marginLeft: 4 }}>
           <Ionicons name="create-outline" size={16} color={palette.muted} />
         </Pressable>
-        <Pressable onPress={onDelete} testID={`delete-period-${period.id}`} style={{ padding: 6 }}>
-          <Ionicons name="trash-outline" size={16} color={palette.error} />
-        </Pressable>
+        {canDelete ? (
+          <Pressable onPress={onDelete} testID={`delete-period-${period.id}`} style={{ padding: 6 }}>
+            <Ionicons name="trash-outline" size={16} color={palette.error} />
+          </Pressable>
+        ) : null}
       </View>
 
       <View style={{ height: 6, backgroundColor: palette.surfaceTertiary, borderRadius: 3, marginTop: spacing.md, overflow: 'hidden' }}>

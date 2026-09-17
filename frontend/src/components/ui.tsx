@@ -1026,6 +1026,8 @@ export function DangerConfirmModal({
   confirmLabel = 'Delete forever',
   busy,
   note,
+  actionLabel,
+  onAction,
   onConfirm,
   onCancel,
   testID,
@@ -1038,6 +1040,9 @@ export function DangerConfirmModal({
   confirmLabel?: string;
   busy?: boolean;
   note?: string;
+  /** Optional safe action offered alongside the destructive one, e.g. an export. */
+  actionLabel?: string;
+  onAction?: () => void;
   onConfirm: () => void;
   onCancel: () => void;
   testID?: string;
@@ -1086,6 +1091,23 @@ export function DangerConfirmModal({
             <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: spacing.md }}>
               {note}
             </Text>
+          ) : null}
+
+          {actionLabel && onAction ? (
+            <Pressable
+              onPress={onAction}
+              testID={testID ? `${testID}-action` : undefined}
+              style={{
+                flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+                marginTop: spacing.md, paddingVertical: 11, borderRadius: radii.md,
+                backgroundColor: palette.brand,
+              }}
+            >
+              <Ionicons name="download-outline" size={16} color="#fff" />
+              <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm, marginLeft: 6 }}>
+                {actionLabel}
+              </Text>
+            </Pressable>
           ) : null}
 
           <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: spacing.md, marginBottom: 6 }}>

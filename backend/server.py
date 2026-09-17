@@ -8,7 +8,7 @@ import random
 import re
 import string
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -909,11 +909,27 @@ _MONTHS = ["January", "February", "March", "April", "May", "June",
            "July", "August", "September", "October", "November", "December"]
 
 
+def _period_day(value: Optional[str]) -> Optional[date]:
+    """A salary cycle is a run of calendar days, not an instant. The client sends
+    "YYYY-MM-DD" so the day the user picked survives the trip through UTC — an
+    instant would land on the previous day for every timezone east of Greenwich."""
+    if not value:
+        return None
+    text = value.strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        try:
+            return date(int(text[0:4]), int(text[5:7]), int(text[8:10]))
+        except ValueError:
+            pass
+    dt = _parse_dt(text)
+    return dt.date() if dt else None
+
+
 def _period_label(start: Optional[str], end: Optional[str]) -> str:
     """Names a salary cycle the way it gets spoken about — "September 2026" for a
     calendar month, "Aug–Sep 2026" when the cycle straddles two."""
-    s = _parse_dt(start)
-    e = _parse_dt(end)
+    s = _period_day(start)
+    e = _period_day(end)
     if not s:
         return "Salary period"
     if e and (e.month != s.month or e.year != s.year):
@@ -923,8 +939,8 @@ def _period_label(start: Optional[str], end: Optional[str]) -> str:
     return f"{_MONTHS[s.month - 1]} {s.year}"
 
 
-def _sort_key(value: Optional[str]) -> datetime:
-    return _parse_dt(value) or datetime.min.replace(tzinfo=timezone.utc)
+def _sort_key(value: Optional[str]) -> date:
+    return _period_day(value) or date.min
 
 
 def _salary_status(total: float, paid: float) -> str:
@@ -951,13 +967,14 @@ async def _worker_periods(worker_id: str) -> List[Dict[str, Any]]:
                 paid_by_period[pid] = paid_by_period.get(pid, 0.0) + float(alloc.get("amount", 0))
 
     periods.sort(key=lambda p: _sort_key(p.get("start_date")))
-    today = datetime.now(timezone.utc)
+    today = datetime.now(timezone.utc).date()
     out: List[Dict[str, Any]] = []
     for p in periods:
         total = float(p.get("total_salary", 0))
         paid = round(paid_by_period.get(p["id"], 0.0), 2)
         pending = round(max(total - paid, 0), 2)
-        end = _parse_dt(p.get("end_date"))
+        end = _period_day(p.get("end_date"))
+        # Salary matures on the end date itself, so that day already counts as owed.
         matured = bool(end and end <= today)
         overdue_days = max((today - end).days, 0) if (end and matured and pending > 0) else 0
         out.append({
@@ -1089,8 +1106,8 @@ async def create_salary_period(worker_id: str, body: SalaryPeriodIn, admin=Depen
         raise HTTPException(404, "Worker not found")
     if body.total_salary <= 0:
         raise HTTPException(400, "Total salary must be greater than zero")
-    start = _parse_dt(body.start_date)
-    end = _parse_dt(body.end_date)
+    start = _period_day(body.start_date)
+    end = _period_day(body.end_date)
     if not start or not end:
         raise HTTPException(400, "Start and end dates are required")
     if end < start:
@@ -1098,7 +1115,7 @@ async def create_salary_period(worker_id: str, body: SalaryPeriodIn, admin=Depen
 
     # Overlapping cycles would let the same day's work be paid twice.
     for existing in await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500):
-        es, ee = _parse_dt(existing.get("start_date")), _parse_dt(existing.get("end_date"))
+        es, ee = _period_day(existing.get("start_date")), _period_day(existing.get("end_date"))
         if es and ee and start <= ee and es <= end:
             clash = _period_label(existing.get("start_date"), existing.get("end_date"))
             raise HTTPException(400, f"This overlaps the existing salary period {clash}")

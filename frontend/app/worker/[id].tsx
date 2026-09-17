@@ -17,7 +17,7 @@ import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { AlertModal, Button, Card, ConfirmModal, EmptyState, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
-import { isoToDisplay } from '@/src/utils/datetime';
+import { calendarDateToDisplay, isoToCalendarDate, isoToDisplay } from '@/src/utils/datetime';
 
 interface Period {
   id: string;
@@ -193,7 +193,14 @@ export default function WorkerDetail() {
     try {
       const created = await apiFetch<Period>(`/workers/${id}/periods`, {
         method: 'POST',
-        body: JSON.stringify({ start_date: mStart, end_date: mEnd, total_salary: total, note: mNote }),
+        // Calendar dates, not instants — otherwise a month picked in IST is
+        // stored as the previous day in UTC and labelled with the wrong month.
+        body: JSON.stringify({
+          start_date: isoToCalendarDate(mStart),
+          end_date: isoToCalendarDate(mEnd),
+          total_salary: total,
+          note: mNote,
+        }),
       });
       setShowMonthModal(false);
       await load();
@@ -587,7 +594,7 @@ function PeriodCard({ period, onDelete }: { period: Period; onDelete: () => void
         <View style={{ flex: 1 }}>
           <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>{period.label}</Text>
           <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>
-            {isoToDisplay(period.start_date).split(' ')[0]} → {isoToDisplay(period.end_date).split(' ')[0]}
+            {calendarDateToDisplay(period.start_date)} → {calendarDateToDisplay(period.end_date)}
           </Text>
         </View>
         <View style={{ paddingHorizontal: 10, paddingVertical: 3, borderRadius: radii.pill, backgroundColor: meta.color + '22' }}>

@@ -33,3 +33,27 @@ export function todayMidnightDisplay(): string {
   d.setHours(0, 0, 0, 0);
   return isoToDisplay(d.toISOString());
 }
+
+/**
+ * Calendar date ("YYYY-MM-DD") of an instant, read in the viewer's own timezone.
+ *
+ * The date picker builds a local Date and serialises it with toISOString(), so
+ * midnight on 1 Sep in IST leaves as "2026-08-31T18:30:00Z". Anything that means
+ * a *day* rather than a moment — a salary month, for instance — has to be pinned
+ * to the calendar date the user actually saw, or it lands a day early on the server.
+ */
+export function isoToCalendarDate(iso?: string | null): string {
+  if (!iso) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** "YYYY-MM-DD" or an ISO instant → "DD/MM/YYYY", with no timezone shift. */
+export function calendarDateToDisplay(value?: string | null): string {
+  const cd = isoToCalendarDate(value);
+  if (!cd) return '';
+  const [y, m, d] = cd.split('-');
+  return `${d}/${m}/${y}`;
+}

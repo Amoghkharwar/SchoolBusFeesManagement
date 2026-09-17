@@ -1025,6 +1025,7 @@ export function DangerConfirmModal({
   confirmWord = 'DELETE',
   confirmLabel = 'Delete forever',
   busy,
+  note,
   onConfirm,
   onCancel,
   testID,
@@ -1036,6 +1037,7 @@ export function DangerConfirmModal({
   confirmWord?: string;
   confirmLabel?: string;
   busy?: boolean;
+  note?: string;
   onConfirm: () => void;
   onCancel: () => void;
   testID?: string;
@@ -1078,6 +1080,12 @@ export function DangerConfirmModal({
                 <Text key={i} style={{ color: palette.error, fontSize: fontSize.sm, fontWeight: '600' }}>• {b}</Text>
               ))}
             </View>
+          ) : null}
+
+          {note ? (
+            <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: spacing.md }}>
+              {note}
+            </Text>
           ) : null}
 
           <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: spacing.md, marginBottom: 6 }}>

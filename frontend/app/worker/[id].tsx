@@ -1,6 +1,7 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  Linking,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -9,11 +10,12 @@ import {
   Text,
   View,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
-import { apiFetch } from '@/src/auth';
+import { apiFetch, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { AlertModal, Button, Card, ConfirmModal, DangerConfirmModal, EmptyState, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
@@ -103,6 +105,7 @@ export default function WorkerDetail() {
   // 'payments' keeps the salary months; 'records' clears those too.
   const [purgeScope, setPurgeScope] = useState<'payments' | 'records' | null>(null);
   const [purging, setPurging] = useState(false);
+  const [downloading, setDownloading] = useState(false);
 
   const [loadError, setLoadError] = useState('');
 
@@ -250,6 +253,21 @@ export default function WorkerDetail() {
     }
   };
 
+  // Downloads stream the file, so they go through the URL with the token as a
+  // query param rather than apiFetch — same route the fee reports take.
+  const downloadPdf = async () => {
+    setDownloading(true);
+    try {
+      const token = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
+      const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+      await Linking.openURL(`${API_BASE}/workers/${id}/report/pdf${qs}`);
+    } catch (e: any) {
+      setModalErr(e?.message || 'Could not open the PDF.');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   const runPurge = async () => {
     if (!purgeScope) return;
     setPurging(true);
@@ -318,6 +336,9 @@ export default function WorkerDetail() {
           <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
         </Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>Worker</Text>
+        <Pressable onPress={downloadPdf} testID="worker-download-pdf" style={{ padding: 6 }}>
+          <Ionicons name={downloading ? 'hourglass-outline' : 'download-outline'} size={22} color={palette.onSurface} />
+        </Pressable>
         <Pressable onPress={() => router.push(`/worker/edit/${id}` as any)} testID="worker-edit" style={{ padding: 6 }}>
           <Ionicons name="create-outline" size={22} color={palette.onSurface} />
         </Pressable>
@@ -472,8 +493,23 @@ export default function WorkerDetail() {
           <View style={{ marginTop: spacing.xl, borderWidth: 1, borderColor: palette.error + '40', borderRadius: radii.md, padding: spacing.md }}>
             <Text style={{ color: palette.error, fontWeight: '700', fontSize: fontSize.base }}>Danger zone</Text>
             <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4, marginBottom: spacing.md }}>
-              Both actions are permanent and affect only {worker.name}.
+              These actions are permanent and affect only {worker.name}. Save the record first — it cannot be recovered afterwards.
             </Text>
+
+            <Pressable
+              testID="danger-download-pdf"
+              onPress={downloadPdf}
+              style={{
+                flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+                paddingVertical: 11, borderRadius: radii.md, marginBottom: spacing.md,
+                backgroundColor: palette.brand,
+              }}
+            >
+              <Ionicons name="download-outline" size={16} color="#fff" />
+              <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm, marginLeft: 6 }}>
+                {downloading ? 'Opening PDF…' : 'Download record as PDF'}
+              </Text>
+            </Pressable>
 
             <Pressable
               testID="purge-payments"
@@ -684,6 +720,7 @@ export default function WorkerDetail() {
               ]
         }
         busy={purging}
+        note="Tip: cancel and use Download record as PDF first if you want a copy."
         onCancel={() => setPurgeScope(null)}
         onConfirm={runPurge}
         testID="worker-purge-confirm"

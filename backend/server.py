@@ -1286,6 +1286,172 @@ async def delete_salary_payment(payment_id: str, _=Depends(require_cap("delete")
     return {"ok": True}
 
 
+def _fmt_day(value: Optional[str]) -> str:
+    """Calendar date as DD/MM/YYYY — salary months are days, so no clock time."""
+    d = _period_day(value)
+    return d.strftime("%d/%m/%Y") if d else "—"
+
+
+@api.get("/workers/{worker_id}/report/pdf")
+async def worker_report_pdf(worker_id: str, admin=Depends(get_current_admin)):
+    """A worker's full salary record as a PDF — the paper trail to keep before
+    deleting history, since nothing here is recoverable once it is gone."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    doc_worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not doc_worker:
+        raise HTTPException(404, "Worker not found")
+
+    worker = await worker_to_out(doc_worker)
+    periods = list(reversed(await _worker_periods(worker_id)))  # newest first
+    payments = await db.salary_payments.find({"worker_id": worker_id}, {"_id": 0}) \
+        .sort("payment_date", -1).to_list(2000)
+    labels = {p["id"]: p["label"] for p in periods}
+
+    buf = io.BytesIO()
+    pdf = SimpleDocTemplate(
+        buf, pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm,
+        topMargin=14 * mm, bottomMargin=14 * mm,
+        title=f"Salary record - {worker['name']}",
+    )
+    styles = getSampleStyleSheet()
+    brand = colors.HexColor("#2B4C3E")
+    title_style = ParagraphStyle("T", parent=styles["Title"], fontSize=18, textColor=brand, alignment=0)
+    sub_style = ParagraphStyle("S", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#6B7280"))
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=12, textColor=brand, spaceBefore=12, spaceAfter=4)
+
+    story: List[Any] = [
+        Paragraph("Salary Record", title_style),
+        Paragraph(
+            f"{worker['name']}"
+            f"{' · ' + worker['designation'] if worker.get('designation') else ''}"
+            f"{' · ' + worker['mobile'] if worker.get('mobile') else ''}"
+            f" · Generated {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+            sub_style,
+        ),
+        Spacer(1, 10),
+    ]
+
+    def money_table(rows: List[List[Any]], widths: List[float], money_from: int, money_to: int,
+                    has_total_row: bool) -> Table:
+        t = Table(rows, repeatRows=1, colWidths=widths)
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), brand),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("FONTSIZE", (0, 1), (-1, -1), 8),
+            ("ALIGN", (money_from, 1), (money_to, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, 0), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 7),
+        ]
+        last_body = -2 if has_total_row else -1
+        style.append(("GRID", (0, 0), (-1, last_body), 0.4, colors.HexColor("#E5E7EB")))
+        style.append(("ROWBACKGROUNDS", (0, 1), (-1, last_body), [colors.white, colors.HexColor("#F9FAFB")]))
+        if has_total_row:
+            style += [
+                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#F2F5F3")),
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                ("LINEABOVE", (0, -1), (-1, -1), 0.8, brand),
+            ]
+        t.setStyle(TableStyle(style))
+        return t
+
+    # ---- Summary ----
+    story.append(Paragraph("Summary", h2))
+    summary_rows = [
+        ["Monthly salary", "Salary months", "Total salary", "Paid", "Pending", "Due now"],
+        [
+            _format_inr(worker.get("monthly_salary", 0)),
+            str(worker["period_count"]),
+            _format_inr(worker["total_salary"]),
+            _format_inr(worker["total_paid"]),
+            _format_inr(worker["total_pending"]),
+            _format_inr(worker["matured_pending"]),
+        ],
+    ]
+    st = Table(summary_rows, colWidths=[30 * mm, 25 * mm, 28 * mm, 28 * mm, 28 * mm, 28 * mm])
+    st.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F5F3")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#6B7280")),
+        ("FONTSIZE", (0, 0), (-1, 0), 8),
+        ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 1), (-1, 1), 10),
+        ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#E5E7EB")),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(st)
+
+    if worker["pending_months"]:
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(
+            f"Unpaid months: {', '.join(worker['pending_months'])}"
+            f"{' · most overdue by ' + str(worker['max_overdue_days']) + ' days' if worker['max_overdue_days'] else ''}",
+            ParagraphStyle("W", parent=sub_style, textColor=colors.HexColor("#DC2626")),
+        ))
+
+    # ---- Salary months ----
+    story.append(Paragraph("Salary Months", h2))
+    if not periods:
+        story.append(Paragraph("No salary months recorded.", sub_style))
+    else:
+        rows: List[List[Any]] = [["Month", "From", "To", "Total", "Paid", "Pending", "Status"]]
+        for p in periods:
+            state = "Paid" if p["status"] == "completed" else ("In progress" if not p["matured"] else p["status"].title())
+            if p["overdue_days"]:
+                state += f" ({p['overdue_days']}d late)"
+            rows.append([
+                p["label"], _fmt_day(p.get("start_date")), _fmt_day(p.get("end_date")),
+                _format_inr(p["total_salary"]), _format_inr(p["paid_amount"]),
+                _format_inr(p["pending_amount"]), state,
+            ])
+        rows.append([
+            "TOTAL", "", "", _format_inr(worker["total_salary"]),
+            _format_inr(worker["total_paid"]), _format_inr(worker["total_pending"]), "",
+        ])
+        story.append(money_table(rows, [34*mm, 22*mm, 22*mm, 24*mm, 24*mm, 24*mm, 32*mm], 3, 5, True))
+
+    # ---- Payments ----
+    story.append(Paragraph("Payment History", h2))
+    if not payments:
+        story.append(Paragraph("No payments recorded.", sub_style))
+    else:
+        rows = [["Date", "Amount", "Mode", "Applied to", "Note"]]
+        for pay in payments:
+            applied = "; ".join(
+                f"{labels.get(a.get('period_id'), 'Unknown')}: {_format_inr(a.get('amount', 0))}"
+                for a in pay.get("allocations", [])
+            ) or "—"
+            rows.append([
+                _fmt_dt(pay.get("payment_date")), _format_inr(pay.get("amount", 0)),
+                str(pay.get("mode", "")).upper(), applied, pay.get("note") or "",
+            ])
+        rows.append(["TOTAL", _format_inr(worker["total_paid"]), "", "", ""])
+        story.append(money_table(rows, [26*mm, 24*mm, 16*mm, 68*mm, 48*mm], 1, 1, True))
+
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "This document is a point-in-time record produced by Bus Fee Management.",
+        sub_style,
+    ))
+
+    pdf.build(story)
+    buf.seek(0)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", worker["name"]).strip("-") or "worker"
+    fname = f"salary-{safe}-{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{fname}"'},
+    )
+
 # ---------- Bulk deletes ----------
 # Each of these is irreversible and scoped deliberately: the caller picks how
 # much history to lose, and nothing here reaches outside the work module's own

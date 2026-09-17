@@ -15,7 +15,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
-import { AlertModal, Button, Card, ConfirmModal, EmptyState, TextField, DateTimeField } from '@/src/components/ui';
+import { AlertModal, Button, Card, ConfirmModal, DangerConfirmModal, EmptyState, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
 import { calendarDateToDisplay, calendarDateToLocalIso, isoToCalendarDate, isoToDisplay } from '@/src/utils/datetime';
 
@@ -100,6 +100,9 @@ export default function WorkerDetail() {
   const [confirmDeleteWorker, setConfirmDeleteWorker] = useState(false);
   const [confirmDeletePeriod, setConfirmDeletePeriod] = useState<Period | null>(null);
   const [confirmDeletePayment, setConfirmDeletePayment] = useState<SalaryPayment | null>(null);
+  // 'payments' keeps the salary months; 'records' clears those too.
+  const [purgeScope, setPurgeScope] = useState<'payments' | 'records' | null>(null);
+  const [purging, setPurging] = useState(false);
 
   const [loadError, setLoadError] = useState('');
 
@@ -244,6 +247,29 @@ export default function WorkerDetail() {
       await load();
     } catch (e: any) {
       setModalErr(e.message);
+    }
+  };
+
+  const runPurge = async () => {
+    if (!purgeScope) return;
+    setPurging(true);
+    try {
+      const res = await apiFetch<any>(
+        purgeScope === 'payments' ? `/workers/${id}/payments` : `/workers/${id}/records`,
+        { method: 'DELETE' },
+      );
+      setPurgeScope(null);
+      await load();
+      setSuccessMsg(
+        purgeScope === 'payments'
+          ? `Deleted ${res.deleted_payments} payment${res.deleted_payments === 1 ? '' : 's'}. Every salary month is pending again.`
+          : `Deleted ${res.deleted_periods} salary month${res.deleted_periods === 1 ? '' : 's'} and ${res.deleted_payments} payment${res.deleted_payments === 1 ? '' : 's'}.`,
+      );
+    } catch (e: any) {
+      setPurgeScope(null);
+      setModalErr(e.message);
+    } finally {
+      setPurging(false);
     }
   };
 
@@ -441,6 +467,43 @@ export default function WorkerDetail() {
             </View>
           ))
         )}
+
+        {periods.length > 0 || payments.length > 0 ? (
+          <View style={{ marginTop: spacing.xl, borderWidth: 1, borderColor: palette.error + '40', borderRadius: radii.md, padding: spacing.md }}>
+            <Text style={{ color: palette.error, fontWeight: '700', fontSize: fontSize.base }}>Danger zone</Text>
+            <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4, marginBottom: spacing.md }}>
+              Both actions are permanent and affect only {worker.name}.
+            </Text>
+
+            <Pressable
+              testID="purge-payments"
+              disabled={payments.length === 0}
+              onPress={() => setPurgeScope('payments')}
+              style={{
+                paddingVertical: 11, borderRadius: radii.md, alignItems: 'center',
+                borderWidth: 1, borderColor: palette.error + '66',
+                opacity: payments.length === 0 ? 0.45 : 1, marginBottom: spacing.sm,
+              }}
+            >
+              <Text style={{ color: palette.error, fontWeight: '700', fontSize: fontSize.sm }}>
+                Delete payment history ({payments.length})
+              </Text>
+            </Pressable>
+
+            <Pressable
+              testID="purge-records"
+              onPress={() => setPurgeScope('records')}
+              style={{
+                paddingVertical: 11, borderRadius: radii.md, alignItems: 'center',
+                borderWidth: 1, borderColor: palette.error + '66',
+              }}
+            >
+              <Text style={{ color: palette.error, fontWeight: '700', fontSize: fontSize.sm }}>
+                Delete all months and payments
+              </Text>
+            </Pressable>
+          </View>
+        ) : null}
       </ScrollView>
 
       <View style={{ position: 'absolute', left: 0, right: 0, bottom: 0, padding: spacing.lg, backgroundColor: palette.surfaceSecondary, borderTopWidth: 1, borderTopColor: palette.border }}>
@@ -599,6 +662,31 @@ export default function WorkerDetail() {
         onCancel={() => setConfirmDeletePeriod(null)}
         onConfirm={() => { const p = confirmDeletePeriod; setConfirmDeletePeriod(null); if (p) removePeriod(p); }}
         testID="period-delete-confirm"
+      />
+
+      <DangerConfirmModal
+        visible={!!purgeScope}
+        title={purgeScope === 'payments' ? 'Delete payment history?' : 'Delete all records?'}
+        message={
+          purgeScope === 'payments'
+            ? `Every salary payment recorded for ${worker.name} will be removed. The salary months stay, and each one goes back to fully pending.`
+            : `Every salary month and every payment for ${worker.name} will be removed. The worker stays, with a clean slate.`
+        }
+        bullets={
+          purgeScope === 'payments'
+            ? [
+                `${payments.length} payment${payments.length === 1 ? '' : 's'} totalling ${formatINR(worker.total_paid)}`,
+                `${periods.length} salary month${periods.length === 1 ? '' : 's'} will show ${formatINR(worker.total_salary)} pending`,
+              ]
+            : [
+                `${periods.length} salary month${periods.length === 1 ? '' : 's'} worth ${formatINR(worker.total_salary)}`,
+                `${payments.length} payment${payments.length === 1 ? '' : 's'} totalling ${formatINR(worker.total_paid)}`,
+              ]
+        }
+        busy={purging}
+        onCancel={() => setPurgeScope(null)}
+        onConfirm={runPurge}
+        testID="worker-purge-confirm"
       />
 
       <ConfirmModal

@@ -14,7 +14,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
-import { Card, EmptyState, FAB, TextField } from '@/src/components/ui';
+import { AlertModal, Card, DangerConfirmModal, EmptyState, FAB, TextField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
 
 export interface WorkerRow {
@@ -45,6 +45,8 @@ interface WorkSummary {
   total_pending: number;
   matured_pending: number;
   workers_with_pending: number;
+  total_periods: number;
+  total_payments: number;
 }
 
 const FILTERS = [
@@ -64,6 +66,9 @@ export default function Work() {
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState('all');
   const [error, setError] = useState('');
+  const [showPurge, setShowPurge] = useState(false);
+  const [purging, setPurging] = useState(false);
+  const [notice, setNotice] = useState('');
 
   const load = useCallback(async () => {
     try {
@@ -90,6 +95,25 @@ export default function Work() {
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
+  const purgeAll = async () => {
+    setPurging(true);
+    try {
+      const res = await apiFetch<any>('/work/records', { method: 'DELETE' });
+      setShowPurge(false);
+      await load();
+      setNotice(
+        `Deleted ${res.deleted_workers} worker${res.deleted_workers === 1 ? '' : 's'}, ` +
+          `${res.deleted_periods} salary month${res.deleted_periods === 1 ? '' : 's'} and ` +
+          `${res.deleted_payments} payment${res.deleted_payments === 1 ? '' : 's'}.`,
+      );
+    } catch (e: any) {
+      setShowPurge(false);
+      setError(e.message || 'Could not delete work data.');
+    } finally {
+      setPurging(false);
+    }
+  };
+
   const visible = useMemo(() => {
     const needle = q.trim().toLowerCase();
     return items.filter((w) => {
@@ -112,9 +136,16 @@ export default function Work() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <View style={{ paddingHorizontal: spacing.lg, paddingTop: spacing.md, paddingBottom: spacing.sm, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-        <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: spacing.md }}>
-          Work Management
-        </Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: spacing.md }}>
+          <Text style={{ flex: 1, fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface }}>
+            Work Management
+          </Text>
+          {items.length > 0 ? (
+            <Pressable onPress={() => setShowPurge(true)} testID="purge-all-work" style={{ padding: 6 }}>
+              <Ionicons name="trash-outline" size={20} color={palette.error} />
+            </Pressable>
+          ) : null}
+        </View>
 
         {summary ? (
           <View style={{ flexDirection: 'row', gap: spacing.sm, marginBottom: spacing.md }}>
@@ -189,6 +220,34 @@ export default function Work() {
       )}
 
       <FAB onPress={() => router.push('/worker/add')} testID="add-worker-fab" />
+
+      <DangerConfirmModal
+        visible={showPurge}
+        title="Delete all work data?"
+        message="Every worker, salary month and payment in Work Management will be removed. Students, schools, fees and financial years are stored separately and are not affected."
+        bullets={
+          summary
+            ? [
+                `${summary.total_workers} worker${summary.total_workers === 1 ? '' : 's'}`,
+                `${summary.total_periods} salary month${summary.total_periods === 1 ? '' : 's'} worth ${formatINR(summary.total_salary)}`,
+                `${summary.total_payments} payment${summary.total_payments === 1 ? '' : 's'} totalling ${formatINR(summary.total_paid)}`,
+              ]
+            : []
+        }
+        busy={purging}
+        onCancel={() => setShowPurge(false)}
+        onConfirm={purgeAll}
+        testID="work-purge-confirm"
+      />
+
+      <AlertModal
+        visible={!!notice}
+        variant="success"
+        title="Work data deleted"
+        message={notice}
+        onClose={() => setNotice('')}
+        testID="work-purge-done"
+      />
     </SafeAreaView>
   );
 }

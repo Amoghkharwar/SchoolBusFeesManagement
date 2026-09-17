@@ -1286,6 +1286,60 @@ async def delete_salary_payment(payment_id: str, _=Depends(require_cap("delete")
     return {"ok": True}
 
 
+# ---------- Bulk deletes ----------
+# Each of these is irreversible and scoped deliberately: the caller picks how
+# much history to lose, and nothing here reaches outside the work module's own
+# three collections.
+@api.delete("/workers/{worker_id}/payments")
+async def clear_worker_payments(worker_id: str, _=Depends(require_cap("delete"))):
+    """Wipes one worker's payment history. Salary months survive and go back to
+    fully pending, which is the state to reach for when payments were entered
+    against the wrong worker."""
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0, "name": 1})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+    res = await db.salary_payments.delete_many({"worker_id": worker_id})
+    return {
+        "ok": True,
+        "worker_name": worker.get("name", ""),
+        "deleted_payments": res.deleted_count,
+        "deleted_periods": 0,
+    }
+
+
+@api.delete("/workers/{worker_id}/records")
+async def clear_worker_records(worker_id: str, _=Depends(require_cap("delete"))):
+    """Wipes one worker's payments and salary months, keeping the worker."""
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0, "name": 1})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+    pay = await db.salary_payments.delete_many({"worker_id": worker_id})
+    per = await db.salary_periods.delete_many({"worker_id": worker_id})
+    return {
+        "ok": True,
+        "worker_name": worker.get("name", ""),
+        "deleted_payments": pay.deleted_count,
+        "deleted_periods": per.deleted_count,
+    }
+
+
+@api.delete("/work/records")
+async def clear_all_work_records(_=Depends(require_cap("delete"))):
+    """Empties work management entirely. Students, schools, fees and financial
+    years are in different collections and are not touched."""
+    pay = await db.salary_payments.delete_many({})
+    per = await db.salary_periods.delete_many({})
+    wor = await db.workers.delete_many({})
+    logger.info(
+        "Work management reset: %d workers, %d periods, %d payments deleted",
+        wor.deleted_count, per.deleted_count, pay.deleted_count,
+    )
+    return {
+        "ok": True,
+        "deleted_workers": wor.deleted_count,
+        "deleted_periods": per.deleted_count,
+        "deleted_payments": pay.deleted_count,
+    }
 # ---------- Work summary / pending ----------
 @api.get("/work/summary")
 async def work_summary(admin=Depends(get_current_admin)):
@@ -1299,6 +1353,8 @@ async def work_summary(admin=Depends(get_current_admin)):
         "total_pending": round(sum(w["total_pending"] for w in workers), 2),
         "matured_pending": round(sum(w["matured_pending"] for w in workers), 2),
         "workers_with_pending": sum(1 for w in workers if w["matured_pending"] > 0),
+        "total_periods": await db.salary_periods.count_documents({}),
+        "total_payments": await db.salary_payments.count_documents({}),
     }
 
 

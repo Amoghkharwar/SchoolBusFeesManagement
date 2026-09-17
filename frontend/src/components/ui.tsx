@@ -1,7 +1,7 @@
 /**
  * Small UI primitives — Button, TextField, DateTimeField, Card, Badge, FAB, EmptyState.
  */
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
@@ -1004,6 +1004,120 @@ export function ConfirmModal({
               }}
             >
               <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm }}>{confirmLabel}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+/**
+ * Confirmation for a destructive action that cannot be undone. Spells out what
+ * is about to be lost, then makes the user type the word — a mistap can't reach
+ * the button, which a plain yes/no dialog cannot promise.
+ */
+export function DangerConfirmModal({
+  visible,
+  title,
+  message,
+  bullets = [],
+  confirmWord = 'DELETE',
+  confirmLabel = 'Delete forever',
+  busy,
+  onConfirm,
+  onCancel,
+  testID,
+}: {
+  visible: boolean;
+  title: string;
+  message: string;
+  bullets?: string[];
+  confirmWord?: string;
+  confirmLabel?: string;
+  busy?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+  testID?: string;
+}) {
+  const { palette } = useTheme();
+  const { width } = useWindowDimensions();
+  const isLargeScreen = width >= 700;
+  const [typed, setTyped] = useState('');
+
+  // Never carry a previous confirmation into the next open.
+  useEffect(() => {
+    if (visible) setTyped('');
+  }, [visible]);
+
+  const armed = typed.trim().toUpperCase() === confirmWord.toUpperCase() && !busy;
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
+      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center', justifyContent: 'center', padding: spacing.lg }}>
+        <View
+          testID={testID}
+          style={{
+            width: '100%', maxWidth: isLargeScreen ? 460 : 400,
+            backgroundColor: palette.surfaceSecondary, borderRadius: radii.lg,
+            padding: spacing.lg, borderWidth: 1, borderColor: palette.error + '55',
+          }}
+        >
+          <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: spacing.sm }}>
+            <Ionicons name="warning" size={22} color={palette.error} />
+            <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>
+              {title}
+            </Text>
+          </View>
+
+          <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.base, lineHeight: 20 }}>{message}</Text>
+
+          {bullets.length > 0 ? (
+            <View style={{ marginTop: spacing.md, backgroundColor: palette.error + '15', borderRadius: radii.md, padding: spacing.md, gap: 4 }}>
+              {bullets.map((b, i) => (
+                <Text key={i} style={{ color: palette.error, fontSize: fontSize.sm, fontWeight: '600' }}>• {b}</Text>
+              ))}
+            </View>
+          ) : null}
+
+          <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: spacing.md, marginBottom: 6 }}>
+            This cannot be undone. Type {confirmWord} to confirm.
+          </Text>
+          <TextField
+            value={typed}
+            onChangeText={setTyped}
+            placeholder={confirmWord}
+            autoCapitalize="characters"
+            autoCorrect={false}
+            testID={testID ? `${testID}-input` : undefined}
+          />
+
+          <View style={{ flexDirection: 'row', gap: spacing.sm }}>
+            <Pressable
+              onPress={onCancel}
+              testID={testID ? `${testID}-cancel` : undefined}
+              style={{
+                flex: 1, paddingVertical: 12, borderRadius: radii.md,
+                backgroundColor: palette.surfaceTertiary, alignItems: 'center',
+                borderWidth: 1, borderColor: palette.border,
+              }}
+            >
+              <Text style={{ color: palette.onSurface, fontWeight: '600', fontSize: fontSize.sm }}>Cancel</Text>
+            </Pressable>
+            <Pressable
+              onPress={armed ? onConfirm : undefined}
+              disabled={!armed}
+              testID={testID ? `${testID}-confirm` : undefined}
+              style={{
+                flex: 1, paddingVertical: 12, borderRadius: radii.md,
+                backgroundColor: armed ? palette.error : palette.surfaceTertiary,
+                alignItems: 'center', opacity: armed ? 1 : 0.6,
+                borderWidth: 1, borderColor: armed ? palette.error : palette.border,
+              }}
+            >
+              <Text style={{ color: armed ? '#fff' : palette.muted, fontWeight: '700', fontSize: fontSize.sm }}>
+                {busy ? 'Deleting…' : confirmLabel}
+              </Text>
             </Pressable>
           </View>
         </View>

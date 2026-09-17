@@ -41,6 +41,7 @@ interface FYCtx {
   refresh: () => Promise<void>;
   previewLabel: (start: string, end: string) => Promise<string | null>;
   createFY: (start: string, end: string) => Promise<FYMeta>;
+  updateFY: (label: string, start: string, end: string) => Promise<FYMeta & { renamed?: boolean }>;
   deleteYear: (label: string) => Promise<DeleteYearResult>;
   closeFY: (label: string) => Promise<void>;
   resetData: (label: string) => Promise<{ deleted_payments: number }>;
@@ -56,6 +57,7 @@ const FYContext = createContext<FYCtx>({
   refresh: async () => {},
   previewLabel: async () => null,
   createFY: async () => ({ label: '', status: 'open' }),
+  updateFY: async () => ({ label: '', status: 'open' }),
   deleteYear: async () => ({ deleted_payments: 0, kept_students: 0, kept_schools: 0 }),
   closeFY: async () => {},
   resetData: async () => ({ deleted_payments: 0 }),
@@ -108,6 +110,15 @@ export function FYProvider({ children }: { children: React.ReactNode }) {
     return created;
   }, [refresh]);
 
+  const updateFY = useCallback(async (label: string, start: string, end: string) => {
+    const updated = await apiFetch<FYMeta & { renamed?: boolean }>(
+      `/financial-years/${encodeURIComponent(label)}`,
+      { method: 'PUT', body: JSON.stringify({ start_date: start, end_date: end }) },
+    );
+    await refresh();
+    return updated;
+  }, [refresh]);
+
   const deleteYear = useCallback(async (label: string) => {
     const res = await apiFetch<DeleteYearResult>(
       `/financial-years/${encodeURIComponent(label)}/records`,
@@ -147,6 +158,7 @@ export function FYProvider({ children }: { children: React.ReactNode }) {
         refresh,
         previewLabel,
         createFY,
+        updateFY,
         deleteYear,
         closeFY,
         resetData,

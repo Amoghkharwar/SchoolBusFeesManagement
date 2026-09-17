@@ -21,7 +21,7 @@ import type { FYMeta } from '@/src/fy';
 import { useFY } from '@/src/fy';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { formatINR } from '@/src/utils/format';
-import { calendarDateToDisplay, isoToCalendarDate } from '@/src/utils/datetime';
+import { calendarDateToDisplay, calendarDateToLocalIso, isoToCalendarDate } from '@/src/utils/datetime';
 import { AlertModal, Card, DateTimeField, EmptyState } from '@/src/components/ui';
 import type { PushState } from '@/src/push';
 import { enablePush, pushPermission, showLocalTest, syncPush } from '@/src/push';
@@ -50,7 +50,7 @@ type ConfirmStep = 'close' | 'delete' | 'reset' | null;
 export default function Dashboard() {
   const { palette, isDark, mode, setMode } = useTheme();
   const { admin, logout } = useAuth();
-  const { current: fy, years, fyMeta, meta: fyInfo, needsSetup, refresh: refreshFY, closeFY, deleteYear, resetData, createFY, previewLabel } = useFY();
+  const { current: fy, years, fyMeta, meta: fyInfo, needsSetup, refresh: refreshFY, closeFY, deleteYear, resetData, createFY, updateFY, previewLabel } = useFY();
   const [summary, setSummary] = useState<Summary | null>(null);
   const [schools, setSchools] = useState<SchoolStat[]>([]);
   const [loading, setLoading] = useState(true);
@@ -64,6 +64,8 @@ export default function Dashboard() {
   const [fyStart, setFyStart] = useState('');
   const [fyEnd, setFyEnd] = useState('');
   const [fyPreview, setFyPreview] = useState<string | null>(null);
+  // Non-null puts the same form into edit mode against an existing year.
+  const [editingFY, setEditingFY] = useState<FYMeta | null>(null);
 
   // FY action bottom-sheet
   const [actionFY, setActionFY] = useState<FYMeta | null>(null);
@@ -133,11 +135,12 @@ export default function Dashboard() {
   // and roll over — nothing closes or deletes itself.
   const expiredFY = fyInfo?.expired ? fyInfo : null;
 
-  const openFyModal = () => {
+  const openFyModal = (edit?: FYMeta) => {
     setFyError('');
-    setFyStart('');
-    setFyEnd('');
-    setFyPreview(null);
+    setEditingFY(edit || null);
+    setFyStart(edit?.start_date ? calendarDateToLocalIso(edit.start_date) : '');
+    setFyEnd(edit?.end_date ? calendarDateToLocalIso(edit.end_date) : '');
+    setFyPreview(edit?.label || null);
     setShowFyModal(true);
   };
 
@@ -163,10 +166,24 @@ export default function Dashboard() {
     }
     try {
       setCreating(true);
-      const created = await createFY(isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd));
-      setShowFyModal(false);
-      await load();
-      setActionMsg(`✓ Financial Year ${created.label} created.`);
+      if (editingFY) {
+        const updated = await updateFY(
+          editingFY.label, isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd),
+        );
+        setShowFyModal(false);
+        setEditingFY(null);
+        await load();
+        setActionMsg(
+          updated.renamed
+            ? `✓ Financial Year updated — now FY ${updated.label}.`
+            : `✓ FY ${updated.label} dates updated.`,
+        );
+      } else {
+        const created = await createFY(isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd));
+        setShowFyModal(false);
+        await load();
+        setActionMsg(`✓ Financial Year ${created.label} created.`);
+      }
     } catch (e: any) {
       setFyError(e.message || 'Failed to create financial year');
     } finally {
@@ -342,7 +359,7 @@ export default function Dashboard() {
           {needsSetup && isAdmin ? (
             <Pressable
               testID="create-fy-btn"
-              onPress={openFyModal}
+              onPress={() => openFyModal()}
               style={{ paddingHorizontal: 10, paddingVertical: 5, borderRadius: radii.sm, backgroundColor: palette.brand, flexDirection: 'row', alignItems: 'center', gap: 4 }}
             >
               <Ionicons name="add" size={14} color="#fff" />
@@ -468,10 +485,10 @@ export default function Dashboard() {
           <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: spacing.lg }}>
             <View style={{ backgroundColor: palette.surfaceSecondary, borderRadius: radii.lg, padding: spacing.lg, width: '100%', maxWidth: 420 }}>
               <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: spacing.sm }}>
-                {needsSetup ? 'Set Up Financial Year' : 'Add Financial Year'}
+                {editingFY ? `Edit FY ${editingFY.label}` : needsSetup ? 'Set Up Financial Year' : 'Add Financial Year'}
               </Text>
 
-              {!needsSetup ? (
+              {!needsSetup && !editingFY ? (
                 // One year exists at a time, so the way forward is to export and
                 // delete the running one — said plainly rather than just refused.
                 <>
@@ -496,15 +513,18 @@ export default function Dashboard() {
               ) : (
                 <>
                   <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: spacing.md }}>
-                    Pick the window this financial year covers. The name is worked out from the
-                    dates, so the two can never disagree.
+                    {editingFY
+                      ? 'Move the window this year covers. The name follows the dates, so changing the years renames it.'
+                      : 'Pick the window this financial year covers. The name is worked out from the dates, so the two can never disagree.'}
                   </Text>
 
                   <DateTimeField label="Start Date" value={fyStart} onChange={setFyStart} required testID="fy-start" />
                   <DateTimeField label="End Date" value={fyEnd} onChange={setFyEnd} required testID="fy-end" />
 
                   <View style={{ backgroundColor: palette.surfaceTertiary, borderRadius: radii.md, padding: spacing.md, marginBottom: spacing.md, alignItems: 'center' }}>
-                    <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>Will be created as</Text>
+                    <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>
+                      {editingFY ? 'Will be named' : 'Will be created as'}
+                    </Text>
                     <Text style={{ color: fyPreview ? palette.brand : palette.muted, fontSize: fontSize.xl, fontWeight: '700', marginTop: 2 }}>
                       {fyPreview ? `FY ${fyPreview}` : '—'}
                     </Text>
@@ -521,7 +541,7 @@ export default function Dashboard() {
                     }}
                   >
                     <Text style={{ color: !fyStart || !fyEnd ? palette.muted : '#fff', fontWeight: '700' }}>
-                      {creating ? 'Creating…' : 'Create Financial Year'}
+                      {creating ? 'Saving…' : editingFY ? 'Save Dates' : 'Create Financial Year'}
                     </Text>
                   </Pressable>
                 </>
@@ -534,7 +554,7 @@ export default function Dashboard() {
               ) : null}
 
               <Pressable
-                onPress={() => { setShowFyModal(false); setFyError(''); }}
+                onPress={() => { setShowFyModal(false); setFyError(''); setEditingFY(null); }}
                 style={{ paddingVertical: 13, borderRadius: radii.md, borderWidth: 1, borderColor: palette.border, alignItems: 'center' }}
               >
                 <Text style={{ color: palette.onSurface, fontWeight: '600' }}>Cancel</Text>
@@ -664,6 +684,16 @@ export default function Dashboard() {
                   color={palette.success}
                   busy={actionBusy === 'excel'}
                   onPress={() => handleDownloadReport('excel')}
+                  palette={palette}
+                />
+
+                <ActionRow
+                  icon="calendar-outline"
+                  label="Edit Dates"
+                  description={`Currently ${calendarDateToDisplay(actionFY?.start_date) || '—'} to ${calendarDateToDisplay(actionFY?.end_date) || '—'}.`}
+                  color={palette.brand}
+                  busy={false}
+                  onPress={() => { const f = actionFY; closeActionSheet(); if (f) openFyModal(f); }}
                   palette={palette}
                 />
 

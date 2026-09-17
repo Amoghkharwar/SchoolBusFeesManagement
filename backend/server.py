@@ -1781,14 +1781,7 @@ async def create_financial_year(payload: CreateFY, admin=Depends(get_current_adm
     """
     start = _period_day(payload.start_date)
     end = _period_day(payload.end_date)
-    if not start or not end:
-        raise HTTPException(400, "Start date and end date are required")
-    if end <= start:
-        raise HTTPException(400, "End date must be after the start date")
-    if (end - start).days > 400:
-        raise HTTPException(400, "A financial year cannot be longer than 400 days")
-    if (end - start).days < 27:
-        raise HTTPException(400, "A financial year must span at least a month")
+    _validate_fy_window(start, end)
 
     # One year at a time — the previous one is deleted, not archived alongside.
     existing = await db.financial_years.find_one({}, {"_id": 0, "label": 1})
@@ -1824,6 +1817,60 @@ async def preview_financial_year(
         return {"label": None}
     return {"label": _fy_label_from_dates(start, end)}
 
+
+def _validate_fy_window(start: Optional[date], end: Optional[date]) -> None:
+    """Shared by create and edit so a year can never be saved in a shape that
+    only one of the two would have allowed."""
+    if not start or not end:
+        raise HTTPException(400, "Start date and end date are required")
+    if end <= start:
+        raise HTTPException(400, "End date must be after the start date")
+    if (end - start).days > 400:
+        raise HTTPException(400, "A financial year cannot be longer than 400 days")
+    if (end - start).days < 27:
+        raise HTTPException(400, "A financial year must span at least a month")
+
+
+@api.put("/financial-years/{label}")
+async def update_financial_year(label: str, payload: CreateFY, admin=Depends(get_current_admin)):
+    """Move a financial year's start and end dates.
+
+    Narrowing the window is refused when it would leave recorded fees outside
+    every year: those payments would stop counting anywhere while still sitting
+    in the database, which is worse than the edit being rejected.
+    """
+    doc = await db.financial_years.find_one({"label": label}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Financial year not found")
+
+    start = _period_day(payload.start_date)
+    end = _period_day(payload.end_date)
+    _validate_fy_window(start, end)
+
+    payments = await db.payments.find({}, {"_id": 0, "payment_date": 1}).to_list(100000)
+    stranded = [p for p in payments if not _in_window(p.get("payment_date"), (start, end))]
+    if stranded:
+        dates = sorted({_fmt_day(p.get("payment_date")) for p in stranded})
+        shown = ", ".join(dates[:3]) + (f" and {len(dates) - 3} more" if len(dates) > 3 else "")
+        raise HTTPException(
+            400,
+            f"{len(stranded)} recorded fee payment(s) fall outside "
+            f"{start.strftime('%d/%m/%Y')} - {end.strftime('%d/%m/%Y')} ({shown}). "
+            f"Widen the dates or delete those payments first.",
+        )
+
+    new_label = _fy_label_from_dates(start, end)
+    await db.financial_years.update_one(
+        {"label": label},
+        {"$set": {
+            "label": new_label,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+        }},
+    )
+    logger.info("FY %s updated to %s (%s to %s)", label, new_label, start, end)
+    updated = await db.financial_years.find_one({"label": new_label}, {"_id": 0})
+    return {"status": "success", "renamed": new_label != label, "previous_label": label, **(updated or {})}
 
 class FYActionIn(BaseModel):
     label: Optional[str] = None

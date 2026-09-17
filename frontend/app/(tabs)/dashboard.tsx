@@ -337,7 +337,7 @@ export default function Dashboard() {
         <View style={{ flex: 1 }}>
           <Text style={{ fontSize: fontSize.sm, color: palette.muted }}>Welcome back</Text>
           <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface }} numberOfLines={1} testID="dashboard-title">
-            {admin?.email ?? 'Admin'}
+            {admin?.full_name?.trim() || admin?.email || 'Admin'}
           </Text>
         </View>
         <View style={{ flexDirection: 'row', gap: spacing.sm }}>

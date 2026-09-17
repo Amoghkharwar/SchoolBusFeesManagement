@@ -594,6 +594,19 @@ async def startup() -> None:
             {"$set": {"role": ROLE_ADMIN, "status": "active", "page_permissions": ALL_PAGES}},
         )
 
+    # Years registered before the due date existed get the 7 July in their window.
+    async for _fy in db.financial_years.find(
+        {"$or": [{"student_due_date": {"$exists": False}}, {"student_due_date": None}]},
+        {"_id": 0, "label": 1, "start_date": 1, "end_date": 1},
+    ):
+        _s, _e = _period_day(_fy.get("start_date")), _period_day(_fy.get("end_date"))
+        if _s and _e:
+            await db.financial_years.update_one(
+                {"label": _fy["label"]},
+                {"$set": {"student_due_date": _default_student_due(_s, _e).isoformat()}},
+            )
+            logger.info("Backfilled student_due_date for FY %s", _fy["label"])
+
     # Students written before start_date existed are dated from their admission.
     await db.students.update_many(
         {"$or": [{"start_date": {"$exists": False}}, {"start_date": None}]},
@@ -1776,7 +1789,8 @@ async def financial_years(admin=Depends(get_current_admin)):
         "status": doc.get("status", "open"),
         "start_date": doc.get("start_date") or (window[0].isoformat() if window else None),
         "end_date": doc.get("end_date") or (window[1].isoformat() if window else None),
-        "student_due_date": doc.get("student_due_date"),
+        "student_due_date": doc.get("student_due_date")
+            or (_default_student_due(window[0], window[1]).isoformat() if window else None),
         "closed_at": doc.get("closed_at"),
         "created_at": doc.get("created_at"),
         # Expiry is a flag, never an action: the server does not close or delete
@@ -1862,15 +1876,25 @@ async def preview_financial_year(
     }
 
 
+# The first due date is always the 7th of July; only the year moves with the
+# financial year, so every school reads the same date every time.
+DUE_DAY = 7
+DUE_MONTH = 7
+
+
 def _default_student_due(start: date, end: date) -> date:
-    """7 July is the usual first due date, so pick whichever 7 July the window
-    actually contains — a June-May year takes the July at its start, a
-    September year the one the following summer."""
-    for year in (start.year, start.year + 1):
-        candidate = date(year, 7, 7)
+    """The 7 July that falls inside this financial year.
+
+    Day and month never change — a June-April year takes the July at its start,
+    a September year the one the following summer. A window that contains no
+    7 July at all keeps the day and month anyway rather than inventing some
+    other date, since that is the one everyone expects to see.
+    """
+    for year in (start.year, end.year):
+        candidate = date(year, DUE_MONTH, DUE_DAY)
         if start <= candidate <= end:
             return candidate
-    return start
+    return date(start.year, DUE_MONTH, DUE_DAY)
 
 
 def _resolve_student_due(payload_value: Optional[str], start: date, end: date) -> date:

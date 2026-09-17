@@ -6,6 +6,8 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize } from '@/src/theme';
+import { useFY } from '@/src/fy';
+import { calendarDateToDisplay, calendarDateToLocalIso } from '@/src/utils/datetime';
 import { AlertModal, Button, TextField, DateTimeField } from '@/src/components/ui';
 
 interface School { id: string; name: string }
@@ -14,6 +16,7 @@ export default function StudentForm() {
   const { id } = useLocalSearchParams<{ id?: string }>();
   const editing = !!id && id !== 'add';
   const { palette } = useTheme();
+  const { meta: fyInfo } = useFY();
   const [schools, setSchools] = useState<School[]>([]);
   const [name, setName] = useState('');
   const [parent, setParent] = useState('');
@@ -43,6 +46,13 @@ export default function StudentForm() {
       setAdmission(new Date().toISOString());
     }
   }, [editing, id]);
+
+  // A new student inherits the financial year's first due date — 7 July by
+  // default — rather than starting blank and being typed in every time.
+  useEffect(() => {
+    if (editing || due || !fyInfo?.student_due_date) return;
+    setDue(calendarDateToLocalIso(fyInfo.student_due_date));
+  }, [editing, due, fyInfo?.student_due_date]);
 
   const submit = async () => {
     setErr('');
@@ -129,6 +139,11 @@ export default function StudentForm() {
           </Text>
           <DateTimeField label="Start Date & Time" value={startDate || admission} onChange={setStartDate} testID="student-start" />
           <DateTimeField label="Due Date & Time" value={due} onChange={setDue} required testID="student-due" />
+          {!editing && fyInfo?.student_due_date ? (
+            <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -6, marginBottom: spacing.md }}>
+              Default for FY {fyInfo.label} is {calendarDateToDisplay(fyInfo.student_due_date)}. Change it here if this student differs.
+            </Text>
+          ) : null}
 
           <Button title={editing ? 'Save Changes' : 'Add Student'} onPress={submit} loading={loading} testID="student-submit" />
         </ScrollView>

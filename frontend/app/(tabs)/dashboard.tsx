@@ -21,7 +21,7 @@ import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { formatINR } from '@/src/utils/format';
 import { AlertModal, Card, EmptyState } from '@/src/components/ui';
 import type { PushState } from '@/src/push';
-import { disablePush, enablePush, pushPermission, syncPush } from '@/src/push';
+import { enablePush, pushPermission, showLocalTest, syncPush } from '@/src/push';
 import { Skeleton, SkeletonCard, SkeletonKPI } from '@/src/components/Skeleton';
 
 interface Summary {
@@ -73,11 +73,35 @@ export default function Dashboard() {
     syncPush();
   }, []);
 
+  // Already on: run the two tests instead of switching off. A local notification
+  // tells us whether this device can display at all, and the server round-trip
+  // tells us whether delivery works — which is the pair that actually diagnoses
+  // "nothing appeared".
+  const runPushTests = async () => {
+    try {
+      await showLocalTest();
+    } catch (e: any) {
+      setPushMsg(`Local test failed: ${e?.message || e}. Notifications are blocked on this device.`);
+      return;
+    }
+    try {
+      const r = await apiFetch<{ sent: number; total: number; errors?: string[] }>(
+        '/push/test',
+        { method: 'POST' },
+      );
+      setPushMsg(
+        `Local test shown. Server sent to ${r.sent} of ${r.total} device(s).` +
+          (r.errors?.length ? ` Errors: ${r.errors.join('; ')}` : '') +
+          ' If you saw the first but not the second, delivery is the problem.',
+      );
+    } catch (e: any) {
+      setPushMsg(`Local test shown, but the server test failed: ${e?.message || e}`);
+    }
+  };
+
   const togglePush = async () => {
     if (pushState === 'granted') {
-      await disablePush();
-      setPushState('default');
-      setPushMsg('Notifications turned off on this device.');
+      await runPushTests();
       return;
     }
     try {

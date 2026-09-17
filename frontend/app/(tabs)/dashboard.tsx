@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
+  KeyboardAvoidingView,
   Linking,
   Modal,
+  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -19,7 +21,8 @@ import type { FYMeta } from '@/src/fy';
 import { useFY } from '@/src/fy';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { formatINR } from '@/src/utils/format';
-import { AlertModal, Card, EmptyState } from '@/src/components/ui';
+import { calendarDateToDisplay, isoToCalendarDate } from '@/src/utils/datetime';
+import { AlertModal, Card, DateTimeField, EmptyState } from '@/src/components/ui';
 import type { PushState } from '@/src/push';
 import { enablePush, pushPermission, showLocalTest, syncPush } from '@/src/push';
 import { Skeleton, SkeletonCard, SkeletonKPI } from '@/src/components/Skeleton';
@@ -47,7 +50,7 @@ type ConfirmStep = 'close' | 'delete' | 'reset' | null;
 export default function Dashboard() {
   const { palette, isDark, mode, setMode } = useTheme();
   const { admin, logout } = useAuth();
-  const { current: fy, years, fyMeta, setCurrent, refresh: refreshFY, closeFY, deleteRecords, resetData } = useFY();
+  const { current: fy, years, fyMeta, meta: fyInfo, needsSetup, refresh: refreshFY, closeFY, deleteYear, resetData, createFY, previewLabel } = useFY();
   const [summary, setSummary] = useState<Summary | null>(null);
   const [schools, setSchools] = useState<SchoolStat[]>([]);
   const [loading, setLoading] = useState(true);
@@ -57,6 +60,10 @@ export default function Dashboard() {
   const [showFyModal, setShowFyModal] = useState(false);
   const [creating, setCreating] = useState(false);
   const [fyError, setFyError] = useState('');
+  // The year is defined by its window; the label is derived from it, not typed.
+  const [fyStart, setFyStart] = useState('');
+  const [fyEnd, setFyEnd] = useState('');
+  const [fyPreview, setFyPreview] = useState<string | null>(null);
 
   // FY action bottom-sheet
   const [actionFY, setActionFY] = useState<FYMeta | null>(null);
@@ -122,59 +129,49 @@ export default function Dashboard() {
   const isAdmin = admin?.role === 'admin';
 
   // Find any older financial year that is still open (e.g. 2025-2026 when active year is 2026-2027)
-  const unclosedOlderFY = fyMeta.find((m) => {
-    if (m.status !== 'open') return false;
-    const startYear = parseInt(m.label.split('-')[0], 10);
-    const now = new Date();
-    const currentStartYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
-    return !isNaN(startYear) && startYear < currentStartYear;
-  });
+  // A year expires when today passes its end date. That is a prompt to export
+  // and roll over — nothing closes or deletes itself.
+  const expiredFY = fyInfo?.expired ? fyInfo : null;
 
-  const handleCreateFY = async (label: string) => {
-    const targetStartYear = parseInt(label.split('-')[0], 10);
-    if (unclosedOlderFY) {
-      const oldStartYear = parseInt(unclosedOlderFY.label.split('-')[0], 10);
-      if (targetStartYear > oldStartYear) {
-        setFyError(
-          `⚠️ Cannot create FY ${label}. Older Financial Year FY ${unclosedOlderFY.label} is still OPEN. Please close FY ${unclosedOlderFY.label} and download its records first.`
-        );
-        return;
-      }
+  const openFyModal = () => {
+    setFyError('');
+    setFyStart('');
+    setFyEnd('');
+    setFyPreview(null);
+    setShowFyModal(true);
+  };
+
+  // Ask the server what the window would be called, so the preview and the
+  // eventual label can never disagree.
+  useEffect(() => {
+    let cancelled = false;
+    if (!fyStart || !fyEnd) {
+      setFyPreview(null);
+      return;
     }
+    previewLabel(isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd)).then((label) => {
+      if (!cancelled) setFyPreview(label);
+    });
+    return () => { cancelled = true; };
+  }, [fyStart, fyEnd, previewLabel]);
 
+  const handleCreateFY = async () => {
+    setFyError('');
+    if (!fyStart || !fyEnd) {
+      setFyError('Select both the start date and the end date of the financial year');
+      return;
+    }
     try {
       setCreating(true);
-      setFyError('');
-      await apiFetch('/financial-years', {
-        method: 'POST',
-        body: JSON.stringify({ label }),
-      });
-      await refreshFY();
-      setCurrent(label);
+      const created = await createFY(isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd));
       setShowFyModal(false);
+      await load();
+      setActionMsg(`✓ Financial Year ${created.label} created.`);
     } catch (e: any) {
       setFyError(e.message || 'Failed to create financial year');
     } finally {
       setCreating(false);
     }
-  };
-
-  /**
-   * Computes options for Add FY modal.
-   * Checks fyMeta (explicitly registered FYs in DB) — NOT the auto-derived `years` list —
-   * so the current year and previous year can always be registered if not yet done.
-   */
-  const getAddFYOptions = (): string[] => {
-    const cur = new Date();
-    const currentStartYear = cur.getMonth() >= 3 ? cur.getFullYear() : cur.getFullYear() - 1;
-    const registeredLabels = fyMeta.map((m) => m.label);
-    const options: string[] = [];
-    for (let i = 0; i <= 1; i++) {
-      const start = currentStartYear - i;
-      const label = `${start}-${start + 1}`;
-      if (!registeredLabels.includes(label)) options.push(label);
-    }
-    return options;
   };
 
   const openActionSheet = (y: string) => {
@@ -243,10 +240,14 @@ export default function Dashboard() {
     setActionMsg('');
     setConfirmStep(null);
     try {
-      const res = await deleteRecords(label);
-      setActionMsg(`✓ Deleted ${res.deleted_students} students & ${res.deleted_payments} payments for FY ${label}.`);
+      const res = await deleteYear(label);
+      setActionMsg(
+        `✓ FY ${label} deleted — ${res.deleted_payments} fee payment(s) removed. ` +
+        `${res.kept_students} student(s) and ${res.kept_schools} school(s) carried over. ` +
+        `You can now create the next financial year.`,
+      );
       await load();
-      setTimeout(() => closeActionSheet(), 2500);
+      setTimeout(() => closeActionSheet(), 4000);
     } catch (e: any) {
       setActionMsg(`Error: ${e.message || 'Failed to delete records'}`);
     } finally {
@@ -263,7 +264,7 @@ export default function Dashboard() {
     setConfirmStep(null);
     try {
       const res = await resetData(label);
-      setActionMsg(`✓ Reset FY ${label}: removed ${res.deleted_students} students & ${res.deleted_payments} payments. FY remains open.`);
+      setActionMsg(`✓ Reset FY ${label}: removed ${res.deleted_payments} fee payment(s). Students and the FY itself are kept.`);
       await load();
     } catch (e: any) {
       setActionMsg(`Error: ${e.message || 'Failed to reset FY data'}`);
@@ -290,9 +291,9 @@ export default function Dashboard() {
 
   useFocusEffect(useCallback(() => {
     setLoading(true);
-    if (years.length === 0) refreshFY();
+    refreshFY();
     load();
-  }, [load, years.length, refreshFY]));
+  }, [load, refreshFY]));
 
   const cycleTheme = () => {
     setMode(mode === 'light' ? 'dark' : mode === 'dark' ? 'system' : 'light');
@@ -331,55 +332,77 @@ export default function Dashboard() {
         </View>
       </View>
 
-      {/* ── Financial Year chip row ── */}
+      {/* ── Financial Year bar — one year at a time ── */}
       <View style={{ borderBottomWidth: 1, borderBottomColor: palette.border, paddingVertical: spacing.sm }}>
-        <View style={{ paddingHorizontal: spacing.lg, marginBottom: 6, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <Ionicons name="calendar-outline" size={14} color={palette.muted} />
-            <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginLeft: 6, fontWeight: '600' }}>Financial Year</Text>
-          </View>
-          <Pressable testID="create-fy-btn" onPress={() => setShowFyModal(true)}
-            style={{ paddingHorizontal: 8, paddingVertical: 4, borderRadius: radii.sm, backgroundColor: palette.brandSecondary, flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-            <Ionicons name="add" size={14} color={palette.brand} />
-            <Text style={{ color: palette.brand, fontWeight: '600', fontSize: fontSize.sm }}>Add FY</Text>
-          </Pressable>
+        <View style={{ paddingHorizontal: spacing.lg, flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <Ionicons name="calendar-outline" size={14} color={palette.muted} />
+          <Text style={{ color: palette.muted, fontSize: fontSize.sm, fontWeight: '600', flex: 1 }}>
+            Financial Year
+          </Text>
+          {needsSetup && isAdmin ? (
+            <Pressable
+              testID="create-fy-btn"
+              onPress={openFyModal}
+              style={{ paddingHorizontal: 10, paddingVertical: 5, borderRadius: radii.sm, backgroundColor: palette.brand, flexDirection: 'row', alignItems: 'center', gap: 4 }}
+            >
+              <Ionicons name="add" size={14} color="#fff" />
+              <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm }}>Set up</Text>
+            </Pressable>
+          ) : null}
         </View>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingHorizontal: spacing.lg }}>
-          {years.length === 0 ? (
-            <Skeleton width={140} height={36} radius={18} />
+
+        <View style={{ paddingHorizontal: spacing.lg, marginTop: 8 }}>
+          {years.length === 0 && !needsSetup ? (
+            <Skeleton width={180} height={36} radius={18} />
+          ) : needsSetup ? (
+            <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>
+              No financial year yet. Set one up to start recording fees.
+            </Text>
           ) : (
-            years.map((y) => {
-              const active = fy === y;
-              const meta = fyMeta.find((m) => m.label === y);
-              const isClosed = meta?.status === 'closed';
-              return (
-                <View key={y} style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                  <Pressable testID={`fy-chip-${y}`} onPress={() => setCurrent(y)}
-                    style={{
-                      height: 36, paddingHorizontal: 14, borderRadius: 18, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', flexShrink: 0, gap: 6,
-                      backgroundColor: active ? palette.brand : palette.surfaceTertiary,
-                      borderWidth: 1, borderColor: active ? palette.brand : isClosed ? palette.warning : palette.border,
-                    }}>
-                    {isClosed && <Ionicons name="lock-closed" size={11} color={active ? '#fff' : palette.warning} />}
-                    <Text style={{ color: active ? '#fff' : palette.onSurface, fontWeight: '600', fontSize: fontSize.sm }}>FY {y}</Text>
-                  </Pressable>
-                  {/* ⋯ options — only for admin */}
-                  {isAdmin && (
-                    <Pressable testID={`fy-options-${y}`} onPress={() => openActionSheet(y)}
-                      style={{
-                        width: 28, height: 28, borderRadius: 14,
-                        backgroundColor: active ? palette.brand : palette.surfaceTertiary,
-                        borderWidth: 1, borderColor: active ? palette.brand : palette.border,
-                        alignItems: 'center', justifyContent: 'center',
-                      }}>
-                      <Ionicons name="ellipsis-horizontal" size={14} color={active ? '#fff' : palette.muted} />
-                    </Pressable>
-                  )}
-                </View>
-              );
-            })
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <View
+                testID={`fy-chip-${fy}`}
+                style={{
+                  height: 36, paddingHorizontal: 14, borderRadius: 18, flexDirection: 'row',
+                  alignItems: 'center', gap: 6, backgroundColor: palette.brand,
+                  borderWidth: 1, borderColor: palette.brand,
+                }}
+              >
+                {fyInfo?.status === 'closed' ? <Ionicons name="lock-closed" size={11} color="#fff" /> : null}
+                <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm }}>FY {fy}</Text>
+              </View>
+
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: palette.muted, fontSize: fontSize.sm }} numberOfLines={1}>
+                  {calendarDateToDisplay(fyInfo?.start_date) || '—'} → {calendarDateToDisplay(fyInfo?.end_date) || '—'}
+                </Text>
+                {expiredFY ? (
+                  <Text style={{ color: palette.error, fontSize: fontSize.sm, fontWeight: '700' }}>
+                    Expired — download and delete to start the next year
+                  </Text>
+                ) : fyInfo?.days_left != null && fyInfo.days_left <= 30 ? (
+                  <Text style={{ color: palette.warning, fontSize: fontSize.sm }}>
+                    {fyInfo.days_left} day{fyInfo.days_left === 1 ? '' : 's'} left
+                  </Text>
+                ) : null}
+              </View>
+
+              {isAdmin ? (
+                <Pressable
+                  testID={`fy-options-${fy}`}
+                  onPress={() => openActionSheet(fy)}
+                  style={{
+                    width: 28, height: 28, borderRadius: 14, backgroundColor: palette.surfaceTertiary,
+                    borderWidth: 1, borderColor: expiredFY ? palette.error : palette.border,
+                    alignItems: 'center', justifyContent: 'center',
+                  }}
+                >
+                  <Ionicons name="ellipsis-horizontal" size={14} color={expiredFY ? palette.error : palette.muted} />
+                </Pressable>
+              ) : null}
+            </View>
           )}
-        </ScrollView>
+        </View>
       </View>
 
       {/* ── Dashboard body ── */}
@@ -441,114 +464,84 @@ export default function Dashboard() {
 
       {/* ══════════ Add FY Modal ══════════ */}
       <Modal visible={showFyModal} transparent animationType="slide" onRequestClose={() => setShowFyModal(false)}>
-        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: spacing.lg }}>
-          <View style={{ backgroundColor: palette.surfaceSecondary, borderRadius: radii.lg, padding: spacing.lg, width: '100%', maxWidth: 400 }}>
-            <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: spacing.sm }}>
-              Add Financial Year
-            </Text>
-            <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: spacing.md }}>
-              Register a financial year to track, close, and export its records.
-            </Text>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+          <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: spacing.lg }}>
+            <View style={{ backgroundColor: palette.surfaceSecondary, borderRadius: radii.lg, padding: spacing.lg, width: '100%', maxWidth: 420 }}>
+              <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: spacing.sm }}>
+                {needsSetup ? 'Set Up Financial Year' : 'Add Financial Year'}
+              </Text>
 
-            {/* Warning notification banner if an older FY is still open */}
-            {unclosedOlderFY && (
-              <View style={{
-                backgroundColor: `${palette.warning}18`,
-                borderWidth: 1.5,
-                borderColor: palette.warning,
-                borderRadius: radii.md,
-                padding: spacing.md,
-                marginBottom: spacing.md,
-              }}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-                  <Ionicons name="warning-outline" size={20} color={palette.warning} />
-                  <Text style={{ fontWeight: '700', color: palette.warning, fontSize: fontSize.base }}>
-                    Action Required: FY {unclosedOlderFY.label} is Open
+              {!needsSetup ? (
+                // One year exists at a time, so the way forward is to export and
+                // delete the running one — said plainly rather than just refused.
+                <>
+                  <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: spacing.md }}>
+                    FY {fy} is still active. Download its records and delete it, then the next
+                    year can be created.
                   </Text>
+                  <View style={{ backgroundColor: `${palette.warning}18`, borderWidth: 1, borderColor: palette.warning, borderRadius: radii.md, padding: spacing.md, marginBottom: spacing.md }}>
+                    <Text style={{ color: palette.onSurface, fontSize: fontSize.sm, lineHeight: 18 }}>
+                      Deleting FY {fy} removes that year&apos;s fee payments only. Schools and students
+                      are kept and carry into the new year with their fees starting fresh.
+                    </Text>
+                  </View>
+                  <Pressable
+                    testID="fy-modal-manage"
+                    onPress={() => { setShowFyModal(false); openActionSheet(fy); }}
+                    style={{ backgroundColor: palette.brand, paddingVertical: 13, borderRadius: radii.md, alignItems: 'center', marginBottom: spacing.sm }}
+                  >
+                    <Text style={{ color: '#fff', fontWeight: '700' }}>Download & Delete FY {fy} →</Text>
+                  </Pressable>
+                </>
+              ) : (
+                <>
+                  <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: spacing.md }}>
+                    Pick the window this financial year covers. The name is worked out from the
+                    dates, so the two can never disagree.
+                  </Text>
+
+                  <DateTimeField label="Start Date" value={fyStart} onChange={setFyStart} required testID="fy-start" />
+                  <DateTimeField label="End Date" value={fyEnd} onChange={setFyEnd} required testID="fy-end" />
+
+                  <View style={{ backgroundColor: palette.surfaceTertiary, borderRadius: radii.md, padding: spacing.md, marginBottom: spacing.md, alignItems: 'center' }}>
+                    <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>Will be created as</Text>
+                    <Text style={{ color: fyPreview ? palette.brand : palette.muted, fontSize: fontSize.xl, fontWeight: '700', marginTop: 2 }}>
+                      {fyPreview ? `FY ${fyPreview}` : '—'}
+                    </Text>
+                  </View>
+
+                  <Pressable
+                    testID="fy-create-submit"
+                    onPress={handleCreateFY}
+                    disabled={creating || !fyStart || !fyEnd}
+                    style={{
+                      backgroundColor: !fyStart || !fyEnd ? palette.surfaceTertiary : palette.brand,
+                      paddingVertical: 13, borderRadius: radii.md, alignItems: 'center',
+                      marginBottom: spacing.sm, opacity: creating ? 0.7 : 1,
+                    }}
+                  >
+                    <Text style={{ color: !fyStart || !fyEnd ? palette.muted : '#fff', fontWeight: '700' }}>
+                      {creating ? 'Creating…' : 'Create Financial Year'}
+                    </Text>
+                  </Pressable>
+                </>
+              )}
+
+              {fyError ? (
+                <View style={{ backgroundColor: `${palette.error}15`, padding: spacing.md, borderRadius: radii.md, marginBottom: spacing.md }}>
+                  <Text style={{ color: palette.error, fontSize: fontSize.sm, textAlign: 'center' }}>{fyError}</Text>
                 </View>
-                <Text style={{ color: palette.onSurface, fontSize: fontSize.sm, lineHeight: 18, marginBottom: spacing.md }}>
-                  Financial Year <Text style={{ fontWeight: '700' }}>FY {unclosedOlderFY.label}</Text> has not been closed yet. Before creating a new financial year, you must close FY {unclosedOlderFY.label} and download its financial records (PDF / Excel).
-                </Text>
-                <Pressable
-                  onPress={() => {
-                    setShowFyModal(false);
-                    openActionSheet(unclosedOlderFY.label);
-                  }}
-                  style={{
-                    backgroundColor: palette.warning,
-                    paddingVertical: 10,
-                    paddingHorizontal: 14,
-                    borderRadius: radii.md,
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 6,
-                  }}
-                >
-                  <Ionicons name="lock-closed-outline" size={16} color="#fff" />
-                  <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm }}>
-                    Close & Download FY {unclosedOlderFY.label} Records →
-                  </Text>
-                </Pressable>
-              </View>
-            )}
+              ) : null}
 
-            {getAddFYOptions().length === 0 ? (
-              <View style={{ paddingVertical: spacing.lg, alignItems: 'center' }}>
-                <Ionicons name="checkmark-circle" size={32} color={palette.success} />
-                <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: spacing.sm, textAlign: 'center' }}>
-                  Both financial years are already registered.{'\n'}Use the ⋯ button on each chip to manage them.
-                </Text>
-              </View>
-            ) : (
-              <View style={{ gap: 8, marginVertical: spacing.md }}>
-                {getAddFYOptions().map((y) => {
-                  const cur = new Date();
-                  const currentStartYear = cur.getMonth() >= 3 ? cur.getFullYear() : cur.getFullYear() - 1;
-                  const isCurrent = y === `${currentStartYear}-${currentStartYear + 1}`;
-                  const isBlocked = !!unclosedOlderFY && parseInt(y.split('-')[0], 10) > parseInt(unclosedOlderFY.label.split('-')[0], 10);
-                  return (
-                    <Pressable key={y} onPress={() => handleCreateFY(y)} disabled={creating || isBlocked}
-                      style={{
-                        paddingVertical: 14, paddingHorizontal: spacing.md, borderRadius: radii.md,
-                        backgroundColor: isBlocked ? `${palette.warning}10` : palette.surfaceTertiary,
-                        borderWidth: 1.5, borderColor: isBlocked ? palette.border : isCurrent ? palette.brand : palette.border,
-                        flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-                        opacity: creating || isBlocked ? 0.55 : 1,
-                      }}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                        <Ionicons name={isBlocked ? "lock-closed" : "calendar"} size={18} color={isBlocked ? palette.warning : isCurrent ? palette.brand : palette.muted} />
-                        <Text style={{ color: isBlocked ? palette.muted : palette.onSurface, fontWeight: '700', fontSize: fontSize.lg }}>FY {y}</Text>
-                        {isCurrent && !isBlocked && (
-                          <View style={{ backgroundColor: palette.brandSecondary, paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10 }}>
-                            <Text style={{ color: palette.brand, fontSize: 10, fontWeight: '700' }}>CURRENT</Text>
-                          </View>
-                        )}
-                        {isBlocked && (
-                          <View style={{ backgroundColor: `${palette.warning}20`, paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10 }}>
-                            <Text style={{ color: palette.warning, fontSize: 10, fontWeight: '700' }}>BLOCKED</Text>
-                          </View>
-                        )}
-                      </View>
-                      <Ionicons name={creating ? 'hourglass-outline' : isBlocked ? 'lock-closed-outline' : 'add-circle-outline'} size={20} color={isBlocked ? palette.warning : palette.brand} />
-                    </Pressable>
-                  );
-                })}
-              </View>
-            )}
-
-            {fyError ? (
-              <View style={{ backgroundColor: `${palette.error}15`, padding: spacing.md, borderRadius: radii.md, marginBottom: spacing.md }}>
-                <Text style={{ color: palette.error, fontSize: fontSize.sm, textAlign: 'center' }}>{fyError}</Text>
-              </View>
-            ) : null}
-
-            <Pressable onPress={() => { setShowFyModal(false); setFyError(''); }}
-              style={{ marginTop: spacing.sm, paddingVertical: 13, borderRadius: radii.md, borderWidth: 1, borderColor: palette.border, alignItems: 'center' }}>
-              <Text style={{ color: palette.onSurface, fontWeight: '600' }}>Cancel</Text>
-            </Pressable>
+              <Pressable
+                onPress={() => { setShowFyModal(false); setFyError(''); }}
+                style={{ paddingVertical: 13, borderRadius: radii.md, borderWidth: 1, borderColor: palette.border, alignItems: 'center' }}
+              >
+                <Text style={{ color: palette.onSurface, fontWeight: '600' }}>Cancel</Text>
+              </Pressable>
+            </View>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ══════════ FY Action Bottom Sheet ══════════ */}
@@ -613,9 +606,9 @@ export default function Dashboard() {
             {/* ─── Confirm: Delete ─── */}
             {confirmStep === 'delete' && (
               <ConfirmPanel
-                title={`Delete all records for FY ${actionFY?.label}?`}
-                body="This will permanently delete ALL students and their payment history for this financial year. This CANNOT be undone."
-                confirmLabel="Delete Everything"
+                title={`Delete FY ${actionFY?.label}?`}
+                body="This removes this financial year and every fee payment recorded in it. Schools and students are kept and carry into the next year with their fees starting fresh. Download the records first — this CANNOT be undone."
+                confirmLabel="Delete Financial Year"
                 confirmColor={palette.error}
                 onConfirm={doDeleteRecords}
                 onCancel={() => setConfirmStep(null)}
@@ -626,9 +619,9 @@ export default function Dashboard() {
             {/* ─── Confirm: Reset ─── */}
             {confirmStep === 'reset' && (
               <ConfirmPanel
-                title={`Reset student data for FY ${actionFY?.label}?`}
-                body="This will permanently delete ALL students and their payment history for this financial year, but the FY stays OPEN so you can start entering fresh data right away. This CANNOT be undone."
-                confirmLabel="Reset Data"
+                title={`Reset fee data for FY ${actionFY?.label}?`}
+                body="This clears every fee payment recorded in this financial year. The year stays open and the student roster is untouched, so you can start collecting again from zero. This CANNOT be undone."
+                confirmLabel="Reset Fee Data"
                 confirmColor={palette.error}
                 onConfirm={doResetData}
                 onCancel={() => setConfirmStep(null)}
@@ -678,8 +671,8 @@ export default function Dashboard() {
                 <View style={{ height: 1, backgroundColor: palette.border, marginVertical: spacing.sm }} />
                 <ActionRow
                   icon="refresh-outline"
-                  label="Reset Student Data"
-                  description="Wipe all students & payments for this FY without closing it."
+                  label="Reset Fee Data"
+                  description="Clear this year's payments. Students are kept and the year stays open."
                   color={palette.error}
                   busy={actionBusy === 'reset'}
                   onPress={() => setConfirmStep('reset')}
@@ -687,22 +680,18 @@ export default function Dashboard() {
                   destructive
                 />
 
-                {/* DELETE — only for closed FYs */}
-                {actionFY?.status === 'closed' && (
-                  <>
-                    <View style={{ height: 1, backgroundColor: palette.border, marginVertical: spacing.sm }} />
-                    <ActionRow
-                      icon="trash-outline"
-                      label="Delete All Records"
-                      description="Permanently delete all students & payments for this FY."
-                      color={palette.error}
-                      busy={actionBusy === 'delete'}
-                      onPress={() => setConfirmStep('delete')}
-                      palette={palette}
-                      destructive
-                    />
-                  </>
-                )}
+                {/* DELETE — closing first is not required; the export is the safeguard */}
+                <View style={{ height: 1, backgroundColor: palette.border, marginVertical: spacing.sm }} />
+                <ActionRow
+                  icon="trash-outline"
+                  label="Delete Financial Year"
+                  description="Removes this year and its fee payments. Students carry over. Download first."
+                  color={palette.error}
+                  busy={actionBusy === 'delete'}
+                  onPress={() => setConfirmStep('delete')}
+                  palette={palette}
+                  destructive
+                />
               </>
             )}
 

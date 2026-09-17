@@ -1,92 +1,83 @@
 /**
- * Financial Year context — global selector that filters data app-wide.
- * Includes per-FY status metadata (open/closed) and lifecycle helpers.
- * Strictly filters out future financial years and enforces max 2 FYs display.
- * The backend is the sole source of truth for FY status — actions here
- * reflect exactly what the server confirms, and throw on failure instead of
- * faking success locally, so the UI can never disagree with the database.
+ * Financial Year context.
+ *
+ * Exactly one financial year is registered at a time, and it carries its own
+ * start and end dates — the label is derived from them, never typed. Fees are
+ * scoped to that window; schools and students are not, so the roster carries
+ * into the next year while the money starts fresh.
+ *
+ * The backend is the sole source of truth: actions here reflect what the server
+ * confirms and throw on failure rather than faking success locally.
  */
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { apiFetch } from './auth';
 
 export interface FYMeta {
   label: string;
   status: 'open' | 'closed';
+  start_date?: string | null;
+  end_date?: string | null;
+  /** Today is past end_date. A flag only — the server never acts on it. */
+  expired?: boolean;
+  days_left?: number;
   closed_at?: string | null;
   created_at?: string | null;
 }
 
+export interface DeleteYearResult {
+  deleted_payments: number;
+  kept_students: number;
+  kept_schools: number;
+}
+
 interface FYCtx {
-  current: string;            // selected FY, e.g. '2026-2027'
-  years: string[];            // just the labels (max 2)
-  fyMeta: FYMeta[];           // enriched meta per FY
+  current: string;
+  years: string[];
+  fyMeta: FYMeta[];
+  /** No year registered yet — the app should prompt for the first one. */
+  needsSetup: boolean;
+  meta: FYMeta | null;
   setCurrent: (fy: string) => void;
   refresh: () => Promise<void>;
+  previewLabel: (start: string, end: string) => Promise<string | null>;
+  createFY: (start: string, end: string) => Promise<FYMeta>;
+  deleteYear: (label: string) => Promise<DeleteYearResult>;
   closeFY: (label: string) => Promise<void>;
-  deleteRecords: (label: string) => Promise<{ deleted_students: number; deleted_payments: number }>;
-  resetData: (label: string) => Promise<{ deleted_students: number; deleted_payments: number }>;
+  resetData: (label: string) => Promise<{ deleted_payments: number }>;
 }
 
 const FYContext = createContext<FYCtx>({
   current: '',
   years: [],
   fyMeta: [],
+  needsSetup: false,
+  meta: null,
   setCurrent: () => {},
   refresh: async () => {},
+  previewLabel: async () => null,
+  createFY: async () => ({ label: '', status: 'open' }),
+  deleteYear: async () => ({ deleted_payments: 0, kept_students: 0, kept_schools: 0 }),
   closeFY: async () => {},
-  deleteRecords: async () => ({ deleted_students: 0, deleted_payments: 0 }),
-  resetData: async () => ({ deleted_students: 0, deleted_payments: 0 }),
+  resetData: async () => ({ deleted_payments: 0 }),
 });
-
-const KEY = 'busfee:fy';
 
 export function FYProvider({ children }: { children: React.ReactNode }) {
   const [years, setYears] = useState<string[]>([]);
   const [fyMeta, setFyMeta] = useState<FYMeta[]>([]);
   const [current, setCurrentState] = useState<string>('');
+  const [needsSetup, setNeedsSetup] = useState(false);
 
+  // The server returns at most one year, so there is nothing to filter or
+  // remember here — no saved selection, because there is nothing to select.
   const refresh = useCallback(async () => {
     try {
-      const data = await apiFetch<{ current: string; years: string[]; meta: FYMeta[] }>('/financial-years');
-      
-      // Calculate current Indian FY start year (April -> March)
-      const now = new Date();
-      const currentStartYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
-
-      // Filter out any future year (start_year > currentStartYear)
-      const filteredYears = (data.years || []).filter((y) => {
-        const startYear = parseInt(y.split('-')[0], 10);
-        return !isNaN(startYear) && startYear <= currentStartYear;
-      });
-
-      // Keep at most 2 years (current + 1 past year)
-      const max2Years = filteredYears.slice(0, 2);
-
-      const rawMeta = data.meta || [];
-      const filteredMeta: FYMeta[] = max2Years.map((label) => {
-        const existing = rawMeta.find((m) => m.label === label);
-        if (existing?.status === 'closed') {
-          return {
-            label,
-            status: 'closed',
-            closed_at: existing.closed_at,
-            created_at: existing.created_at,
-          };
-        }
-        return {
-          label,
-          status: 'open',
-          created_at: existing?.created_at,
-        };
-      });
-
-      setYears(max2Years);
-      setFyMeta(filteredMeta);
-
-      const saved = await AsyncStorage.getItem(KEY);
-      const picked = saved && max2Years.includes(saved) ? saved : (max2Years[0] || data.current);
-      setCurrentState(picked);
+      const data = await apiFetch<{
+        current: string; years: string[]; meta: FYMeta[]; needs_setup: boolean;
+      }>('/financial-years');
+      setYears(data.years || []);
+      setFyMeta(data.meta || []);
+      setCurrentState(data.current || '');
+      setNeedsSetup(!!data.needs_setup);
     } catch {
       /* ignore — only available after login */
     }
@@ -96,58 +87,71 @@ export function FYProvider({ children }: { children: React.ReactNode }) {
     refresh();
   }, [refresh]);
 
-  const setCurrent = (fy: string) => {
-    setCurrentState(fy);
-    AsyncStorage.setItem(KEY, fy).catch(() => {});
-  };
+  const previewLabel = useCallback(async (start: string, end: string) => {
+    if (!start || !end) return null;
+    try {
+      const r = await apiFetch<{ label: string | null }>(
+        `/financial-years/preview?start_date=${encodeURIComponent(start)}&end_date=${encodeURIComponent(end)}`,
+      );
+      return r.label;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const createFY = useCallback(async (start: string, end: string) => {
+    const created = await apiFetch<FYMeta>('/financial-years', {
+      method: 'POST',
+      body: JSON.stringify({ start_date: start, end_date: end }),
+    });
+    await refresh();
+    return created;
+  }, [refresh]);
+
+  const deleteYear = useCallback(async (label: string) => {
+    const res = await apiFetch<DeleteYearResult>(
+      `/financial-years/${encodeURIComponent(label)}/records`,
+      { method: 'DELETE' },
+    );
+    await refresh();
+    return {
+      deleted_payments: res?.deleted_payments ?? 0,
+      kept_students: res?.kept_students ?? 0,
+      kept_schools: res?.kept_schools ?? 0,
+    };
+  }, [refresh]);
 
   const closeFY = useCallback(async (label: string) => {
-    // No local fallback: if the server doesn't confirm the close, this throws
-    // and the FY stays open — the UI must never show "closed" unless the
-    // database actually says so.
-    try {
-      await apiFetch(`/financial-years/${encodeURIComponent(label)}/close`, { method: 'PATCH' });
-    } catch {
-      await apiFetch(`/financial-years/close`, {
-        method: 'POST',
-        body: JSON.stringify({ label }),
-      });
-    }
+    await apiFetch(`/financial-years/${encodeURIComponent(label)}/close`, { method: 'PATCH' });
     await refresh();
   }, [refresh]);
 
-  const deleteRecords = useCallback(async (label: string) => {
-    let res: any;
-    try {
-      res = await apiFetch(`/financial-years/${encodeURIComponent(label)}/records`, { method: 'DELETE' });
-    } catch {
-      res = await apiFetch(`/financial-years/records`, {
-        method: 'POST',
-        body: JSON.stringify({ label }),
-      });
-    }
-    await refresh();
-    return { deleted_students: res?.deleted_students ?? 0, deleted_payments: res?.deleted_payments ?? 0 };
-  }, [refresh]);
-
-  // Reset (wipe) a FY's student + payment data without closing it — the FY stays
-  // open/registered and can immediately be used again with fresh data.
   const resetData = useCallback(async (label: string) => {
-    let res: any;
-    try {
-      res = await apiFetch(`/financial-years/${encodeURIComponent(label)}/reset`, { method: 'DELETE' });
-    } catch {
-      res = await apiFetch(`/financial-years/reset`, {
-        method: 'POST',
-        body: JSON.stringify({ label }),
-      });
-    }
+    const res = await apiFetch<{ deleted_payments: number }>(
+      `/financial-years/${encodeURIComponent(label)}/reset`,
+      { method: 'DELETE' },
+    );
     await refresh();
-    return { deleted_students: res?.deleted_students ?? 0, deleted_payments: res?.deleted_payments ?? 0 };
+    return { deleted_payments: res?.deleted_payments ?? 0 };
   }, [refresh]);
 
   return (
-    <FYContext.Provider value={{ current, years, fyMeta, setCurrent, refresh, closeFY, deleteRecords, resetData }}>
+    <FYContext.Provider
+      value={{
+        current,
+        years,
+        fyMeta,
+        needsSetup,
+        meta: fyMeta[0] || null,
+        setCurrent: setCurrentState,
+        refresh,
+        previewLabel,
+        createFY,
+        deleteYear,
+        closeFY,
+        resetData,
+      }}
+    >
       {children}
     </FYContext.Provider>
   );

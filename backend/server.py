@@ -369,6 +369,9 @@ class CreateFY(BaseModel):
     label: Optional[str] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    # First due date every student inherits when the year is created. Defaults
+    # to 7 July inside the window.
+    student_due_date: Optional[str] = None
 
 
 class LoginIn(BaseModel):
@@ -408,8 +411,12 @@ class StudentIn(BaseModel):
     standard: str
     pickup_location: Optional[str] = ""
     yearly_fee: float
-    admission_date: str  # ISO datetime
-    due_date: str  # ISO datetime
+    # The day this student first joined. Never rewritten — the yearly rollover
+    # moves start_date instead, so the original enrolment stays on record.
+    admission_date: str
+    # Service start within the current financial year.
+    start_date: Optional[str] = None
+    due_date: str  # first due date of the year; later ones follow payments
 
     @field_validator("parent_mobile")
     @classmethod
@@ -586,6 +593,12 @@ async def startup() -> None:
             {"email": ADMIN_EMAIL},
             {"$set": {"role": ROLE_ADMIN, "status": "active", "page_permissions": ALL_PAGES}},
         )
+
+    # Students written before start_date existed are dated from their admission.
+    await db.students.update_many(
+        {"$or": [{"start_date": {"$exists": False}}, {"start_date": None}]},
+        [{"$set": {"start_date": "$admission_date"}}],
+    )
 
     if await db.schools.count_documents({}) == 0:
         sample_schools = [
@@ -790,6 +803,9 @@ async def create_student(body: StudentIn, admin=Depends(get_current_admin)):
     if await db.students.find_one(_duplicate_student_query(body)):
         raise HTTPException(400, "A student with the same name, parent, mobile, class, pickup location, and fee already exists")
     doc = {**body.model_dump(), "id": str(uuid.uuid4()), "created_at": now_iso()}
+    # A student joining mid-year starts the day they were admitted.
+    if not doc.get("start_date"):
+        doc["start_date"] = doc["admission_date"]
     await db.students.insert_one(dict(doc))
     actor = admin.get("full_name") or admin.get("email") or "Someone"
     await send_push_to_all(
@@ -815,7 +831,11 @@ async def update_student(student_id: str, body: StudentIn, admin=Depends(get_cur
         raise HTTPException(400, "Invalid school_id")
     if await db.students.find_one(_duplicate_student_query(body, exclude_id=student_id)):
         raise HTTPException(400, "A student with the same name, parent, mobile, class, pickup location, and fee already exists")
-    res = await db.students.update_one({"id": student_id}, {"$set": body.model_dump()})
+    patch = body.model_dump()
+    if not patch.get("start_date"):
+        existing = await db.students.find_one({"id": student_id}, {"_id": 0, "start_date": 1})
+        patch["start_date"] = (existing or {}).get("start_date") or patch["admission_date"]
+    res = await db.students.update_one({"id": student_id}, {"$set": patch})
     if res.matched_count == 0:
         raise HTTPException(404, "Student not found")
     doc = await db.students.find_one({"id": student_id}, {"_id": 0})
@@ -1756,6 +1776,7 @@ async def financial_years(admin=Depends(get_current_admin)):
         "status": doc.get("status", "open"),
         "start_date": doc.get("start_date") or (window[0].isoformat() if window else None),
         "end_date": doc.get("end_date") or (window[1].isoformat() if window else None),
+        "student_due_date": doc.get("student_due_date"),
         "closed_at": doc.get("closed_at"),
         "created_at": doc.get("created_at"),
         # Expiry is a flag, never an action: the server does not close or delete
@@ -1792,18 +1813,38 @@ async def create_financial_year(payload: CreateFY, admin=Depends(get_current_adm
             f"delete it before creating a new financial year.",
         )
 
+    due = _resolve_student_due(payload.student_due_date, start, end)
     label = _fy_label_from_dates(start, end)
     doc = {
         "label": label,
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
+        "student_due_date": due.isoformat(),
         "status": "open",
         "closed_at": None,
         "created_at": now_iso(),
     }
     await db.financial_years.insert_one(dict(doc))
-    logger.info("Created FY %s (%s to %s)", label, doc["start_date"], doc["end_date"])
-    return {"status": "success", **{k: v for k, v in doc.items() if k != "_id"}}
+
+    # The roster carried over from the deleted year, so bring every student into
+    # the new one: a fresh service start and a fresh first due date. Their
+    # admission_date is left alone — it records when they actually joined.
+    rolled = 0
+    if await db.students.count_documents({}):
+        rolled = (await db.students.update_many(
+            {},
+            {"$set": {"start_date": start.isoformat(), "due_date": due.isoformat()}},
+        )).modified_count
+
+    logger.info(
+        "Created FY %s (%s to %s); rolled %d student(s) to due %s",
+        label, doc["start_date"], doc["end_date"], rolled, doc["student_due_date"],
+    )
+    return {
+        "status": "success",
+        "students_rolled": rolled,
+        **{k: v for k, v in doc.items() if k != "_id"},
+    }
 
 
 @api.get("/financial-years/preview")
@@ -1814,8 +1855,35 @@ async def preview_financial_year(
     """The label a given window would produce, so the form can show it live."""
     start, end = _period_day(start_date), _period_day(end_date)
     if not start or not end or end <= start:
-        return {"label": None}
-    return {"label": _fy_label_from_dates(start, end)}
+        return {"label": None, "student_due_date": None}
+    return {
+        "label": _fy_label_from_dates(start, end),
+        "student_due_date": _default_student_due(start, end).isoformat(),
+    }
+
+
+def _default_student_due(start: date, end: date) -> date:
+    """7 July is the usual first due date, so pick whichever 7 July the window
+    actually contains — a June-May year takes the July at its start, a
+    September year the one the following summer."""
+    for year in (start.year, start.year + 1):
+        candidate = date(year, 7, 7)
+        if start <= candidate <= end:
+            return candidate
+    return start
+
+
+def _resolve_student_due(payload_value: Optional[str], start: date, end: date) -> date:
+    due = _period_day(payload_value) if payload_value else None
+    if due is None:
+        return _default_student_due(start, end)
+    if not (start <= due <= end):
+        raise HTTPException(
+            400,
+            f"The student due date must fall inside {start.strftime('%d/%m/%Y')} - "
+            f"{end.strftime('%d/%m/%Y')}",
+        )
+    return due
 
 
 def _validate_fy_window(start: Optional[date], end: Optional[date]) -> None:
@@ -1860,12 +1928,23 @@ async def update_financial_year(label: str, payload: CreateFY, admin=Depends(get
         )
 
     new_label = _fy_label_from_dates(start, end)
+    existing_due = _period_day(doc.get("student_due_date"))
+    # Keep the due date where it is when it still fits, otherwise move it to the
+    # 7 July of the new window rather than leaving it stranded outside.
+    if payload.student_due_date:
+        due = _resolve_student_due(payload.student_due_date, start, end)
+    elif existing_due and start <= existing_due <= end:
+        due = existing_due
+    else:
+        due = _default_student_due(start, end)
+
     await db.financial_years.update_one(
         {"label": label},
         {"$set": {
             "label": new_label,
             "start_date": start.isoformat(),
             "end_date": end.isoformat(),
+            "student_due_date": due.isoformat(),
         }},
     )
     logger.info("FY %s updated to %s (%s to %s)", label, new_label, start, end)

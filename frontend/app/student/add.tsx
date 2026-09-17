@@ -23,6 +23,7 @@ export default function StudentForm() {
   const [pickup, setPickup] = useState('');
   const [fee, setFee] = useState('');
   const [admission, setAdmission] = useState(new Date().toISOString());
+  const [startDate, setStartDate] = useState('');
   const [due, setDue] = useState('');
   const [err, setErr] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
@@ -35,7 +36,8 @@ export default function StudentForm() {
       apiFetch(`/students/${id}`).then((s: any) => {
         setName(s.name); setParent(s.parent_name); setMobile(s.parent_mobile);
         setSchoolId(s.school_id); setStandard(s.standard); setPickup(s.pickup_location || '');
-        setFee(String(s.yearly_fee)); setAdmission(s.admission_date); setDue(s.due_date);
+        setFee(String(s.yearly_fee)); setAdmission(s.admission_date);
+        setStartDate(s.start_date || s.admission_date); setDue(s.due_date);
       }).catch(() => {}).finally(() => setHydrating(false));
     } else {
       setAdmission(new Date().toISOString());
@@ -61,7 +63,8 @@ export default function StudentForm() {
       const body = JSON.stringify({
         name: name.trim(), parent_name: parent.trim(), parent_mobile: mobile.trim(),
         school_id: schoolId, standard: standard.trim(), pickup_location: pickup,
-        yearly_fee: feeNum, admission_date: admission, due_date: due,
+        yearly_fee: feeNum, admission_date: admission,
+        start_date: startDate || admission, due_date: due,
       });
       if (editing) await apiFetch(`/students/${id}`, { method: 'PUT', body });
       else await apiFetch('/students', { method: 'POST', body });
@@ -121,6 +124,10 @@ export default function StudentForm() {
             testID="student-fee"
           />
           <DateTimeField label="Admission Date & Time" value={admission} onChange={setAdmission} required testID="student-admission" />
+          <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -6, marginBottom: spacing.md }}>
+            When this student first joined. Kept as-is every year — the yearly rollover moves the start and due dates instead.
+          </Text>
+          <DateTimeField label="Start Date & Time" value={startDate || admission} onChange={setStartDate} testID="student-start" />
           <DateTimeField label="Due Date & Time" value={due} onChange={setDue} required testID="student-due" />
 
           <Button title={editing ? 'Save Changes' : 'Add Student'} onPress={submit} loading={loading} testID="student-submit" />

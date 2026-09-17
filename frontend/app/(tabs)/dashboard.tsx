@@ -64,6 +64,7 @@ export default function Dashboard() {
   const [fyStart, setFyStart] = useState('');
   const [fyEnd, setFyEnd] = useState('');
   const [fyPreview, setFyPreview] = useState<string | null>(null);
+  const [fyDue, setFyDue] = useState('');
   // Non-null puts the same form into edit mode against an existing year.
   const [editingFY, setEditingFY] = useState<FYMeta | null>(null);
 
@@ -141,6 +142,7 @@ export default function Dashboard() {
     setFyStart(edit?.start_date ? calendarDateToLocalIso(edit.start_date) : '');
     setFyEnd(edit?.end_date ? calendarDateToLocalIso(edit.end_date) : '');
     setFyPreview(edit?.label || null);
+    setFyDue(edit?.student_due_date ? calendarDateToLocalIso(edit.student_due_date) : '');
     setShowFyModal(true);
   };
 
@@ -152,8 +154,11 @@ export default function Dashboard() {
       setFyPreview(null);
       return;
     }
-    previewLabel(isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd)).then((label) => {
-      if (!cancelled) setFyPreview(label);
+    previewLabel(isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd)).then((res) => {
+      if (cancelled) return;
+      setFyPreview(res.label);
+      // Only ever prefill an empty picker — never overwrite a date already chosen.
+      if (res.student_due_date && !fyDue) setFyDue(calendarDateToLocalIso(res.student_due_date));
     });
     return () => { cancelled = true; };
   }, [fyStart, fyEnd, previewLabel]);
@@ -169,6 +174,7 @@ export default function Dashboard() {
       if (editingFY) {
         const updated = await updateFY(
           editingFY.label, isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd),
+          fyDue ? isoToCalendarDate(fyDue) : undefined,
         );
         setShowFyModal(false);
         setEditingFY(null);
@@ -179,10 +185,17 @@ export default function Dashboard() {
             : `✓ FY ${updated.label} dates updated.`,
         );
       } else {
-        const created = await createFY(isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd));
+        const created = await createFY(
+          isoToCalendarDate(fyStart), isoToCalendarDate(fyEnd),
+          fyDue ? isoToCalendarDate(fyDue) : undefined,
+        );
         setShowFyModal(false);
         await load();
-        setActionMsg(`✓ Financial Year ${created.label} created.`);
+        setActionMsg(
+          created.students_rolled
+            ? `✓ FY ${created.label} created. ${created.students_rolled} student(s) carried over, due ${calendarDateToDisplay(created.student_due_date)}.`
+            : `✓ Financial Year ${created.label} created.`,
+        );
       }
     } catch (e: any) {
       setFyError(e.message || 'Failed to create financial year');
@@ -520,6 +533,11 @@ export default function Dashboard() {
 
                   <DateTimeField label="Start Date" value={fyStart} onChange={setFyStart} required testID="fy-start" />
                   <DateTimeField label="End Date" value={fyEnd} onChange={setFyEnd} required testID="fy-end" />
+                  <DateTimeField label="Student Due Date" value={fyDue} onChange={setFyDue} testID="fy-due" />
+                  <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -6, marginBottom: spacing.md }}>
+                    The first due date every student inherits this year. Defaults to 7 July. Later
+                    due dates shift as part-payments come in.
+                  </Text>
 
                   <View style={{ backgroundColor: palette.surfaceTertiary, borderRadius: radii.md, padding: spacing.md, marginBottom: spacing.md, alignItems: 'center' }}>
                     <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>

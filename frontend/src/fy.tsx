@@ -20,8 +20,17 @@ export interface FYMeta {
   /** Today is past end_date. A flag only — the server never acts on it. */
   expired?: boolean;
   days_left?: number;
+  /** First due date every student inherits for this year. */
+  student_due_date?: string | null;
+  /** How many students the create step rolled into this year. */
+  students_rolled?: number;
   closed_at?: string | null;
   created_at?: string | null;
+}
+
+export interface FYPreview {
+  label: string | null;
+  student_due_date?: string | null;
 }
 
 export interface DeleteYearResult {
@@ -39,9 +48,9 @@ interface FYCtx {
   meta: FYMeta | null;
   setCurrent: (fy: string) => void;
   refresh: () => Promise<void>;
-  previewLabel: (start: string, end: string) => Promise<string | null>;
-  createFY: (start: string, end: string) => Promise<FYMeta>;
-  updateFY: (label: string, start: string, end: string) => Promise<FYMeta & { renamed?: boolean }>;
+  previewLabel: (start: string, end: string) => Promise<FYPreview>;
+  createFY: (start: string, end: string, due?: string) => Promise<FYMeta>;
+  updateFY: (label: string, start: string, end: string, due?: string) => Promise<FYMeta & { renamed?: boolean }>;
   deleteYear: (label: string) => Promise<DeleteYearResult>;
   closeFY: (label: string) => Promise<void>;
   resetData: (label: string) => Promise<{ deleted_payments: number }>;
@@ -55,7 +64,7 @@ const FYContext = createContext<FYCtx>({
   meta: null,
   setCurrent: () => {},
   refresh: async () => {},
-  previewLabel: async () => null,
+  previewLabel: async () => ({ label: null }),
   createFY: async () => ({ label: '', status: 'open' }),
   updateFY: async () => ({ label: '', status: 'open' }),
   deleteYear: async () => ({ deleted_payments: 0, kept_students: 0, kept_schools: 0 }),
@@ -89,31 +98,33 @@ export function FYProvider({ children }: { children: React.ReactNode }) {
     refresh();
   }, [refresh]);
 
-  const previewLabel = useCallback(async (start: string, end: string) => {
-    if (!start || !end) return null;
+  const previewLabel = useCallback(async (start: string, end: string): Promise<FYPreview> => {
+    if (!start || !end) return { label: null };
     try {
-      const r = await apiFetch<{ label: string | null }>(
+      return await apiFetch<FYPreview>(
         `/financial-years/preview?start_date=${encodeURIComponent(start)}&end_date=${encodeURIComponent(end)}`,
       );
-      return r.label;
     } catch {
-      return null;
+      return { label: null };
     }
   }, []);
 
-  const createFY = useCallback(async (start: string, end: string) => {
+  const createFY = useCallback(async (start: string, end: string, due?: string) => {
     const created = await apiFetch<FYMeta>('/financial-years', {
       method: 'POST',
-      body: JSON.stringify({ start_date: start, end_date: end }),
+      body: JSON.stringify({ start_date: start, end_date: end, student_due_date: due || null }),
     });
     await refresh();
     return created;
   }, [refresh]);
 
-  const updateFY = useCallback(async (label: string, start: string, end: string) => {
+  const updateFY = useCallback(async (label: string, start: string, end: string, due?: string) => {
     const updated = await apiFetch<FYMeta & { renamed?: boolean }>(
       `/financial-years/${encodeURIComponent(label)}`,
-      { method: 'PUT', body: JSON.stringify({ start_date: start, end_date: end }) },
+      {
+        method: 'PUT',
+        body: JSON.stringify({ start_date: start, end_date: end, student_due_date: due || null }),
+      },
     );
     await refresh();
     return updated;

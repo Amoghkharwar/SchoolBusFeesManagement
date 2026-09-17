@@ -6,9 +6,12 @@ import { useAuth } from '@/src/auth';
 export default function TabsLayout() {
   const { palette } = useTheme();
   const { admin } = useAuth();
-  const perms = admin?.page_permissions || ['dashboard', 'schools', 'students', 'pending', 'reports', 'users'];
-  const can = (key: string) => perms.includes(key);
+  const perms = admin?.page_permissions || ['dashboard', 'schools', 'students', 'work', 'pending', 'reports', 'users'];
   const isAdmin = admin?.role === 'admin';
+  // An admin always holds every page (the server re-asserts that on boot), so
+  // read the role rather than the stored list — otherwise a page added after a
+  // user row was written stays invisible until that row is rewritten.
+  const can = (key: string) => isAdmin || perms.includes(key);
 
   return (
     <Tabs
@@ -48,6 +51,14 @@ export default function TabsLayout() {
           title: 'Students',
           href: can('students') ? undefined : null,
           tabBarIcon: ({ color, size }) => <Ionicons name="people" size={size} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="work"
+        options={{
+          title: 'Work',
+          href: can('work') ? undefined : null,
+          tabBarIcon: ({ color, size }) => <Ionicons name="hammer" size={size} color={color} />,
         }}
       />
       <Tabs.Screen

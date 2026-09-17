@@ -66,10 +66,10 @@ db = client[DB_NAME]
 ROLE_ADMIN = "admin"
 ROLE_AUTHOR = "author"
 ROLE_GUEST = "guest"
-ALL_PAGES = ["dashboard", "schools", "students", "pending", "reports", "users"]
+ALL_PAGES = ["dashboard", "schools", "students", "work", "pending", "reports", "users"]
 ROLE_DEFAULT_PERMS: Dict[str, List[str]] = {
     ROLE_ADMIN: ALL_PAGES,
-    ROLE_AUTHOR: ["dashboard", "students", "pending", "reports"],
+    ROLE_AUTHOR: ["dashboard", "students", "work", "pending", "reports"],
     ROLE_GUEST: ["dashboard"],  # admin can override per user
 }
 # Action permissions
@@ -420,6 +420,53 @@ class PaymentIn(BaseModel):
     next_due_date: Optional[str] = None  # ISO datetime — next fee due
 
 
+class WorkerIn(BaseModel):
+    """A person on the payroll. `monthly_salary` is only the default used to
+    pre-fill new salary months — each month stores its own matured amount, so
+    a raise or a short month doesn't rewrite history."""
+    name: str
+    mobile: Optional[str] = ""
+    designation: Optional[str] = ""
+    monthly_salary: float
+    join_date: str  # ISO datetime
+    active: Optional[bool] = True
+
+    @field_validator("mobile")
+    @classmethod
+    def validate_mobile(cls, v: Optional[str]) -> str:
+        digits = (v or "").strip()
+        if not digits:
+            return ""
+        if digits.startswith("+91"):
+            digits = digits[3:]
+        elif digits.startswith("91") and len(digits) == 12:
+            digits = digits[2:]
+        elif digits.startswith("0") and len(digits) == 11:
+            digits = digits[1:]
+        if not re.fullmatch(r"[6-9]\d{9}", digits):
+            raise ValueError("Mobile must be a valid 10-digit Indian mobile number")
+        return digits
+
+
+class SalaryPeriodIn(BaseModel):
+    """One salary cycle — the stretch of work whose pay matures on end_date."""
+    start_date: str  # ISO datetime
+    end_date: str    # ISO datetime — the day the salary matures
+    total_salary: float
+    note: Optional[str] = ""
+
+
+class SalaryPaymentIn(BaseModel):
+    """A part-payment against salary. With no `period_id` the amount is spread
+    over unpaid months oldest-first, which is how a lump sum handed over after
+    a couple of missed months actually settles them."""
+    amount: float
+    payment_date: str  # ISO datetime
+    mode: str  # cash / upi / bank
+    note: Optional[str] = ""
+    period_id: Optional[str] = None
+
+
 # ---------- Helpers ----------
 def compute_status(yearly: float, paid: float) -> str:
     if paid <= 0:
@@ -475,6 +522,11 @@ async def startup() -> None:
     await db.payments.create_index("id", unique=True)
     await db.password_resets.create_index("email")
     await db.archives.create_index("fy", unique=True)
+    await db.workers.create_index("id", unique=True)
+    await db.salary_periods.create_index("id", unique=True)
+    await db.salary_periods.create_index("worker_id")
+    await db.salary_payments.create_index("id", unique=True)
+    await db.salary_payments.create_index("worker_id")
 
     # Migrate old admins → users
     async for old in db.admins.find({}):
@@ -850,6 +902,359 @@ async def add_payment(student_id: str, body: PaymentIn, admin=Depends(get_curren
 async def delete_payment(payment_id: str, admin=Depends(get_current_admin)):
     await db.payments.delete_one({"id": payment_id})
     return {"ok": True}
+
+
+# ---------- Work Management (workers & salary) ----------
+_MONTHS = ["January", "February", "March", "April", "May", "June",
+           "July", "August", "September", "October", "November", "December"]
+
+
+def _period_label(start: Optional[str], end: Optional[str]) -> str:
+    """Names a salary cycle the way it gets spoken about — "September 2026" for a
+    calendar month, "Aug–Sep 2026" when the cycle straddles two."""
+    s = _parse_dt(start)
+    e = _parse_dt(end)
+    if not s:
+        return "Salary period"
+    if e and (e.month != s.month or e.year != s.year):
+        if e.year != s.year:
+            return f"{_MONTHS[s.month - 1][:3]} {s.year} – {_MONTHS[e.month - 1][:3]} {e.year}"
+        return f"{_MONTHS[s.month - 1][:3]}–{_MONTHS[e.month - 1][:3]} {s.year}"
+    return f"{_MONTHS[s.month - 1]} {s.year}"
+
+
+def _sort_key(value: Optional[str]) -> datetime:
+    return _parse_dt(value) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _salary_status(total: float, paid: float) -> str:
+    """Deliberately separate from the student-fee status helper: work management
+    is its own module, so a change to fee rules must not move salary states."""
+    if paid <= 0:
+        return "pending"
+    if paid + 0.0001 >= total:
+        return "completed"
+    return "partial"
+
+
+async def _worker_periods(worker_id: str) -> List[Dict[str, Any]]:
+    """Every salary cycle for a worker, oldest first, with what has been paid
+    against it resolved from the payment allocations."""
+    periods = await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500)
+    payments = await db.salary_payments.find({"worker_id": worker_id}, {"_id": 0}).to_list(2000)
+
+    paid_by_period: Dict[str, float] = {}
+    for pay in payments:
+        for alloc in pay.get("allocations", []):
+            pid = alloc.get("period_id")
+            if pid:
+                paid_by_period[pid] = paid_by_period.get(pid, 0.0) + float(alloc.get("amount", 0))
+
+    periods.sort(key=lambda p: _sort_key(p.get("start_date")))
+    today = datetime.now(timezone.utc)
+    out: List[Dict[str, Any]] = []
+    for p in periods:
+        total = float(p.get("total_salary", 0))
+        paid = round(paid_by_period.get(p["id"], 0.0), 2)
+        pending = round(max(total - paid, 0), 2)
+        end = _parse_dt(p.get("end_date"))
+        matured = bool(end and end <= today)
+        overdue_days = max((today - end).days, 0) if (end and matured and pending > 0) else 0
+        out.append({
+            **p,
+            "label": _period_label(p.get("start_date"), p.get("end_date")),
+            "paid_amount": paid,
+            "pending_amount": pending,
+            "status": _salary_status(total, paid),
+            "matured": matured,
+            "overdue_days": overdue_days,
+        })
+    return out
+
+
+async def worker_to_out(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """A worker plus the roll-up the list and pending screens both read from."""
+    periods = await _worker_periods(doc["id"])
+    total_salary = round(sum(float(p["total_salary"]) for p in periods), 2)
+    total_paid = round(sum(float(p["paid_amount"]) for p in periods), 2)
+    total_pending = round(sum(float(p["pending_amount"]) for p in periods), 2)
+
+    # Only a matured cycle can be owed — an in-progress month isn't late yet.
+    unpaid_matured = [p for p in periods if p["matured"] and p["pending_amount"] > 0]
+    matured_pending = round(sum(float(p["pending_amount"]) for p in unpaid_matured), 2)
+
+    last_payment = await db.salary_payments.find({"worker_id": doc["id"]}, {"_id": 0}) \
+        .sort("payment_date", -1).to_list(1)
+
+    return {
+        **{k: v for k, v in doc.items() if k != "_id"},
+        "period_count": len(periods),
+        "total_salary": total_salary,
+        "total_paid": total_paid,
+        "total_pending": total_pending,
+        "matured_pending": matured_pending,
+        "status": _salary_status(total_salary, total_paid) if periods else "pending",
+        "pending_months": [p["label"] for p in unpaid_matured],
+        "oldest_pending_month": unpaid_matured[0]["label"] if unpaid_matured else None,
+        "max_overdue_days": max([p["overdue_days"] for p in unpaid_matured], default=0),
+        "last_payment_date": last_payment[0]["payment_date"] if last_payment else None,
+    }
+
+
+@api.get("/workers")
+async def list_workers(
+    search: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    active: Optional[bool] = None,
+    admin=Depends(get_current_admin),
+):
+    query: Dict[str, Any] = {}
+    if active is not None:
+        query["active"] = active
+    if search:
+        query["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"mobile": {"$regex": search, "$options": "i"}},
+            {"designation": {"$regex": search, "$options": "i"}},
+        ]
+    docs = await db.workers.find(query, {"_id": 0}).to_list(2000)
+    out = [await worker_to_out(d) for d in docs]
+    if status_filter in ("pending", "partial", "completed"):
+        out = [w for w in out if w["status"] == status_filter]
+    out.sort(key=lambda w: (-w["matured_pending"], w["name"].lower()))
+    return out
+
+
+@api.post("/workers")
+async def create_worker(body: WorkerIn, admin=Depends(get_current_admin)):
+    if body.monthly_salary <= 0:
+        raise HTTPException(400, "Monthly salary must be greater than zero")
+    if await db.workers.find_one({"name": body.name.strip(), "mobile": body.mobile}):
+        raise HTTPException(400, "A worker with the same name and mobile already exists")
+    doc = {
+        **body.model_dump(),
+        "name": body.name.strip(),
+        "id": str(uuid.uuid4()),
+        "created_at": now_iso(),
+    }
+    await db.workers.insert_one(dict(doc))
+    actor = admin.get("full_name") or admin.get("email") or "Someone"
+    await send_push_to_all("New worker added", f"{actor} added {doc['name']} to work management.", "/work")
+    return await worker_to_out(doc)
+
+
+@api.get("/workers/{worker_id}")
+async def get_worker(worker_id: str, admin=Depends(get_current_admin)):
+    doc = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Worker not found")
+    return await worker_to_out(doc)
+
+
+@api.put("/workers/{worker_id}")
+async def update_worker(worker_id: str, body: WorkerIn, admin=Depends(get_current_admin)):
+    if body.monthly_salary <= 0:
+        raise HTTPException(400, "Monthly salary must be greater than zero")
+    res = await db.workers.update_one(
+        {"id": worker_id}, {"$set": {**body.model_dump(), "name": body.name.strip()}}
+    )
+    if res.matched_count == 0:
+        raise HTTPException(404, "Worker not found")
+    doc = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    return await worker_to_out(doc)
+
+
+@api.delete("/workers/{worker_id}")
+async def delete_worker(worker_id: str, _=Depends(require_cap("delete"))):
+    await db.salary_payments.delete_many({"worker_id": worker_id})
+    await db.salary_periods.delete_many({"worker_id": worker_id})
+    await db.workers.delete_one({"id": worker_id})
+    return {"ok": True}
+
+
+# ---------- Salary periods (months) ----------
+@api.get("/workers/{worker_id}/periods")
+async def list_salary_periods(worker_id: str, admin=Depends(get_current_admin)):
+    if not await db.workers.find_one({"id": worker_id}, {"_id": 0, "id": 1}):
+        raise HTTPException(404, "Worker not found")
+    periods = await _worker_periods(worker_id)
+    periods.reverse()  # newest month first for display
+    return periods
+
+
+@api.post("/workers/{worker_id}/periods")
+async def create_salary_period(worker_id: str, body: SalaryPeriodIn, admin=Depends(get_current_admin)):
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+    if body.total_salary <= 0:
+        raise HTTPException(400, "Total salary must be greater than zero")
+    start = _parse_dt(body.start_date)
+    end = _parse_dt(body.end_date)
+    if not start or not end:
+        raise HTTPException(400, "Start and end dates are required")
+    if end < start:
+        raise HTTPException(400, "End date must be on or after the start date")
+
+    # Overlapping cycles would let the same day's work be paid twice.
+    for existing in await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500):
+        es, ee = _parse_dt(existing.get("start_date")), _parse_dt(existing.get("end_date"))
+        if es and ee and start <= ee and es <= end:
+            clash = _period_label(existing.get("start_date"), existing.get("end_date"))
+            raise HTTPException(400, f"This overlaps the existing salary period {clash}")
+
+    doc = {
+        **body.model_dump(),
+        "id": str(uuid.uuid4()),
+        "worker_id": worker_id,
+        "created_at": now_iso(),
+    }
+    await db.salary_periods.insert_one(dict(doc))
+    return {
+        **{k: v for k, v in doc.items() if k != "_id"},
+        "label": _period_label(doc["start_date"], doc["end_date"]),
+        "paid_amount": 0.0,
+        "pending_amount": round(float(doc["total_salary"]), 2),
+        "status": "pending",
+    }
+
+
+@api.delete("/periods/{period_id}")
+async def delete_salary_period(period_id: str, _=Depends(require_cap("delete"))):
+    period = await db.salary_periods.find_one({"id": period_id}, {"_id": 0})
+    if not period:
+        raise HTTPException(404, "Salary period not found")
+    paid = 0.0
+    payments = await db.salary_payments.find({"worker_id": period["worker_id"]}, {"_id": 0}).to_list(2000)
+    for pay in payments:
+        for alloc in pay.get("allocations", []):
+            if alloc.get("period_id") == period_id:
+                paid += float(alloc.get("amount", 0))
+    if paid > 0:
+        raise HTTPException(
+            400,
+            f"Rs. {round(paid, 2)} is already recorded against this month — delete those payments first",
+        )
+    await db.salary_periods.delete_one({"id": period_id})
+    return {"ok": True}
+
+
+# ---------- Salary payments ----------
+@api.get("/workers/{worker_id}/salary-payments")
+async def list_salary_payments(worker_id: str, admin=Depends(get_current_admin)):
+    docs = await db.salary_payments.find({"worker_id": worker_id}, {"_id": 0}) \
+        .sort("payment_date", -1).to_list(2000)
+    labels = {p["id"]: p["label"] for p in await _worker_periods(worker_id)}
+    for d in docs:
+        d["allocation_labels"] = [
+            {"label": labels.get(a.get("period_id"), "Unknown month"),
+             "amount": round(float(a.get("amount", 0)), 2)}
+            for a in d.get("allocations", [])
+        ]
+    return docs
+
+
+@api.post("/workers/{worker_id}/salary-payments")
+async def add_salary_payment(worker_id: str, body: SalaryPaymentIn, admin=Depends(get_current_admin)):
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+    if body.amount <= 0:
+        raise HTTPException(400, "Amount must be greater than zero")
+
+    periods = await _worker_periods(worker_id)
+    if not periods:
+        raise HTTPException(400, "Add a salary month for this worker before recording a payment")
+
+    if body.period_id:
+        targets = [p for p in periods if p["id"] == body.period_id]
+        if not targets:
+            raise HTTPException(400, "That salary month does not belong to this worker")
+    else:
+        # Oldest unpaid month first: a lump sum handed over after a missed month
+        # settles the arrears before it touches the current one.
+        targets = [p for p in periods if p["pending_amount"] > 0]
+
+    capacity = round(sum(float(p["pending_amount"]) for p in targets), 2)
+    if capacity <= 0:
+        raise HTTPException(
+            400,
+            "This salary month is already fully paid" if body.period_id
+            else "Nothing is pending for this worker",
+        )
+    if body.amount > capacity + 0.0001:
+        raise HTTPException(400, f"Payment exceeds the pending salary of Rs. {capacity}")
+
+    remaining = float(body.amount)
+    allocations: List[Dict[str, Any]] = []
+    for p in targets:
+        if remaining <= 0.0001:
+            break
+        take = min(remaining, float(p["pending_amount"]))
+        if take <= 0:
+            continue
+        allocations.append({"period_id": p["id"], "amount": round(take, 2)})
+        remaining = round(remaining - take, 2)
+
+    doc = {
+        **{k: v for k, v in body.model_dump().items() if k != "period_id"},
+        "id": str(uuid.uuid4()),
+        "worker_id": worker_id,
+        "allocations": allocations,
+        "created_at": now_iso(),
+    }
+    await db.salary_payments.insert_one(dict(doc))
+
+    labels = {p["id"]: p["label"] for p in periods}
+    return {
+        **{k: v for k, v in doc.items() if k != "_id"},
+        "allocation_labels": [
+            {"label": labels.get(a["period_id"], "Unknown month"), "amount": a["amount"]}
+            for a in allocations
+        ],
+        "worker": await worker_to_out(worker),
+    }
+
+
+@api.delete("/salary-payments/{payment_id}")
+async def delete_salary_payment(payment_id: str, _=Depends(require_cap("delete"))):
+    res = await db.salary_payments.delete_one({"id": payment_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Salary payment not found")
+    return {"ok": True}
+
+
+# ---------- Work summary / pending ----------
+@api.get("/work/summary")
+async def work_summary(admin=Depends(get_current_admin)):
+    docs = await db.workers.find({}, {"_id": 0}).to_list(2000)
+    workers = [await worker_to_out(d) for d in docs]
+    return {
+        "total_workers": len(workers),
+        "active_workers": sum(1 for w in workers if w.get("active", True)),
+        "total_salary": round(sum(w["total_salary"] for w in workers), 2),
+        "total_paid": round(sum(w["total_paid"] for w in workers), 2),
+        "total_pending": round(sum(w["total_pending"] for w in workers), 2),
+        "matured_pending": round(sum(w["matured_pending"] for w in workers), 2),
+        "workers_with_pending": sum(1 for w in workers if w["matured_pending"] > 0),
+    }
+
+
+@api.get("/work/pending")
+async def work_pending(admin=Depends(get_current_admin)):
+    """Workers owed matured salary, most overdue first, with the months named."""
+    docs = await db.workers.find({}, {"_id": 0}).to_list(2000)
+    out = []
+    for d in docs:
+        w = await worker_to_out(d)
+        if w["matured_pending"] <= 0:
+            continue
+        w["pending_periods"] = [
+            p for p in await _worker_periods(d["id"]) if p["matured"] and p["pending_amount"] > 0
+        ]
+        out.append(w)
+    out.sort(key=lambda w: -w["max_overdue_days"])
+    return out
 
 
 # ---------- Pending Fees ----------

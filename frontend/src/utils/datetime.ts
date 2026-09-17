@@ -57,3 +57,15 @@ export function calendarDateToDisplay(value?: string | null): string {
   const [y, m, d] = cd.split('-');
   return `${d}/${m}/${y}`;
 }
+
+/**
+ * "YYYY-MM-DD" → an ISO instant at local midnight on that day, so the date
+ * picker opens on the day the user stored. Round-trips with isoToCalendarDate
+ * in any timezone.
+ */
+export function calendarDateToLocalIso(value?: string | null): string {
+  const cd = isoToCalendarDate(value);
+  if (!cd) return '';
+  const [y, m, d] = cd.split('-').map(Number);
+  return new Date(y, m - 1, d, 0, 0, 0, 0).toISOString();
+}

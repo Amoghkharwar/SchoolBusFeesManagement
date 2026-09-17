@@ -17,7 +17,7 @@ import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { AlertModal, Button, Card, ConfirmModal, EmptyState, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
-import { calendarDateToDisplay, isoToCalendarDate, isoToDisplay } from '@/src/utils/datetime';
+import { calendarDateToDisplay, calendarDateToLocalIso, isoToCalendarDate, isoToDisplay } from '@/src/utils/datetime';
 
 interface Period {
   id: string;
@@ -87,7 +87,8 @@ export default function WorkerDetail() {
   const [note, setNote] = useState('');
   const [targetPeriod, setTargetPeriod] = useState<string>(''); // '' = oldest-pending-first
 
-  // add-month form
+  // add/edit-month form — a non-null editingPeriod switches it to edit mode
+  const [editingPeriod, setEditingPeriod] = useState<Period | null>(null);
   const [mStart, setMStart] = useState('');
   const [mEnd, setMEnd] = useState('');
   const [mSalary, setMSalary] = useState('');
@@ -144,8 +145,23 @@ export default function WorkerDetail() {
     setShowPayModal(true);
   };
 
-  const openMonthModal = () => {
+  const closeMonthModal = () => {
+    setShowMonthModal(false);
+    setEditingPeriod(null);
+  };
+
+  const openMonthModal = (period?: Period) => {
     setModalErr('');
+    if (period) {
+      setEditingPeriod(period);
+      setMStart(calendarDateToLocalIso(period.start_date));
+      setMEnd(calendarDateToLocalIso(period.end_date));
+      setMSalary(String(period.total_salary));
+      setMNote(period.note || '');
+      setShowMonthModal(true);
+      return;
+    }
+    setEditingPeriod(null);
     // Default to the month after the latest recorded one, else the current month.
     const latest = periods[0];
     const base = latest ? new Date(new Date(latest.end_date).getTime() + 24 * 3600 * 1000) : new Date();
@@ -191,20 +207,25 @@ export default function WorkerDetail() {
     if (!total || total <= 0) { setModalErr('Enter a valid total salary for this month'); return; }
     setSubmitting(true);
     try {
-      const created = await apiFetch<Period>(`/workers/${id}/periods`, {
-        method: 'POST',
-        // Calendar dates, not instants — otherwise a month picked in IST is
-        // stored as the previous day in UTC and labelled with the wrong month.
-        body: JSON.stringify({
-          start_date: isoToCalendarDate(mStart),
-          end_date: isoToCalendarDate(mEnd),
-          total_salary: total,
-          note: mNote,
-        }),
+      // Calendar dates, not instants — otherwise a month picked in IST is
+      // stored as the previous day in UTC and labelled with the wrong month.
+      const body = JSON.stringify({
+        start_date: isoToCalendarDate(mStart),
+        end_date: isoToCalendarDate(mEnd),
+        total_salary: total,
+        note: mNote,
       });
+      const saved = editingPeriod
+        ? await apiFetch<Period>(`/periods/${editingPeriod.id}`, { method: 'PUT', body })
+        : await apiFetch<Period>(`/workers/${id}/periods`, { method: 'POST', body });
       setShowMonthModal(false);
+      setEditingPeriod(null);
       await load();
-      setSuccessMsg(`Salary month ${created.label} added for ${formatINR(total)}.`);
+      setSuccessMsg(
+        editingPeriod
+          ? `Salary month ${saved.label} updated to ${formatINR(total)}.`
+          : `Salary month ${saved.label} added for ${formatINR(total)}.`,
+      );
     } catch (e: any) {
       setModalErr(e.message);
     } finally {
@@ -354,7 +375,7 @@ export default function WorkerDetail() {
 
         <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: spacing.xl, marginBottom: spacing.md }}>
           <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>Salary Months</Text>
-          <Pressable onPress={openMonthModal} testID="add-salary-month" style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <Pressable onPress={() => openMonthModal()} testID="add-salary-month" style={{ flexDirection: 'row', alignItems: 'center' }}>
             <Ionicons name="add-circle" size={18} color={palette.brand} />
             <Text style={{ color: palette.brand, fontWeight: '700', marginLeft: 4 }}>Add Month</Text>
           </Pressable>
@@ -369,7 +390,14 @@ export default function WorkerDetail() {
             />
           </Card>
         ) : (
-          periods.map((p) => <PeriodCard key={p.id} period={p} onDelete={() => setConfirmDeletePeriod(p)} />)
+          periods.map((p) => (
+            <PeriodCard
+              key={p.id}
+              period={p}
+              onEdit={() => openMonthModal(p)}
+              onDelete={() => setConfirmDeletePeriod(p)}
+            />
+          ))
         )}
 
         <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginTop: spacing.xl, marginBottom: spacing.md }}>
@@ -510,15 +538,21 @@ export default function WorkerDetail() {
       </Modal>
 
       {/* ── Add salary month ──────────────────────────────── */}
-      <Modal visible={showMonthModal} transparent animationType="slide" onRequestClose={() => setShowMonthModal(false)}>
+      <Modal visible={showMonthModal} transparent animationType="slide" onRequestClose={closeMonthModal}>
         <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1, justifyContent: 'flex-end' }}>
-          <Pressable onPress={() => setShowMonthModal(false)} style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)' }} />
+          <Pressable onPress={closeMonthModal} style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)' }} />
           <View style={{ backgroundColor: palette.surfaceSecondary, borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '88%' }}>
             <ScrollView contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
               <View style={{ alignSelf: 'center', width: 40, height: 4, backgroundColor: palette.border, borderRadius: 2, marginBottom: spacing.md }} />
-              <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: 4 }}>Add Salary Month</Text>
+              <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: 4 }}>
+                {editingPeriod ? `Edit ${editingPeriod.label}` : 'Add Salary Month'}
+              </Text>
               <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: spacing.md }}>
-                The salary matures on the end date — only then does it show as pending.
+                {editingPeriod
+                  ? editingPeriod.paid_amount > 0
+                    ? `${formatINR(editingPeriod.paid_amount)} is already paid for this month, so the total cannot go below that.`
+                    : 'Nothing is paid against this month yet, so it can be changed freely.'
+                  : 'The salary matures on the end date — only then does it show as pending.'}
               </Text>
 
               <DateTimeField label="Month Start Date" value={mStart} onChange={setMStart} required testID="month-start" />
@@ -531,9 +565,14 @@ export default function WorkerDetail() {
                 testID="month-salary"
               />
               <TextField label="Note (optional)" value={mNote} onChangeText={setMNote} testID="month-note" />
-              <Button title="Add Month" onPress={submitMonth} loading={submitting} testID="month-save" />
+              <Button
+                title={editingPeriod ? 'Save Changes' : 'Add Month'}
+                onPress={submitMonth}
+                loading={submitting}
+                testID="month-save"
+              />
               <View style={{ height: spacing.sm }} />
-              <Button title="Cancel" variant="ghost" onPress={() => setShowMonthModal(false)} />
+              <Button title="Cancel" variant="ghost" onPress={closeMonthModal} />
             </ScrollView>
           </View>
         </KeyboardAvoidingView>
@@ -575,7 +614,7 @@ export default function WorkerDetail() {
   );
 }
 
-function PeriodCard({ period, onDelete }: { period: Period; onDelete: () => void }) {
+function PeriodCard({ period, onEdit, onDelete }: { period: Period; onEdit: () => void; onDelete: () => void }) {
   const { palette } = useTheme();
   const meta =
     period.status === 'completed'
@@ -600,7 +639,10 @@ function PeriodCard({ period, onDelete }: { period: Period; onDelete: () => void
         <View style={{ paddingHorizontal: 10, paddingVertical: 3, borderRadius: radii.pill, backgroundColor: meta.color + '22' }}>
           <Text style={{ color: meta.color, fontWeight: '700', fontSize: fontSize.sm }}>{meta.label}</Text>
         </View>
-        <Pressable onPress={onDelete} testID={`delete-period-${period.id}`} style={{ padding: 6, marginLeft: 4 }}>
+        <Pressable onPress={onEdit} testID={`edit-period-${period.id}`} style={{ padding: 6, marginLeft: 4 }}>
+          <Ionicons name="create-outline" size={16} color={palette.muted} />
+        </Pressable>
+        <Pressable onPress={onDelete} testID={`delete-period-${period.id}`} style={{ padding: 6 }}>
           <Ionicons name="trash-outline" size={16} color={palette.error} />
         </Pressable>
       </View>

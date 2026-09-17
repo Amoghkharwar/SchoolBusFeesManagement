@@ -1136,21 +1136,66 @@ async def create_salary_period(worker_id: str, body: SalaryPeriodIn, admin=Depen
     }
 
 
+async def _period_paid(worker_id: str, period_id: str) -> float:
+    """How much has already been handed over against one salary month."""
+    paid = 0.0
+    payments = await db.salary_payments.find({"worker_id": worker_id}, {"_id": 0}).to_list(2000)
+    for pay in payments:
+        for alloc in pay.get("allocations", []):
+            if alloc.get("period_id") == period_id:
+                paid += float(alloc.get("amount", 0))
+    return round(paid, 2)
+
+
+@api.put("/periods/{period_id}")
+async def update_salary_period(period_id: str, body: SalaryPeriodIn, admin=Depends(get_current_admin)):
+    period = await db.salary_periods.find_one({"id": period_id}, {"_id": 0})
+    if not period:
+        raise HTTPException(404, "Salary period not found")
+    if body.total_salary <= 0:
+        raise HTTPException(400, "Total salary must be greater than zero")
+    start = _period_day(body.start_date)
+    end = _period_day(body.end_date)
+    if not start or not end:
+        raise HTTPException(400, "Start and end dates are required")
+    if end < start:
+        raise HTTPException(400, "End date must be on or after the start date")
+
+    worker_id = period["worker_id"]
+
+    # Overlapping cycles would let the same day's work be paid twice.
+    for existing in await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500):
+        if existing["id"] == period_id:
+            continue
+        es, ee = _period_day(existing.get("start_date")), _period_day(existing.get("end_date"))
+        if es and ee and start <= ee and es <= end:
+            clash = _period_label(existing.get("start_date"), existing.get("end_date"))
+            raise HTTPException(400, f"This overlaps the existing salary period {clash}")
+
+    # Money already handed over can't exceed what the month is now worth, or the
+    # month would read as overpaid with no way to show it.
+    paid = await _period_paid(worker_id, period_id)
+    if body.total_salary + 0.0001 < paid:
+        raise HTTPException(
+            400,
+            f"Rs. {paid} is already paid for this month — the total cannot be set below that",
+        )
+
+    await db.salary_periods.update_one({"id": period_id}, {"$set": body.model_dump()})
+    updated = next((p for p in await _worker_periods(worker_id) if p["id"] == period_id), None)
+    if not updated:
+        raise HTTPException(404, "Salary period not found")
+    return updated
 @api.delete("/periods/{period_id}")
 async def delete_salary_period(period_id: str, _=Depends(require_cap("delete"))):
     period = await db.salary_periods.find_one({"id": period_id}, {"_id": 0})
     if not period:
         raise HTTPException(404, "Salary period not found")
-    paid = 0.0
-    payments = await db.salary_payments.find({"worker_id": period["worker_id"]}, {"_id": 0}).to_list(2000)
-    for pay in payments:
-        for alloc in pay.get("allocations", []):
-            if alloc.get("period_id") == period_id:
-                paid += float(alloc.get("amount", 0))
+    paid = await _period_paid(period["worker_id"], period_id)
     if paid > 0:
         raise HTTPException(
             400,
-            f"Rs. {round(paid, 2)} is already recorded against this month — delete those payments first",
+            f"Rs. {paid} is already recorded against this month — delete those payments first",
         )
     await db.salary_periods.delete_one({"id": period_id})
     return {"ok": True}

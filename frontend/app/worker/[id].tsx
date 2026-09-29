@@ -26,13 +26,40 @@ interface Period {
   label: string;
   start_date: string;
   end_date: string;
+  /** What the month is worth before absences are taken off. */
   total_salary: number;
+  /** Calendar days the month covers — the divisor behind per_day_wage. */
+  days_in_period: number;
+  per_day_wage: number;
+  absent_days: number;
+  /** Only the absences flagged to deduct — the rest are attendance history. */
+  deducted_days: number;
+  deduction: number;
+  /** total_salary − deduction. This, not total_salary, is what a payment settles. */
+  payable_salary: number;
+  absence_count: number;
   paid_amount: number;
   pending_amount: number;
   status: 'pending' | 'partial' | 'completed';
   matured: boolean;
   overdue_days: number;
   note?: string;
+}
+
+interface Absence {
+  id: string;
+  /** Calendar date ("YYYY-MM-DD") of the first day off. */
+  date: string;
+  /** Last day the absence covers — the server derives it from date + days. */
+  end_date?: string | null;
+  days: number;
+  reason?: string;
+  /** Off means the day is recorded but the salary is left alone (paid leave). */
+  deduct: boolean;
+  period_id?: string | null;
+  period_label?: string | null;
+  per_day_wage: number;
+  deduction_amount: number;
 }
 
 interface AllocationLabel {
@@ -81,10 +108,12 @@ export default function WorkerDetail() {
   const [worker, setWorker] = useState<any>(null);
   const [periods, setPeriods] = useState<Period[]>([]);
   const [payments, setPayments] = useState<SalaryPayment[]>([]);
+  const [absences, setAbsences] = useState<Absence[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [showPayModal, setShowPayModal] = useState(false);
   const [showMonthModal, setShowMonthModal] = useState(false);
+  const [showAbsenceModal, setShowAbsenceModal] = useState(false);
 
   // pay-salary form
   const [amount, setAmount] = useState('');
@@ -100,12 +129,20 @@ export default function WorkerDetail() {
   const [mSalary, setMSalary] = useState('');
   const [mNote, setMNote] = useState('');
 
+  // add/edit-absence form — a non-null editingAbsence switches it to edit mode
+  const [editingAbsence, setEditingAbsence] = useState<Absence | null>(null);
+  const [aDate, setADate] = useState('');
+  const [aDays, setADays] = useState('1');
+  const [aReason, setAReason] = useState('');
+  const [aDeduct, setADeduct] = useState(true);
+
   const [submitting, setSubmitting] = useState(false);
   const [modalErr, setModalErr] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [confirmDeleteWorker, setConfirmDeleteWorker] = useState(false);
   const [confirmDeletePeriod, setConfirmDeletePeriod] = useState<Period | null>(null);
   const [confirmDeletePayment, setConfirmDeletePayment] = useState<SalaryPayment | null>(null);
+  const [confirmDeleteAbsence, setConfirmDeleteAbsence] = useState<Absence | null>(null);
   // 'payments' keeps the salary months; 'records' clears those too.
   const [purgeScope, setPurgeScope] = useState<'payments' | 'records' | null>(null);
   const [purging, setPurging] = useState(false);
@@ -125,14 +162,16 @@ export default function WorkerDetail() {
     if (!id) return null;
     try {
       setLoadError('');
-      const [w, p, pay] = await Promise.all([
+      const [w, p, pay, abs] = await Promise.all([
         apiFetch<any>(`/workers/${id}`),
         apiFetch<Period[]>(`/workers/${id}/periods`),
         apiFetch<SalaryPayment[]>(`/workers/${id}/salary-payments`),
+        apiFetch<Absence[]>(`/workers/${id}/absences`),
       ]);
       setWorker(w);
       setPeriods(p);
       setPayments(pay);
+      setAbsences(abs);
       return w;
     } catch (e: any) {
       setLoadError(
@@ -248,6 +287,116 @@ export default function WorkerDetail() {
       setModalErr(e.message);
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const closeAbsenceModal = () => {
+    setShowAbsenceModal(false);
+    setEditingAbsence(null);
+  };
+
+  const openAbsenceModal = (absence?: Absence) => {
+    setModalErr('');
+    if (absence) {
+      setEditingAbsence(absence);
+      setADate(calendarDateToLocalIso(absence.date));
+      setADays(String(absence.days));
+      setAReason(absence.reason || '');
+      setADeduct(!!absence.deduct);
+      setShowAbsenceModal(true);
+      return;
+    }
+    setEditingAbsence(null);
+    setADate(new Date().toISOString());
+    setADays('1');
+    setAReason('');
+    setADeduct(true);
+    setShowAbsenceModal(true);
+  };
+
+  /** The month the absence being edited falls in — the source of the rate the
+   *  form quotes, so the user sees the cost before committing to the deduction. */
+  const absenceHostPeriod = useMemo(() => {
+    const day = isoToCalendarDate(aDate);
+    if (!day) return null;
+    return periods.find((p) => {
+      const start = isoToCalendarDate(p.start_date);
+      const end = isoToCalendarDate(p.end_date);
+      return !!start && !!end && start <= day && day <= end;
+    }) || null;
+  }, [aDate, periods]);
+
+  const absenceCost = useMemo(() => {
+    const d = parseFloat(aDays);
+    if (!absenceHostPeriod || !d || d <= 0) return 0;
+    return Math.round(absenceHostPeriod.per_day_wage * d * 100) / 100;
+  }, [absenceHostPeriod, aDays]);
+
+  const submitAbsence = async () => {
+    setModalErr('');
+    const days = parseFloat(aDays);
+    if (!aDate) { setModalErr('Select the date the worker was absent'); return; }
+    if (!days || days <= 0) { setModalErr('Enter how many days were missed'); return; }
+    if (!aReason.trim()) { setModalErr('Enter why the worker was absent'); return; }
+    if (Math.round(days * 2) !== days * 2) {
+      setModalErr('Days must be a whole number or a half — for example 1 or 1.5');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      // A calendar date, not an instant, for the same reason salary months are:
+      // an instant picked in IST is stored as the previous day in UTC.
+      const body = JSON.stringify({
+        date: isoToCalendarDate(aDate),
+        days,
+        reason: aReason,
+        deduct: aDeduct,
+      });
+      const saved = editingAbsence
+        ? await apiFetch<Absence>(`/absences/${editingAbsence.id}`, { method: 'PUT', body })
+        : await apiFetch<Absence>(`/workers/${id}/absences`, { method: 'POST', body });
+      setShowAbsenceModal(false);
+      setEditingAbsence(null);
+      await load();
+      const dayWord = `${days} day${days === 1 ? '' : 's'}`;
+      setSuccessMsg(
+        saved.deduct
+          ? saved.period_label
+            ? `${dayWord} absent from ${calendarDateToDisplay(saved.date)} — ${formatINR(saved.deduction_amount)} deducted from ${saved.period_label}.`
+            : `${dayWord} absent from ${calendarDateToDisplay(saved.date)} recorded. No salary month covers that date yet, so nothing is deducted until you add one.`
+          : `${dayWord} absent from ${calendarDateToDisplay(saved.date)} recorded as paid leave — the salary is unchanged.`,
+      );
+    } catch (e: any) {
+      setModalErr(e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  /** Flip one absence between "deduct" and "paid leave" straight from the list. */
+  const toggleDeduct = async (a: Absence) => {
+    try {
+      await apiFetch<Absence>(`/absences/${a.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          date: a.date,
+          days: a.days,
+          reason: a.reason || '',
+          deduct: !a.deduct,
+        }),
+      });
+      await load();
+    } catch (e: any) {
+      setModalErr(e.message);
+    }
+  };
+
+  const removeAbsence = async (a: Absence) => {
+    try {
+      await apiFetch(`/absences/${a.id}`, { method: 'DELETE' });
+      await load();
+    } catch (e: any) {
+      setModalErr(e.message);
     }
   };
 
@@ -388,11 +537,28 @@ export default function WorkerDetail() {
             <InfoRow icon="calendar" label="Joined" value={isoToDisplay(worker.join_date) || '—'} />
             <InfoRow icon="time" label="Last Paid" value={isoToDisplay(worker.last_payment_date) || 'Never'} />
             <InfoRow icon="layers" label="Months" value={`${worker.period_count} salary month${worker.period_count === 1 ? '' : 's'} recorded`} />
+            <InfoRow
+              icon="cash"
+              label="Per day"
+              value={`${formatINR(worker.per_day_wage)} a day${periods.length ? ` (${periods[0].label}: ${formatINR(periods[0].total_salary)} ÷ ${periods[0].days_in_period} days)` : ' — from the monthly salary over 30 days'}`}
+            />
+            <InfoRow
+              icon="calendar-clear"
+              label="Absent"
+              value={
+                worker.total_absent_days > 0
+                  ? `${worker.total_absent_days} day${worker.total_absent_days === 1 ? '' : 's'}` +
+                    (worker.total_deduction > 0
+                      ? ` · ${formatINR(worker.total_deduction)} deducted`
+                      : ' · nothing deducted')
+                  : 'No absences recorded'
+              }
+            />
           </View>
 
           <View style={{ flexDirection: 'row', marginTop: spacing.lg, gap: spacing.md }}>
             <View style={{ flex: 1 }}>
-              <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>Total Salary</Text>
+              <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>Gross Salary</Text>
               <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>{formatINR(worker.total_salary)}</Text>
             </View>
             <View style={{ flex: 1 }}>
@@ -404,6 +570,13 @@ export default function WorkerDetail() {
               <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.warning }}>{formatINR(worker.total_pending)}</Text>
             </View>
           </View>
+
+          {worker.total_deduction > 0 ? (
+            <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: spacing.sm }}>
+              Less {formatINR(worker.total_deduction)} for {worker.deducted_days} unpaid day
+              {worker.deducted_days === 1 ? '' : 's'} — {formatINR(worker.total_payable)} payable in all.
+            </Text>
+          ) : null}
         </Card>
 
         {worker.pending_months?.length > 0 ? (
@@ -463,6 +636,42 @@ export default function WorkerDetail() {
           ))
         )}
 
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: spacing.xl, marginBottom: spacing.md }}>
+          <View style={{ flex: 1 }}>
+            <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>Absences</Text>
+            <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>
+              {worker.total_absent_days > 0
+                ? `${worker.total_absent_days} day${worker.total_absent_days === 1 ? '' : 's'} missed · ${formatINR(worker.total_deduction)} deducted`
+                : 'Days the worker did not come to work'}
+            </Text>
+          </View>
+          <Pressable onPress={() => openAbsenceModal()} testID="add-absence" style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <Ionicons name="add-circle" size={18} color={palette.brand} />
+            <Text style={{ color: palette.brand, fontWeight: '700', marginLeft: 4 }}>Add Absence</Text>
+          </Pressable>
+        </View>
+
+        {absences.length === 0 ? (
+          <Card>
+            <EmptyState
+              icon="calendar-clear-outline"
+              title="No absences recorded"
+              subtitle="Add the date, how many days were missed and the reason. Each one only cuts the salary if you switch the deduction on."
+            />
+          </Card>
+        ) : (
+          absences.map((a) => (
+            <AbsenceCard
+              key={a.id}
+              absence={a}
+              canDelete={isAdmin}
+              onEdit={() => openAbsenceModal(a)}
+              onToggle={() => toggleDeduct(a)}
+              onDelete={() => setConfirmDeleteAbsence(a)}
+            />
+          ))
+        )}
+
         <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginTop: spacing.xl, marginBottom: spacing.md }}>
           Payment History
         </Text>
@@ -507,7 +716,7 @@ export default function WorkerDetail() {
           ))
         )}
 
-        {isAdmin && (periods.length > 0 || payments.length > 0) ? (
+        {isAdmin && (periods.length > 0 || payments.length > 0 || absences.length > 0) ? (
           <View style={{ marginTop: spacing.xl, borderWidth: 1, borderColor: palette.error + '40', borderRadius: radii.md, padding: spacing.md }}>
             <Text style={{ color: palette.error, fontWeight: '700', fontSize: fontSize.base }}>Danger zone</Text>
             <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4, marginBottom: spacing.md }}>
@@ -695,6 +904,98 @@ export default function WorkerDetail() {
         </KeyboardAvoidingView>
       </Modal>
 
+      {/* ── Add / edit absence ──────────────────── */}
+      <Modal visible={showAbsenceModal} transparent animationType="slide" onRequestClose={closeAbsenceModal}>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1, justifyContent: 'flex-end' }}>
+          <Pressable onPress={closeAbsenceModal} style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)' }} />
+          <View style={{ backgroundColor: palette.surfaceSecondary, borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '88%' }}>
+            <ScrollView contentContainerStyle={{ padding: spacing.lg }} keyboardShouldPersistTaps="handled">
+              <View style={{ alignSelf: 'center', width: 40, height: 4, backgroundColor: palette.border, borderRadius: 2, marginBottom: spacing.md }} />
+              <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface, marginBottom: 4 }}>
+                {editingAbsence ? 'Edit Absence' : 'Add Absence'}
+              </Text>
+              <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: spacing.md }}>
+                Record the days {worker.name} did not come to work. The salary only changes if you switch the deduction on below.
+              </Text>
+
+              <DateTimeField label="First day absent" value={aDate} onChange={setADate} required testID="absence-date" />
+
+              <TextField
+                label="How many days? *"
+                value={aDays}
+                onChangeText={(t) => setADays(t.replace(/[^0-9.]/g, ''))}
+                keyboardType="numeric"
+                testID="absence-days"
+              />
+              <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -8, marginBottom: spacing.md }}>
+                Use 0.5 for a half day. Consecutive days go in as one entry.
+              </Text>
+
+              <TextField label="Reason *" value={aReason} onChangeText={setAReason} testID="absence-reason" />
+
+              <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>Deduct from salary?</Text>
+              <View style={{ flexDirection: 'row', gap: 8, marginBottom: spacing.md }}>
+                {[
+                  { on: true, title: 'Deduct', sub: 'Unpaid leave' },
+                  { on: false, title: "Don't deduct", sub: 'Paid / approved leave' },
+                ].map((opt) => {
+                  const active = aDeduct === opt.on;
+                  return (
+                    <Pressable
+                      key={String(opt.on)}
+                      testID={`absence-deduct-${opt.on ? 'yes' : 'no'}`}
+                      onPress={() => setADeduct(opt.on)}
+                      style={{
+                        flex: 1,
+                        paddingVertical: 12,
+                        paddingHorizontal: 10,
+                        borderRadius: radii.md,
+                        backgroundColor: active ? palette.brand : palette.surfaceTertiary,
+                        borderWidth: 1,
+                        borderColor: active ? palette.brand : palette.border,
+                      }}
+                    >
+                      <Text style={{ color: active ? '#fff' : palette.onSurface, fontWeight: '700' }}>{opt.title}</Text>
+                      <Text style={{ color: active ? '#ffffffcc' : palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>{opt.sub}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
+              {/* What this actually costs, quoted before it is saved. */}
+              <View style={{ backgroundColor: palette.surfaceTertiary, borderRadius: radii.md, padding: spacing.md, marginBottom: spacing.md }}>
+                {absenceHostPeriod ? (
+                  <>
+                    <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm }}>
+                      {absenceHostPeriod.label} · {formatINR(absenceHostPeriod.total_salary)} over {absenceHostPeriod.days_in_period} days
+                      {' = '}{formatINR(absenceHostPeriod.per_day_wage)} a day
+                    </Text>
+                    <Text style={{ color: aDeduct ? palette.error : palette.success, fontWeight: '700', marginTop: 4 }}>
+                      {aDeduct
+                        ? `${formatINR(absenceCost)} will come off ${absenceHostPeriod.label}`
+                        : `Nothing comes off — ${absenceHostPeriod.label} stays at ${formatINR(absenceHostPeriod.payable_salary)}`}
+                    </Text>
+                  </>
+                ) : (
+                  <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm }}>
+                    No salary month covers this date yet. The absence is still recorded — it starts deducting on its own once you add that month.
+                  </Text>
+                )}
+              </View>
+
+              <Button
+                title={editingAbsence ? 'Save Changes' : 'Add Absence'}
+                onPress={submitAbsence}
+                loading={submitting}
+                testID="absence-save"
+              />
+              <View style={{ height: spacing.sm }} />
+              <Button title="Cancel" variant="ghost" onPress={closeAbsenceModal} />
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
       <AlertModal visible={!!modalErr} title="Cannot Save" message={modalErr} onClose={() => setModalErr('')} testID="worker-detail-error" />
       <AlertModal visible={!!successMsg} variant="success" title="Success" message={successMsg} onClose={() => setSuccessMsg('')} testID="worker-detail-success" />
 
@@ -724,7 +1025,7 @@ export default function WorkerDetail() {
         message={
           purgeScope === 'payments'
             ? `Every salary payment recorded for ${worker.name} will be removed. The salary months stay, and each one goes back to fully pending.`
-            : `Every salary month and every payment for ${worker.name} will be removed. The worker stays, with a clean slate.`
+            : `Every salary month, absence and payment for ${worker.name} will be removed. The worker stays, with a clean slate.`
         }
         bullets={
           purgeScope === 'payments'
@@ -735,6 +1036,7 @@ export default function WorkerDetail() {
             : [
                 `${periods.length} salary month${periods.length === 1 ? '' : 's'} worth ${formatINR(worker.total_salary)}`,
                 `${payments.length} payment${payments.length === 1 ? '' : 's'} totalling ${formatINR(worker.total_paid)}`,
+                `${absences.length} absence${absences.length === 1 ? '' : 's'} covering ${worker.total_absent_days} day${worker.total_absent_days === 1 ? '' : 's'}`,
               ]
         }
         busy={purging}
@@ -744,6 +1046,23 @@ export default function WorkerDetail() {
         onCancel={() => setPurgeScope(null)}
         onConfirm={runPurge}
         testID="worker-purge-confirm"
+      />
+
+      <ConfirmModal
+        visible={!!confirmDeleteAbsence}
+        title="Delete this absence?"
+        message={
+          confirmDeleteAbsence
+            ? `${confirmDeleteAbsence.days} day${confirmDeleteAbsence.days === 1 ? '' : 's'} from ${calendarDateToDisplay(confirmDeleteAbsence.date)} will be removed` +
+              (confirmDeleteAbsence.deduct && confirmDeleteAbsence.period_label
+                ? `, and ${formatINR(confirmDeleteAbsence.deduction_amount)} goes back onto ${confirmDeleteAbsence.period_label}.`
+                : '.')
+            : ''
+        }
+        confirmLabel="Delete"
+        onCancel={() => setConfirmDeleteAbsence(null)}
+        onConfirm={() => { const a = confirmDeleteAbsence; setConfirmDeleteAbsence(null); if (a) removeAbsence(a); }}
+        testID="absence-delete-confirm"
       />
 
       <ConfirmModal
@@ -770,7 +1089,9 @@ function PeriodCard({ period, canDelete, onEdit, onDelete }: { period: Period; c
       ? { color: palette.warning, label: 'Partial' }
       : { color: palette.error, label: 'Pending' };
 
-  const pct = period.total_salary > 0 ? Math.min(period.paid_amount / period.total_salary, 1) : 0;
+  // Progress is against what is actually owed — a deducted month is cleared by
+  // a smaller payment, and the bar has to say so.
+  const pct = period.payable_salary > 0 ? Math.min(period.paid_amount / period.payable_salary, 1) : 1;
 
   return (
     <Card style={{ marginBottom: spacing.md }}>
@@ -800,7 +1121,7 @@ function PeriodCard({ period, canDelete, onEdit, onDelete }: { period: Period; c
 
       <View style={{ flexDirection: 'row', marginTop: spacing.sm }}>
         <Text style={{ flex: 1, color: palette.muted, fontSize: fontSize.sm }}>
-          Total {formatINR(period.total_salary)}
+          Payable {formatINR(period.payable_salary)}
         </Text>
         <Text style={{ color: palette.success, fontSize: fontSize.sm, marginRight: spacing.md }}>
           Paid {formatINR(period.paid_amount)}
@@ -810,6 +1131,19 @@ function PeriodCard({ period, canDelete, onEdit, onDelete }: { period: Period; c
         </Text>
       </View>
 
+      <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 6 }}>
+        {formatINR(period.total_salary)} over {period.days_in_period} days = {formatINR(period.per_day_wage)} a day
+      </Text>
+
+      {period.absent_days > 0 ? (
+        <Text style={{ color: period.deduction > 0 ? palette.error : palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: 4 }}>
+          {period.absent_days} day{period.absent_days === 1 ? '' : 's'} absent
+          {period.deduction > 0
+            ? ` · ${formatINR(period.deduction)} deducted for ${period.deducted_days} unpaid day${period.deducted_days === 1 ? '' : 's'}`
+            : ' · not deducted'}
+        </Text>
+      ) : null}
+
       {period.overdue_days > 0 ? (
         <Text style={{ color: palette.error, fontSize: fontSize.sm, marginTop: 6 }}>
           Overdue by {period.overdue_days} day{period.overdue_days === 1 ? '' : 's'}
@@ -818,6 +1152,80 @@ function PeriodCard({ period, canDelete, onEdit, onDelete }: { period: Period; c
       {period.note ? (
         <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: 6 }}>{period.note}</Text>
       ) : null}
+    </Card>
+  );
+}
+
+function AbsenceCard({
+  absence, canDelete, onEdit, onToggle, onDelete,
+}: {
+  absence: Absence;
+  canDelete: boolean;
+  onEdit: () => void;
+  onToggle: () => void;
+  onDelete: () => void;
+}) {
+  const { palette } = useTheme();
+  const multiDay = absence.end_date && absence.end_date !== absence.date;
+  const when = multiDay
+    ? `${calendarDateToDisplay(absence.date)} → ${calendarDateToDisplay(absence.end_date)}`
+    : calendarDateToDisplay(absence.date);
+  // Three states, not two: deducting, deliberately not deducting, and waiting
+  // for a salary month to exist before it can deduct anything.
+  const meta = !absence.deduct
+    ? { color: palette.success, label: 'Paid leave' }
+    : absence.period_id
+    ? { color: palette.error, label: `−${formatINR(absence.deduction_amount)}` }
+    : { color: palette.warning, label: 'No month yet' };
+
+  return (
+    <Card style={{ marginBottom: spacing.md }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: fontSize.base, fontWeight: '700', color: palette.onSurface }}>
+            {absence.days} day{absence.days === 1 ? '' : 's'} · {when}
+          </Text>
+          <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>
+            {absence.reason || 'No reason given'}
+          </Text>
+        </View>
+        <View style={{ paddingHorizontal: 10, paddingVertical: 3, borderRadius: radii.pill, backgroundColor: meta.color + '22' }}>
+          <Text style={{ color: meta.color, fontWeight: '700', fontSize: fontSize.sm }}>{meta.label}</Text>
+        </View>
+        <Pressable onPress={onEdit} testID={`edit-absence-${absence.id}`} style={{ padding: 6, marginLeft: 4 }}>
+          <Ionicons name="create-outline" size={16} color={palette.muted} />
+        </Pressable>
+        {canDelete ? (
+          <Pressable onPress={onDelete} testID={`delete-absence-${absence.id}`} style={{ padding: 6 }}>
+            <Ionicons name="trash-outline" size={16} color={palette.error} />
+          </Pressable>
+        ) : null}
+      </View>
+
+      <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: spacing.sm }}>
+        {absence.period_label
+          ? absence.deduct
+            ? `${formatINR(absence.per_day_wage)} a day × ${absence.days} off ${absence.period_label}`
+            : `Falls in ${absence.period_label} — salary left untouched`
+          : 'No salary month covers this date yet, so nothing is deducted.'}
+      </Text>
+
+      <Pressable
+        onPress={onToggle}
+        testID={`toggle-absence-${absence.id}`}
+        style={{
+          marginTop: spacing.sm,
+          paddingVertical: 8,
+          borderRadius: radii.md,
+          alignItems: 'center',
+          borderWidth: 1,
+          borderColor: absence.deduct ? palette.border : palette.error + '66',
+        }}
+      >
+        <Text style={{ color: absence.deduct ? palette.onSurfaceSecondary : palette.error, fontWeight: '600', fontSize: fontSize.sm }}>
+          {absence.deduct ? 'Stop deducting this' : 'Deduct this from the salary'}
+        </Text>
+      </Pressable>
     </Card>
   );
 }

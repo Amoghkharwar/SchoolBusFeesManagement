@@ -27,7 +27,16 @@ export interface WorkerRow {
   monthly_salary: number;
   active?: boolean;
   period_count: number;
+  /** Gross, before absences are taken off. */
   total_salary: number;
+  /** Taken off for absences flagged to deduct. */
+  total_deduction: number;
+  /** total_salary − total_deduction: what is actually owed across all months. */
+  total_payable: number;
+  absence_count: number;
+  total_absent_days: number;
+  deducted_days: number;
+  per_day_wage: number;
   total_paid: number;
   total_pending: number;
   /** Pending only on months that have already ended — an in-progress month isn't late. */
@@ -43,12 +52,16 @@ interface WorkSummary {
   total_workers: number;
   active_workers: number;
   total_salary: number;
+  total_deduction: number;
+  total_payable: number;
+  total_absent_days: number;
   total_paid: number;
   total_pending: number;
   matured_pending: number;
   workers_with_pending: number;
   total_periods: number;
   total_payments: number;
+  total_absences: number;
 }
 
 const FILTERS = [
@@ -254,13 +267,14 @@ export default function Work() {
       <DangerConfirmModal
         visible={showPurge}
         title="Delete all work data?"
-        message="Every worker, salary month and payment in Work Management will be removed. Students, schools, fees and financial years are stored separately and are not affected."
+        message="Every worker, salary month, absence and payment in Work Management will be removed. Students, schools, fees and financial years are stored separately and are not affected."
         bullets={
           summary
             ? [
                 `${summary.total_workers} worker${summary.total_workers === 1 ? '' : 's'}`,
                 `${summary.total_periods} salary month${summary.total_periods === 1 ? '' : 's'} worth ${formatINR(summary.total_salary)}`,
                 `${summary.total_payments} payment${summary.total_payments === 1 ? '' : 's'} totalling ${formatINR(summary.total_paid)}`,
+                `${summary.total_absences} absence${summary.total_absences === 1 ? '' : 's'} covering ${summary.total_absent_days} day${summary.total_absent_days === 1 ? '' : 's'}`,
               ]
             : []
         }
@@ -316,6 +330,13 @@ function WorkerItem({ item }: { item: WorkerRow }) {
       ? `Pending: ${item.pending_months[0]}`
       : `Pending: ${item.pending_months[0]} +${item.pending_months.length - 1} more`;
 
+  // Absences only earn a line once they have actually cost the worker money —
+  // paid leave is detail for the worker screen, not the list.
+  const absenceLine =
+    item.total_deduction > 0
+      ? `${item.total_absent_days} day${item.total_absent_days === 1 ? '' : 's'} absent · ${formatINR(item.total_deduction)} deducted`
+      : null;
+
   return (
     <Pressable
       testID={`worker-row-${item.id}`}
@@ -359,6 +380,20 @@ function WorkerItem({ item }: { item: WorkerRow }) {
                 {item.max_overdue_days}d late
               </Text>
             ) : null}
+          </View>
+        ) : null}
+
+        {absenceLine ? (
+          <View style={{
+            flexDirection: 'row', alignItems: 'center',
+            marginTop: monthsLine ? spacing.sm : spacing.md,
+            paddingTop: monthsLine ? 0 : spacing.sm,
+            borderTopWidth: monthsLine ? 0 : 1, borderTopColor: palette.border,
+          }}>
+            <Ionicons name="calendar-clear-outline" size={14} color={palette.muted} />
+            <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginLeft: 6, flex: 1 }} numberOfLines={1}>
+              {absenceLine}
+            </Text>
           </View>
         ) : null}
       </Card>

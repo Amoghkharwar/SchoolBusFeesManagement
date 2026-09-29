@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import os
 import random
 import re
@@ -488,6 +489,29 @@ class SalaryPaymentIn(BaseModel):
     period_id: Optional[str] = None
 
 
+class WorkerAbsenceIn(BaseModel):
+    """A stretch of days the worker did not turn up. `deduct` is the whole point
+    of recording it separately from a note: an absence only takes money off the
+    month when that switch is on, so approved or paid leave can be kept on the
+    record without touching the salary."""
+    date: str                      # calendar date — the first day off
+    days: float = 1.0              # 0.5 for a half day
+    reason: Optional[str] = ""
+    deduct: Optional[bool] = True
+
+    @field_validator("days")
+    @classmethod
+    def validate_days(cls, v: float) -> float:
+        if v is None or v <= 0:
+            raise ValueError("Days must be greater than zero")
+        if v > 31:
+            raise ValueError("A single absence cannot be longer than 31 days")
+        # Half days are the only fraction payroll here deals in.
+        if round(v * 2) != v * 2:
+            raise ValueError("Days must be a whole number or a half (e.g. 1 or 1.5)")
+        return float(v)
+
+
 # ---------- Helpers ----------
 def compute_status(yearly: float, paid: float) -> str:
     if paid <= 0:
@@ -549,6 +573,8 @@ async def startup() -> None:
     await db.salary_periods.create_index("worker_id")
     await db.salary_payments.create_index("id", unique=True)
     await db.salary_payments.create_index("worker_id")
+    await db.worker_absences.create_index("id", unique=True)
+    await db.worker_absences.create_index("worker_id")
 
     # Migrate old admins → users
     async for old in db.admins.find({}):
@@ -1001,11 +1027,90 @@ def _salary_status(total: float, paid: float) -> str:
     return "partial"
 
 
-async def _worker_periods(worker_id: str) -> List[Dict[str, Any]]:
+def _period_span_days(start: Optional[date], end: Optional[date]) -> int:
+    """Calendar days a salary cycle covers, both ends included — the divisor the
+    per-day wage is built from, so a 28-day February is worth more per day than
+    a 31-day March at the same monthly salary."""
+    if not start or not end or end < start:
+        return 0
+    return (end - start).days + 1
+
+
+def _per_day_wage(total_salary: float, start: Optional[date], end: Optional[date]) -> float:
+    span = _period_span_days(start, end)
+    if span <= 0:
+        return 0.0
+    return round(float(total_salary) / span, 2)
+
+
+def _absence_span(a: Dict[str, Any]) -> Tuple[Optional[date], Optional[date]]:
+    """First and last calendar day an absence covers. A half day still occupies
+    one day on the calendar, so the span rounds up while the pay maths does not."""
+    start = _period_day(a.get("date"))
+    if not start:
+        return None, None
+    span = max(int(math.ceil(float(a.get("days", 1) or 0))), 1)
+    return start, start + timedelta(days=span - 1)
+
+
+async def _worker_absence_docs(worker_id: str) -> List[Dict[str, Any]]:
+    """Raw absence rows, oldest first."""
+    docs = await db.worker_absences.find({"worker_id": worker_id}, {"_id": 0}).to_list(2000)
+    docs.sort(key=lambda a: _sort_key(a.get("date")))
+    return docs
+
+
+def _period_absences(period: Dict[str, Any], absences: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The absences that belong to one salary month. An absence is attributed by
+    the day it starts, so one that runs past the end of the month still settles
+    against the month it began in rather than being split across two payslips."""
+    start = _period_day(period.get("start_date"))
+    end = _period_day(period.get("end_date"))
+    if not start or not end:
+        return []
+    out = []
+    for a in absences:
+        day = _period_day(a.get("date"))
+        if day and start <= day <= end:
+            out.append(a)
+    return out
+
+
+def _period_deduction(period: Dict[str, Any], absences: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """What a month's absences cost. Only the rows flagged `deduct` take money
+    off — the rest are attendance history and nothing more. The deduction is
+    capped at the month's total so the payable figure can never go negative."""
+    total = float(period.get("total_salary", 0))
+    start = _period_day(period.get("start_date"))
+    end = _period_day(period.get("end_date"))
+    mine = _period_absences(period, absences)
+
+    absent_days = round(sum(float(a.get("days", 0) or 0) for a in mine), 2)
+    deduct_days = round(sum(float(a.get("days", 0) or 0) for a in mine if a.get("deduct")), 2)
+    per_day = _per_day_wage(total, start, end)
+    deduction = round(min(per_day * deduct_days, total), 2)
+    return {
+        "days_in_period": _period_span_days(start, end),
+        "per_day_wage": per_day,
+        "absent_days": absent_days,
+        "deducted_days": deduct_days,
+        "deduction": deduction,
+        "payable_salary": round(total - deduction, 2),
+        "absence_count": len(mine),
+    }
+
+
+async def _worker_periods(
+    worker_id: str, absences: Optional[List[Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
     """Every salary cycle for a worker, oldest first, with what has been paid
-    against it resolved from the payment allocations."""
+    against it resolved from the payment allocations and what its absences take
+    off it already applied. `payable_salary` — not `total_salary` — is the figure
+    a payment settles against."""
     periods = await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500)
     payments = await db.salary_payments.find({"worker_id": worker_id}, {"_id": 0}).to_list(2000)
+    if absences is None:
+        absences = await _worker_absence_docs(worker_id)
 
     paid_by_period: Dict[str, float] = {}
     for pay in payments:
@@ -1019,18 +1124,21 @@ async def _worker_periods(worker_id: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for p in periods:
         total = float(p.get("total_salary", 0))
+        calc = _period_deduction(p, absences)
+        payable = calc["payable_salary"]
         paid = round(paid_by_period.get(p["id"], 0.0), 2)
-        pending = round(max(total - paid, 0), 2)
+        pending = round(max(payable - paid, 0), 2)
         end = _period_day(p.get("end_date"))
         # Salary matures on the end date itself, so that day already counts as owed.
         matured = bool(end and end <= today)
         overdue_days = max((today - end).days, 0) if (end and matured and pending > 0) else 0
         out.append({
             **p,
+            **calc,
             "label": _period_label(p.get("start_date"), p.get("end_date")),
             "paid_amount": paid,
             "pending_amount": pending,
-            "status": _salary_status(total, paid),
+            "status": "completed" if payable <= 0.0001 else _salary_status(payable, paid),
             "matured": matured,
             "overdue_days": overdue_days,
         })
@@ -1039,10 +1147,25 @@ async def _worker_periods(worker_id: str) -> List[Dict[str, Any]]:
 
 async def worker_to_out(doc: Dict[str, Any]) -> Dict[str, Any]:
     """A worker plus the roll-up the list and pending screens both read from."""
-    periods = await _worker_periods(doc["id"])
+    absences = await _worker_absence_docs(doc["id"])
+    periods = await _worker_periods(doc["id"], absences)
     total_salary = round(sum(float(p["total_salary"]) for p in periods), 2)
+    total_deduction = round(sum(float(p["deduction"]) for p in periods), 2)
+    total_payable = round(total_salary - total_deduction, 2)
     total_paid = round(sum(float(p["paid_amount"]) for p in periods), 2)
     total_pending = round(sum(float(p["pending_amount"]) for p in periods), 2)
+
+    # Counted over every absence, not only the ones inside a salary month — an
+    # absence recorded before the month exists still belongs on the attendance
+    # record, it just has nothing to come off yet.
+    total_absent_days = round(sum(float(a.get("days", 0) or 0) for a in absences), 2)
+    deducted_days = round(sum(float(p["deducted_days"]) for p in periods), 2)
+    # The rate the next month would use: the latest cycle's, falling back to the
+    # standing monthly salary over a nominal 30-day month when none exists yet.
+    per_day_wage = (
+        periods[-1]["per_day_wage"] if periods
+        else round(float(doc.get("monthly_salary", 0)) / 30, 2)
+    )
 
     # Only a matured cycle can be owed — an in-progress month isn't late yet.
     unpaid_matured = [p for p in periods if p["matured"] and p["pending_amount"] > 0]
@@ -1055,10 +1178,16 @@ async def worker_to_out(doc: Dict[str, Any]) -> Dict[str, Any]:
         **{k: v for k, v in doc.items() if k != "_id"},
         "period_count": len(periods),
         "total_salary": total_salary,
+        "total_deduction": total_deduction,
+        "total_payable": total_payable,
+        "absence_count": len(absences),
+        "total_absent_days": total_absent_days,
+        "deducted_days": deducted_days,
+        "per_day_wage": per_day_wage,
         "total_paid": total_paid,
         "total_pending": total_pending,
         "matured_pending": matured_pending,
-        "status": _salary_status(total_salary, total_paid) if periods else "pending",
+        "status": _salary_status(total_payable, total_paid) if periods else "pending",
         "pending_months": [p["label"] for p in unpaid_matured],
         "oldest_pending_month": unpaid_matured[0]["label"] if unpaid_matured else None,
         "max_overdue_days": max([p["overdue_days"] for p in unpaid_matured], default=0),
@@ -1133,6 +1262,7 @@ async def update_worker(worker_id: str, body: WorkerIn, admin=Depends(get_curren
 async def delete_worker(worker_id: str, _=Depends(require_cap("delete"))):
     await db.salary_payments.delete_many({"worker_id": worker_id})
     await db.salary_periods.delete_many({"worker_id": worker_id})
+    await db.worker_absences.delete_many({"worker_id": worker_id})
     await db.workers.delete_one({"id": worker_id})
     return {"ok": True}
 
@@ -1175,13 +1305,12 @@ async def create_salary_period(worker_id: str, body: SalaryPeriodIn, admin=Depen
         "created_at": now_iso(),
     }
     await db.salary_periods.insert_one(dict(doc))
-    return {
-        **{k: v for k, v in doc.items() if k != "_id"},
-        "label": _period_label(doc["start_date"], doc["end_date"]),
-        "paid_amount": 0.0,
-        "pending_amount": round(float(doc["total_salary"]), 2),
-        "status": "pending",
-    }
+    # Absences may already sit inside this window, so read the month back through
+    # the same path the list uses rather than assuming it starts fully pending.
+    created = next((p for p in await _worker_periods(worker_id) if p["id"] == doc["id"]), None)
+    if not created:
+        raise HTTPException(500, "Salary month could not be created")
+    return created
 
 
 async def _period_paid(worker_id: str, period_id: str) -> float:
@@ -1221,12 +1350,22 @@ async def update_salary_period(period_id: str, body: SalaryPeriodIn, admin=Depen
             raise HTTPException(400, f"This overlaps the existing salary period {clash}")
 
     # Money already handed over can't exceed what the month is now worth, or the
-    # month would read as overpaid with no way to show it.
+    # month would read as overpaid with no way to show it. What it is worth is
+    # the total minus its absences, so the deduction is re-run against the new
+    # dates and total before the floor is checked.
     paid = await _period_paid(worker_id, period_id)
-    if body.total_salary + 0.0001 < paid:
+    absences = await _worker_absence_docs(worker_id)
+    calc = _period_deduction({**period, **body.model_dump()}, absences)
+    if calc["payable_salary"] + 0.0001 < paid:
+        extra = (
+            f" (Rs. {body.total_salary} less Rs. {calc['deduction']} deducted for "
+            f"{calc['deducted_days']} absent day{'' if calc['deducted_days'] == 1 else 's'})"
+            if calc["deduction"] > 0 else ""
+        )
         raise HTTPException(
             400,
-            f"Rs. {paid} is already paid for this month — the total cannot be set below that",
+            f"Rs. {paid} is already paid for this month — it would be payable at "
+            f"Rs. {calc['payable_salary']}{extra}, which is below that",
         )
 
     await db.salary_periods.update_one({"id": period_id}, {"$set": body.model_dump()})
@@ -1246,6 +1385,144 @@ async def delete_salary_period(period_id: str, _=Depends(require_cap("delete")))
             f"Rs. {paid} is already recorded against this month — delete those payments first",
         )
     await db.salary_periods.delete_one({"id": period_id})
+    return {"ok": True}
+
+
+# ---------- Absences / holidays ----------
+async def _absence_out(
+    a: Dict[str, Any], periods: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """One absence with the month it lands in and what it costs there. An
+    absence outside every recorded month is kept and reported with a null
+    period — it starts deducting by itself once that month is added."""
+    day = _period_day(a.get("date"))
+    host = None
+    for p in periods:
+        ps, pe = _period_day(p.get("start_date")), _period_day(p.get("end_date"))
+        if day and ps and pe and ps <= day <= pe:
+            host = p
+            break
+    days = float(a.get("days", 0) or 0)
+    per_day = float(host["per_day_wage"]) if host else 0.0
+    _, span_end = _absence_span(a)
+    return {
+        **a,
+        "end_date": span_end.isoformat() if span_end else None,
+        "period_id": host["id"] if host else None,
+        "period_label": host["label"] if host else None,
+        "per_day_wage": per_day,
+        # What this row on its own takes off. The month caps the total, so the
+        # sum of these can read slightly above the month's actual deduction
+        # when absences exceed a full month of work.
+        "deduction_amount": round(per_day * days, 2) if a.get("deduct") else 0.0,
+    }
+
+
+async def _check_absence_fits(
+    worker_id: str,
+    body: WorkerAbsenceIn,
+    absence_id: Optional[str] = None,
+) -> None:
+    """Rejects an absence that would either double-count days already recorded
+    or push a month's payable salary below what has already been handed over."""
+    day = _period_day(body.date)
+    if not day:
+        raise HTTPException(400, "A valid absence date is required")
+
+    candidate = {"date": body.date, "days": body.days, "deduct": bool(body.deduct)}
+    new_start, new_end = _absence_span(candidate)
+
+    existing = await _worker_absence_docs(worker_id)
+    for other in existing:
+        if absence_id and other["id"] == absence_id:
+            continue
+        os_, oe = _absence_span(other)
+        if os_ and oe and new_start <= oe and os_ <= new_end:
+            raise HTTPException(
+                400,
+                f"An absence is already recorded for {os_.strftime('%d/%m/%Y')}"
+                + (f" – {oe.strftime('%d/%m/%Y')}" if oe != os_ else ""),
+            )
+
+    # Re-run the month's maths with this absence in place.
+    kept = [o for o in existing if not (absence_id and o["id"] == absence_id)]
+    kept.append({**candidate, "id": absence_id or "new", "worker_id": worker_id})
+
+    for period in await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500):
+        ps, pe = _period_day(period.get("start_date")), _period_day(period.get("end_date"))
+        if not (ps and pe and ps <= day <= pe):
+            continue
+        calc = _period_deduction(period, kept)
+        paid = await _period_paid(worker_id, period["id"])
+        if calc["payable_salary"] + 0.0001 < paid:
+            label = _period_label(period.get("start_date"), period.get("end_date"))
+            raise HTTPException(
+                400,
+                f"Deducting this would leave {label} payable at "
+                f"Rs. {calc['payable_salary']}, below the Rs. {paid} already paid. "
+                "Turn the deduction off, or remove a payment first.",
+            )
+
+
+@api.get("/workers/{worker_id}/absences")
+async def list_absences(worker_id: str, admin=Depends(get_current_admin)):
+    if not await db.workers.find_one({"id": worker_id}, {"_id": 0, "id": 1}):
+        raise HTTPException(404, "Worker not found")
+    periods = await _worker_periods(worker_id)
+    docs = await _worker_absence_docs(worker_id)
+    docs.reverse()  # newest first for display
+    return [await _absence_out(a, periods) for a in docs]
+
+
+@api.post("/workers/{worker_id}/absences")
+async def create_absence(worker_id: str, body: WorkerAbsenceIn, admin=Depends(get_current_admin)):
+    if not await db.workers.find_one({"id": worker_id}, {"_id": 0, "id": 1}):
+        raise HTTPException(404, "Worker not found")
+    await _check_absence_fits(worker_id, body)
+
+    doc = {
+        **body.model_dump(),
+        # Stored as a calendar date for the same reason salary months are: an
+        # instant would land on the previous day east of Greenwich.
+        "date": _period_day(body.date).isoformat(),
+        "reason": (body.reason or "").strip(),
+        "deduct": bool(body.deduct),
+        "id": str(uuid.uuid4()),
+        "worker_id": worker_id,
+        "created_at": now_iso(),
+    }
+    await db.worker_absences.insert_one(dict(doc))
+    periods = await _worker_periods(worker_id)
+    return await _absence_out({k: v for k, v in doc.items() if k != "_id"}, periods)
+
+
+@api.put("/absences/{absence_id}")
+async def update_absence(absence_id: str, body: WorkerAbsenceIn, admin=Depends(get_current_admin)):
+    existing = await db.worker_absences.find_one({"id": absence_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Absence not found")
+    worker_id = existing["worker_id"]
+    await _check_absence_fits(worker_id, body, absence_id=absence_id)
+
+    await db.worker_absences.update_one(
+        {"id": absence_id},
+        {"$set": {
+            **body.model_dump(),
+            "date": _period_day(body.date).isoformat(),
+            "reason": (body.reason or "").strip(),
+            "deduct": bool(body.deduct),
+        }},
+    )
+    doc = await db.worker_absences.find_one({"id": absence_id}, {"_id": 0})
+    periods = await _worker_periods(worker_id)
+    return await _absence_out(doc, periods)
+
+
+@api.delete("/absences/{absence_id}")
+async def delete_absence(absence_id: str, _=Depends(require_cap("delete"))):
+    res = await db.worker_absences.delete_one({"id": absence_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Absence not found")
     return {"ok": True}
 
 
@@ -1334,6 +1611,12 @@ async def delete_salary_payment(payment_id: str, _=Depends(require_cap("delete")
     return {"ok": True}
 
 
+def _trim_days(value: Any) -> str:
+    """Day counts read as "2" and half days as "1.5" — never "2.0"."""
+    n = float(value or 0)
+    return str(int(n)) if n == int(n) else f"{n:g}"
+
+
 def _fmt_day(value: Optional[str]) -> str:
     """Calendar date as DD/MM/YYYY — salary months are days, so no clock time."""
     d = _period_day(value)
@@ -1403,6 +1686,7 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
     periods = list(reversed(await _worker_periods(doc_worker["id"])))  # newest first
     payments = await db.salary_payments.find({"worker_id": doc_worker["id"]}, {"_id": 0}) \
         .sort("payment_date", -1).to_list(2000)
+    absences = list(reversed(await _worker_absence_docs(doc_worker["id"])))  # newest first
     labels = {p["id"]: p["label"] for p in periods}
 
     out: List[Any] = []
@@ -1422,16 +1706,21 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
         out.append(kit.Paragraph(" · ".join(meta), kit.sub))
 
     summary_rows = [
-        ["Salary months", "Total salary", "Paid", "Pending", "Due now"],
+        ["Months", "Gross salary", "Deducted", "Payable", "Paid", "Pending", "Due now"],
         [
             str(worker["period_count"]),
             _format_inr(worker["total_salary"]),
+            _format_inr(worker["total_deduction"]),
+            _format_inr(worker["total_payable"]),
             _format_inr(worker["total_paid"]),
             _format_inr(worker["total_pending"]),
             _format_inr(worker["matured_pending"]),
         ],
     ]
-    st = kit.Table(summary_rows, colWidths=[28 * mm, 32 * mm, 32 * mm, 32 * mm, 32 * mm])
+    st = kit.Table(
+        summary_rows,
+        colWidths=[16 * mm, 28 * mm, 25 * mm, 27 * mm, 25 * mm, 25 * mm, 26 * mm],
+    )
     st.setStyle(kit.TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), kit.colors.HexColor("#F2F5F3")),
         ("TEXTCOLOR", (0, 0), (-1, 0), kit.colors.HexColor("#6B7280")),
@@ -1455,20 +1744,67 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
     if not periods:
         out.append(kit.Paragraph("No salary months recorded.", kit.sub))
     else:
-        rows: List[List[Any]] = [["Month", "From", "To", "Total", "Paid", "Pending", "Status"]]
+        # Portrait A4 leaves 182mm of usable width, so the per-day rate and the
+        # day counts live in the Absences table below rather than widening this
+        # one past legibility.
+        rows: List[List[Any]] = [
+            ["Month", "From", "To", "Gross", "Deducted", "Payable", "Paid", "Pending", "Status"]
+        ]
         for p in periods:
             state = "Paid" if p["status"] == "completed" else (
                 "In progress" if not p["matured"] else p["status"].title())
             if p["overdue_days"]:
-                state += f" ({p['overdue_days']}d late)"
+                state += f" +{p['overdue_days']}d"
             rows.append([
                 p["label"], _fmt_day(p.get("start_date")), _fmt_day(p.get("end_date")),
-                _format_inr(p["total_salary"]), _format_inr(p["paid_amount"]),
+                _format_inr(p["total_salary"]),
+                _format_inr(p["deduction"]) if p["deduction"] else "-",
+                _format_inr(p["payable_salary"]), _format_inr(p["paid_amount"]),
                 _format_inr(p["pending_amount"]), state,
             ])
-        rows.append(["TOTAL", "", "", _format_inr(worker["total_salary"]),
-                     _format_inr(worker["total_paid"]), _format_inr(worker["total_pending"]), ""])
-        out.append(_pdf_table(kit, rows, [32*mm, 21*mm, 21*mm, 24*mm, 24*mm, 24*mm, 32*mm], 3, 5, True))
+        rows.append([
+            "TOTAL", "", "", _format_inr(worker["total_salary"]),
+            _format_inr(worker["total_deduction"]), _format_inr(worker["total_payable"]),
+            _format_inr(worker["total_paid"]), _format_inr(worker["total_pending"]), "",
+        ])
+        out.append(_pdf_table(
+            kit, rows,
+            [28*mm, 18*mm, 18*mm, 19*mm, 19*mm, 20*mm, 19*mm, 19*mm, 22*mm],
+            3, 7, True,
+        ))
+
+    out.append(kit.Paragraph("Absences", kit.h3))
+    if not absences:
+        out.append(kit.Paragraph("No absences recorded.", kit.sub))
+    else:
+        rows = [["Date", "Days", "Reason", "Salary month", "Per day", "Deducted"]]
+        for a in absences:
+            start = _period_day(a.get("date"))
+            host = next(
+                (p for p in periods
+                 if start
+                 and _period_day(p.get("start_date"))
+                 and _period_day(p.get("end_date"))
+                 and _period_day(p["start_date"]) <= start <= _period_day(p["end_date"])),
+                None,
+            )
+            days = float(a.get("days", 0) or 0)
+            if not a.get("deduct"):
+                cost = "Not deducted"
+            elif host:
+                cost = _format_inr(round(float(host["per_day_wage"]) * days, 2))
+            else:
+                cost = "No salary month yet"
+            rows.append([
+                _fmt_day(a.get("date")), _trim_days(days), a.get("reason") or "-",
+                host["label"] if host else "-",
+                _format_inr(host["per_day_wage"]) if host else "-", cost,
+            ])
+        rows.append(["TOTAL", _trim_days(worker["total_absent_days"]), "", "", "",
+                     _format_inr(worker["total_deduction"])])
+        out.append(_pdf_table(
+            kit, rows, [24*mm, 14*mm, 56*mm, 32*mm, 26*mm, 30*mm], 1, 5, True,
+        ))
 
     out.append(kit.Paragraph("Payment History", kit.h3))
     if not payments:
@@ -1620,22 +1956,25 @@ async def clear_worker_payments(worker_id: str, _=Depends(require_cap("delete"))
         "worker_name": worker.get("name", ""),
         "deleted_payments": res.deleted_count,
         "deleted_periods": 0,
+        "deleted_absences": 0,
     }
 
 
 @api.delete("/workers/{worker_id}/records")
 async def clear_worker_records(worker_id: str, _=Depends(require_cap("delete"))):
-    """Wipes one worker's payments and salary months, keeping the worker."""
+    """Wipes one worker's payments, salary months and absences, keeping the worker."""
     worker = await db.workers.find_one({"id": worker_id}, {"_id": 0, "name": 1})
     if not worker:
         raise HTTPException(404, "Worker not found")
     pay = await db.salary_payments.delete_many({"worker_id": worker_id})
     per = await db.salary_periods.delete_many({"worker_id": worker_id})
+    abs_ = await db.worker_absences.delete_many({"worker_id": worker_id})
     return {
         "ok": True,
         "worker_name": worker.get("name", ""),
         "deleted_payments": pay.deleted_count,
         "deleted_periods": per.deleted_count,
+        "deleted_absences": abs_.deleted_count,
     }
 
 
@@ -1645,16 +1984,18 @@ async def clear_all_work_records(_=Depends(require_cap("delete"))):
     years are in different collections and are not touched."""
     pay = await db.salary_payments.delete_many({})
     per = await db.salary_periods.delete_many({})
+    abs_ = await db.worker_absences.delete_many({})
     wor = await db.workers.delete_many({})
     logger.info(
-        "Work management reset: %d workers, %d periods, %d payments deleted",
-        wor.deleted_count, per.deleted_count, pay.deleted_count,
+        "Work management reset: %d workers, %d periods, %d payments, %d absences deleted",
+        wor.deleted_count, per.deleted_count, pay.deleted_count, abs_.deleted_count,
     )
     return {
         "ok": True,
         "deleted_workers": wor.deleted_count,
         "deleted_periods": per.deleted_count,
         "deleted_payments": pay.deleted_count,
+        "deleted_absences": abs_.deleted_count,
     }
 # ---------- Work summary / pending ----------
 @api.get("/work/summary")
@@ -1665,12 +2006,16 @@ async def work_summary(admin=Depends(get_current_admin)):
         "total_workers": len(workers),
         "active_workers": sum(1 for w in workers if w.get("active", True)),
         "total_salary": round(sum(w["total_salary"] for w in workers), 2),
+        "total_deduction": round(sum(w["total_deduction"] for w in workers), 2),
+        "total_payable": round(sum(w["total_payable"] for w in workers), 2),
+        "total_absent_days": round(sum(w["total_absent_days"] for w in workers), 2),
         "total_paid": round(sum(w["total_paid"] for w in workers), 2),
         "total_pending": round(sum(w["total_pending"] for w in workers), 2),
         "matured_pending": round(sum(w["matured_pending"] for w in workers), 2),
         "workers_with_pending": sum(1 for w in workers if w["matured_pending"] > 0),
         "total_periods": await db.salary_periods.count_documents({}),
         "total_payments": await db.salary_payments.count_documents({}),
+        "total_absences": await db.worker_absences.count_documents({}),
     }
 
 

@@ -12,15 +12,15 @@ self.addEventListener('push', (event) => {
   try {
     payload = event.data ? event.data.json() : {};
   } catch (e) {
-    payload = { title: 'Bus Fee Manager', body: event.data ? event.data.text() : '' };
+    payload = { title: 'Amogh Fee Management', body: event.data ? event.data.text() : '' };
   }
 
-  const title = payload.title || 'Bus Fee Manager';
+  const title = payload.title || 'Amogh Fee Management';
   event.waitUntil(
     self.registration.showNotification(title, {
       body: payload.body || '',
-      icon: '/favicon.ico',
-      badge: '/favicon.ico',
+      icon: '/icon-192.png',
+      badge: '/icon-192.png',
       data: { url: payload.url || '/' },
       tag: payload.tag || undefined,
     })

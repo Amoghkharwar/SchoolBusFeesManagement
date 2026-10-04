@@ -1,5 +1,5 @@
 /**
- * Theme tokens for School Bus Fee Manager.
+ * Theme tokens for Amogh Fee Management.
  * Derived from /app/design_guidelines.json — light + dark variants.
  */
 import { useColorScheme } from 'react-native';

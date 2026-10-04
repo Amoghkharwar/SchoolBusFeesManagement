@@ -1,5 +1,5 @@
 /**
- * API client + Auth context for Bus Fee Manager.
+ * API client + Auth context for Amogh Fee Management.
  */
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';

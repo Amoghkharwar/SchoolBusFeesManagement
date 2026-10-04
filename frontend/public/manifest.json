@@ -1,6 +1,6 @@
 {
-  "name": "School Bus Fee Manager",
-  "short_name": "Bus Fees",
+  "name": "Amogh Fee Management",
+  "short_name": "Amogh Fees",
   "description": "Track school bus fees, payments and pending dues.",
   "start_url": "/",
   "scope": "/",

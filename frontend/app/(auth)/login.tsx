@@ -67,7 +67,7 @@ export default function Login() {
             >
               <Ionicons name="bus" size={28} color="#0B1110" />
             </View>
-            <Text style={{ color: '#fff', fontSize: 28, fontWeight: '700' }}>Bus Fee Manager</Text>
+            <Text style={{ color: '#fff', fontSize: 28, fontWeight: '700' }}>Amogh Fee Management</Text>
             <Text style={{ color: '#E1E7E4', fontSize: fontSize.base, marginTop: 4 }}>
               Manage students, payments and pending fees.
             </Text>

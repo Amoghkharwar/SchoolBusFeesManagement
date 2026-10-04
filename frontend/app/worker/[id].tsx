@@ -97,6 +97,55 @@ function settlementSummary(paidLabel: string, allocs: AllocationLabel[], worker:
   return `${paidLabel} recorded — ${parts}.${tail}`;
 }
 
+const r2 = (n: number) => Math.round(n * 100) / 100;
+
+/** Local mirror of the server's salary roll-up (`_period_deduction` and
+ *  `worker_to_out` in backend/server.py) so toggling a deduction can repaint
+ *  the figures on the spot instead of waiting out a round trip. The reload that
+ *  follows overwrites all of it with the server's own numbers, so this only
+ *  ever has to be right for the moment between the tap and the response.
+ *
+ *  Absences are attributed to the month they start in, and the server already
+ *  resolved that into `period_id` — so there is no date maths to repeat here. */
+function rollUpSalary(periods: Period[], absences: Absence[], worker: any) {
+  const nextPeriods = periods.map((p) => {
+    const mine = absences.filter((a) => a.period_id === p.id);
+    const deductedDays = r2(mine.reduce((s, a) => s + (a.deduct ? a.days : 0), 0));
+    // Capped at the month's total, exactly as the server does, so payable can
+    // never read negative while the request is in flight.
+    const deduction = r2(Math.min(p.per_day_wage * deductedDays, p.total_salary));
+    const payable = r2(p.total_salary - deduction);
+    return {
+      ...p,
+      absent_days: r2(mine.reduce((s, a) => s + a.days, 0)),
+      deducted_days: deductedDays,
+      deduction,
+      payable_salary: payable,
+      pending_amount: r2(Math.max(payable - p.paid_amount, 0)),
+    };
+  });
+
+  const sum = (pick: (p: Period) => number) => r2(nextPeriods.reduce((s, p) => s + pick(p), 0));
+  // Only a matured month can be owed — an in-progress one isn't late yet.
+  const owed = nextPeriods.filter((p) => p.matured && p.pending_amount > 0);
+  const totalDeduction = sum((p) => p.deduction);
+
+  return {
+    periods: nextPeriods,
+    worker: worker && {
+      ...worker,
+      total_deduction: totalDeduction,
+      total_payable: r2(worker.total_salary - totalDeduction),
+      total_pending: sum((p) => p.pending_amount),
+      deducted_days: sum((p) => p.deducted_days),
+      matured_pending: r2(owed.reduce((s, p) => s + p.pending_amount, 0)),
+      pending_months: owed.map((p) => p.label),
+      oldest_pending_month: owed.length ? owed[0].label : null,
+      max_overdue_days: owed.reduce((m, p) => Math.max(m, p.overdue_days), 0),
+    },
+  };
+}
+
 export default function WorkerDetail() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { palette } = useTheme();
@@ -137,6 +186,8 @@ export default function WorkerDetail() {
   const [aDeduct, setADeduct] = useState(true);
 
   const [submitting, setSubmitting] = useState(false);
+  // The absence whose deduction is mid-flight, so its button can't be tapped twice.
+  const [togglingId, setTogglingId] = useState<string | null>(null);
   const [modalErr, setModalErr] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [confirmDeleteWorker, setConfirmDeleteWorker] = useState(false);
@@ -373,8 +424,31 @@ export default function WorkerDetail() {
     }
   };
 
-  /** Flip one absence between "deduct" and "paid leave" straight from the list. */
+  /** Flip one absence between "deduct" and "paid leave" straight from the list.
+   *
+   *  The row and every salary figure are recomputed locally and painted before
+   *  the request goes out, so the tap lands immediately rather than after a PUT
+   *  plus a four-call reload. The server stays authoritative: load() replaces
+   *  the optimistic numbers, and a rejected toggle — the server refuses one
+   *  that would drop a month below what is already paid — puts the whole screen
+   *  back the way it was. */
   const toggleDeduct = async (a: Absence) => {
+    if (togglingId) return; // one in flight is enough; ignore repeat taps
+    const next = !a.deduct;
+    const previous = { worker, periods, absences };
+
+    const nextAbsences = absences.map((x) =>
+      x.id === a.id
+        ? { ...x, deduct: next, deduction_amount: next ? r2(x.per_day_wage * x.days) : 0 }
+        : x,
+    );
+    const rolled = rollUpSalary(periods, nextAbsences, worker);
+
+    setTogglingId(a.id);
+    setAbsences(nextAbsences);
+    setPeriods(rolled.periods);
+    setWorker(rolled.worker);
+
     try {
       await apiFetch<Absence>(`/absences/${a.id}`, {
         method: 'PUT',
@@ -382,12 +456,17 @@ export default function WorkerDetail() {
           date: a.date,
           days: a.days,
           reason: a.reason || '',
-          deduct: !a.deduct,
+          deduct: next,
         }),
       });
       await load();
     } catch (e: any) {
+      setWorker(previous.worker);
+      setPeriods(previous.periods);
+      setAbsences(previous.absences);
       setModalErr(e.message);
+    } finally {
+      setTogglingId(null);
     }
   };
 
@@ -667,6 +746,7 @@ export default function WorkerDetail() {
               canDelete={isAdmin}
               onEdit={() => openAbsenceModal(a)}
               onToggle={() => toggleDeduct(a)}
+              toggling={togglingId === a.id}
               onDelete={() => setConfirmDeleteAbsence(a)}
             />
           ))
@@ -1157,13 +1237,15 @@ function PeriodCard({ period, canDelete, onEdit, onDelete }: { period: Period; c
 }
 
 function AbsenceCard({
-  absence, canDelete, onEdit, onToggle, onDelete,
+  absence, canDelete, onEdit, onToggle, onDelete, toggling = false,
 }: {
   absence: Absence;
   canDelete: boolean;
   onEdit: () => void;
   onToggle: () => void;
   onDelete: () => void;
+  /** The new state is already on screen; this only blocks a second tap. */
+  toggling?: boolean;
 }) {
   const { palette } = useTheme();
   const multiDay = absence.end_date && absence.end_date !== absence.date;
@@ -1212,6 +1294,7 @@ function AbsenceCard({
 
       <Pressable
         onPress={onToggle}
+        disabled={toggling}
         testID={`toggle-absence-${absence.id}`}
         style={{
           marginTop: spacing.sm,
@@ -1219,6 +1302,7 @@ function AbsenceCard({
           borderRadius: radii.md,
           alignItems: 'center',
           borderWidth: 1,
+          opacity: toggling ? 0.6 : 1,
           borderColor: absence.deduct ? palette.border : palette.error + '66',
         }}
       >

@@ -442,6 +442,16 @@ class PaymentIn(BaseModel):
     next_due_date: Optional[str] = None  # ISO datetime — next fee due
 
 
+def _whole_rupees(v: float, what: str) -> float:
+    """Salaries are agreed in whole rupees. Paise only ever crept in by typo, and
+    then showed as ₹5,001 on screen while the server quoted 5000.75 back."""
+    if v is None or v <= 0:
+        raise ValueError(f"{what} must be greater than zero")
+    if abs(v - round(v)) > 1e-9:
+        raise ValueError(f"{what} must be in whole rupees, without paise")
+    return float(round(v))
+
+
 class WorkerIn(BaseModel):
     """A person on the payroll. `monthly_salary` is only the default used to
     pre-fill new salary months — each month stores its own matured amount, so
@@ -452,6 +462,11 @@ class WorkerIn(BaseModel):
     monthly_salary: float
     join_date: str  # ISO datetime
     active: Optional[bool] = True
+
+    @field_validator("monthly_salary")
+    @classmethod
+    def validate_monthly_salary(cls, v: float) -> float:
+        return _whole_rupees(v, "Monthly salary")
 
     @field_validator("mobile")
     @classmethod
@@ -476,6 +491,11 @@ class SalaryPeriodIn(BaseModel):
     end_date: str    # ISO datetime — the day the salary matures
     total_salary: float
     note: Optional[str] = ""
+
+    @field_validator("total_salary")
+    @classmethod
+    def validate_total_salary(cls, v: float) -> float:
+        return _whole_rupees(v, "Salary for the month")
 
 
 class SalaryPaymentIn(BaseModel):
@@ -1017,6 +1037,54 @@ def _sort_key(value: Optional[str]) -> date:
     return _period_day(value) or date.min
 
 
+# Payroll runs on the Indian calendar. Reading "today" in UTC would call a month
+# unmatured until 05:30 IST on its last day, and reject today's date as future
+# for anyone using the app before then.
+_IST = timezone(timedelta(hours=5, minutes=30))
+# Longest stretch one salary month may cover — a 123-day "month" divides the
+# salary by 123, which made each absent day cost a quarter of what it should.
+_MAX_PERIOD_DAYS = 31
+# Less than a rupee left on a month counts as paid. Salary is typed in whole
+# rupees, so paying the rupees shown always settles a month — even an old one
+# whose total or deduction still carries paise (₹5,000.75 paid ₹5,000).
+_SETTLED_BELOW = 1.0
+
+
+def _today() -> date:
+    return datetime.now(_IST).date()
+
+
+def _local_day(value: Optional[str]) -> Optional[date]:
+    """The calendar day an ISO instant falls on in India — what the user picked
+    in the date picker, rather than the UTC day it was serialised as."""
+    if not value:
+        return None
+    text = value.strip()
+    if len(text) == 10:
+        return _period_day(text)
+    dt = _parse_dt(text)
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_IST).date()
+
+
+def _dmy(d: Optional[date]) -> str:
+    return d.strftime("%d/%m/%Y") if d else "—"
+
+
+def _inr(n: float) -> str:
+    """Rupee amount for a message the app shows — the same "₹4,899" the screen
+    uses, so an error never quotes "Rs. 4899.0" next to it."""
+    return _format_inr(n).replace("Rs. ", "₹")
+
+
+def _plural(n: float, word: str) -> str:
+    shown = int(n) if float(n).is_integer() else n
+    return f"{shown} {word}{'' if n == 1 else 's'}"
+
+
 def _salary_status(total: float, paid: float) -> str:
     """Deliberately separate from the student-fee status helper: work management
     is its own module, so a change to fee rules must not move salary states."""
@@ -1041,6 +1109,15 @@ def _per_day_wage(total_salary: float, start: Optional[date], end: Optional[date
     if span <= 0:
         return 0.0
     return round(float(total_salary) / span, 2)
+
+
+def _days_cost(total_salary: float, span: int, days: float) -> float:
+    """What `days` off a month of `span` days costs, in whole rupees and never
+    more than the month itself. Worked from the total rather than the rounded
+    per-day figure so 30 days off a 30-day month comes to exactly the salary."""
+    if span <= 0 or days <= 0:
+        return 0.0
+    return float(round(min(float(total_salary) * days / span, float(total_salary))))
 
 
 def _absence_span(a: Dict[str, Any]) -> Tuple[Optional[date], Optional[date]]:
@@ -1088,7 +1165,7 @@ def _period_deduction(period: Dict[str, Any], absences: List[Dict[str, Any]]) ->
     absent_days = round(sum(float(a.get("days", 0) or 0) for a in mine), 2)
     deduct_days = round(sum(float(a.get("days", 0) or 0) for a in mine if a.get("deduct")), 2)
     per_day = _per_day_wage(total, start, end)
-    deduction = round(min(per_day * deduct_days, total), 2)
+    deduction = _days_cost(total, _period_span_days(start, end), deduct_days)
     return {
         "days_in_period": _period_span_days(start, end),
         "per_day_wage": per_day,
@@ -1120,7 +1197,7 @@ async def _worker_periods(
                 paid_by_period[pid] = paid_by_period.get(pid, 0.0) + float(alloc.get("amount", 0))
 
     periods.sort(key=lambda p: _sort_key(p.get("start_date")))
-    today = datetime.now(timezone.utc).date()
+    today = _today()
     out: List[Dict[str, Any]] = []
     for p in periods:
         total = float(p.get("total_salary", 0))
@@ -1128,6 +1205,13 @@ async def _worker_periods(
         payable = calc["payable_salary"]
         paid = round(paid_by_period.get(p["id"], 0.0), 2)
         pending = round(max(payable - paid, 0), 2)
+        # Paise left over are not salary owed. Months deducted before deductions
+        # rounded to the rupee were paid to the paisa (4838.71), and now come out
+        # at 4839 — without this the 29 paise kept the month "partial" while the
+        # screen showed ₹0 due. The frontend applies the same rule (owed()).
+        settled = pending < _SETTLED_BELOW
+        if settled:
+            pending = 0.0
         end = _period_day(p.get("end_date"))
         # Salary matures on the end date itself, so that day already counts as owed.
         matured = bool(end and end <= today)
@@ -1138,7 +1222,7 @@ async def _worker_periods(
             "label": _period_label(p.get("start_date"), p.get("end_date")),
             "paid_amount": paid,
             "pending_amount": pending,
-            "status": "completed" if payable <= 0.0001 else _salary_status(payable, paid),
+            "status": "completed" if payable <= 0.0001 or settled else _salary_status(payable, paid),
             "matured": matured,
             "overdue_days": overdue_days,
         })
@@ -1170,6 +1254,22 @@ async def worker_to_out(doc: Dict[str, Any]) -> Dict[str, Any]:
     # Only a matured cycle can be owed — an in-progress month isn't late yet.
     unpaid_matured = [p for p in periods if p["matured"] and p["pending_amount"] > 0]
     matured_pending = round(sum(float(p["pending_amount"]) for p in unpaid_matured), 2)
+    # Still owed on a month that hasn't ended — not due yet, but not cleared either.
+    upcoming_pending = round(max(total_pending - matured_pending, 0), 2)
+    running = next((p for p in periods if not p["matured"] and p["pending_amount"] > 0), None)
+
+    # Status is about what is due, so it is read off the ended months alone. The
+    # list, the filter and the detail badge all use this one field; computing it
+    # over every month made a worker with nothing due read as "Partial" just
+    # because the current month was still running.
+    if not periods:
+        status = "pending"
+    elif not unpaid_matured:
+        status = "completed"
+    elif any(float(p["paid_amount"]) > 0 for p in unpaid_matured):
+        status = "partial"
+    else:
+        status = "pending"
 
     last_payment = await db.salary_payments.find({"worker_id": doc["id"]}, {"_id": 0}) \
         .sort("payment_date", -1).to_list(1)
@@ -1187,7 +1287,10 @@ async def worker_to_out(doc: Dict[str, Any]) -> Dict[str, Any]:
         "total_paid": total_paid,
         "total_pending": total_pending,
         "matured_pending": matured_pending,
-        "status": _salary_status(total_payable, total_paid) if periods else "pending",
+        "upcoming_pending": upcoming_pending,
+        "upcoming_month": running["label"] if running else None,
+        "upcoming_matures_on": running.get("end_date") if running else None,
+        "status": status,
         "pending_months": [p["label"] for p in unpaid_matured],
         "oldest_pending_month": unpaid_matured[0]["label"] if unpaid_matured else None,
         "max_overdue_days": max([p["overdue_days"] for p in unpaid_matured], default=0),
@@ -1219,12 +1322,44 @@ async def list_workers(
     return out
 
 
+async def _check_worker_fields(body: WorkerIn, existing: Optional[Dict[str, Any]] = None) -> None:
+    """Rules a worker record has to satisfy on both create and edit."""
+    worker_id = existing["id"] if existing else None
+    if not body.name.strip():
+        raise HTTPException(400, "Worker name is required")
+    joined = _local_day(body.join_date)
+    if not joined:
+        raise HTTPException(400, "A valid joining date is required")
+    if joined > _today():
+        raise HTTPException(400, f"Joining date {_dmy(joined)} is in the future")
+
+    # One phone number is one person — a second worker on the same number is
+    # almost always the same person added twice. Checked only when the number
+    # changes, so a duplicate that predates this rule doesn't lock both records
+    # out of being edited.
+    if body.mobile and body.mobile != (existing or {}).get("mobile"):
+        query: Dict[str, Any] = {"mobile": body.mobile}
+        if worker_id:
+            query["id"] = {"$ne": worker_id}
+        clash = await db.workers.find_one(query, {"_id": 0, "name": 1})
+        if clash:
+            raise HTTPException(400, f"{clash['name']} is already added with mobile {body.mobile}")
+
+    if existing and joined != _local_day(existing.get("join_date")):
+        # Moving the joining date later can't strand months that start before it.
+        for p in await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500):
+            start = _period_day(p.get("start_date"))
+            if start and start < joined:
+                label = _period_label(p.get("start_date"), p.get("end_date"))
+                raise HTTPException(
+                    400,
+                    f"The salary month {label} starts on {_dmy(start)}, before this joining date",
+                )
+
+
 @api.post("/workers")
 async def create_worker(body: WorkerIn, admin=Depends(get_current_admin)):
-    if body.monthly_salary <= 0:
-        raise HTTPException(400, "Monthly salary must be greater than zero")
-    if await db.workers.find_one({"name": body.name.strip(), "mobile": body.mobile}):
-        raise HTTPException(400, "A worker with the same name and mobile already exists")
+    await _check_worker_fields(body)
     doc = {
         **body.model_dump(),
         "name": body.name.strip(),
@@ -1247,8 +1382,10 @@ async def get_worker(worker_id: str, admin=Depends(get_current_admin)):
 
 @api.put("/workers/{worker_id}")
 async def update_worker(worker_id: str, body: WorkerIn, admin=Depends(get_current_admin)):
-    if body.monthly_salary <= 0:
-        raise HTTPException(400, "Monthly salary must be greater than zero")
+    existing = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Worker not found")
+    await _check_worker_fields(body, existing)
     res = await db.workers.update_one(
         {"id": worker_id}, {"$set": {**body.model_dump(), "name": body.name.strip()}}
     )
@@ -1277,26 +1414,56 @@ async def list_salary_periods(worker_id: str, admin=Depends(get_current_admin)):
     return periods
 
 
-@api.post("/workers/{worker_id}/periods")
-async def create_salary_period(worker_id: str, body: SalaryPeriodIn, admin=Depends(get_current_admin)):
-    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
-    if not worker:
-        raise HTTPException(404, "Worker not found")
-    if body.total_salary <= 0:
-        raise HTTPException(400, "Total salary must be greater than zero")
+async def _check_period_window(
+    worker: Dict[str, Any], body: SalaryPeriodIn, period_id: Optional[str] = None
+) -> None:
+    """The dates a salary month may cover: one month at most, not before the
+    worker joined, not starting in the future, and not overlapping another."""
     start = _period_day(body.start_date)
     end = _period_day(body.end_date)
     if not start or not end:
         raise HTTPException(400, "Start and end dates are required")
     if end < start:
         raise HTTPException(400, "End date must be on or after the start date")
+    span = _period_span_days(start, end)
+    if span > _MAX_PERIOD_DAYS:
+        raise HTTPException(
+            400,
+            f"A salary month can cover at most {_MAX_PERIOD_DAYS} days — {_dmy(start)} to "
+            f"{_dmy(end)} is {span} days. Add each month separately.",
+        )
+    joined = _local_day(worker.get("join_date"))
+    if joined and start < joined:
+        raise HTTPException(
+            400,
+            f"{worker['name']} joined on {_dmy(joined)}, so a salary month cannot start before that. "
+            f"Start this month on {_dmy(joined)} and set its salary for the days worked.",
+        )
+    if start > _today():
+        raise HTTPException(
+            400, f"A salary month cannot start in the future ({_dmy(start)}). Add it once it begins."
+        )
 
     # Overlapping cycles would let the same day's work be paid twice.
-    for existing in await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500):
+    for existing in await db.salary_periods.find({"worker_id": worker["id"]}, {"_id": 0}).to_list(500):
+        if existing["id"] == period_id:
+            continue
         es, ee = _period_day(existing.get("start_date")), _period_day(existing.get("end_date"))
         if es and ee and start <= ee and es <= end:
             clash = _period_label(existing.get("start_date"), existing.get("end_date"))
-            raise HTTPException(400, f"This overlaps the existing salary period {clash}")
+            raise HTTPException(400, f"This overlaps the existing salary month {clash}")
+
+
+@api.post("/workers/{worker_id}/periods")
+async def create_salary_period(worker_id: str, body: SalaryPeriodIn, admin=Depends(get_current_admin)):
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+    if worker.get("active") is False:
+        raise HTTPException(
+            400, f"{worker['name']} is inactive. Mark them active before adding a salary month."
+        )
+    await _check_period_window(worker, body)
 
     doc = {
         **body.model_dump(),
@@ -1329,25 +1496,11 @@ async def update_salary_period(period_id: str, body: SalaryPeriodIn, admin=Depen
     period = await db.salary_periods.find_one({"id": period_id}, {"_id": 0})
     if not period:
         raise HTTPException(404, "Salary period not found")
-    if body.total_salary <= 0:
-        raise HTTPException(400, "Total salary must be greater than zero")
-    start = _period_day(body.start_date)
-    end = _period_day(body.end_date)
-    if not start or not end:
-        raise HTTPException(400, "Start and end dates are required")
-    if end < start:
-        raise HTTPException(400, "End date must be on or after the start date")
-
     worker_id = period["worker_id"]
-
-    # Overlapping cycles would let the same day's work be paid twice.
-    for existing in await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500):
-        if existing["id"] == period_id:
-            continue
-        es, ee = _period_day(existing.get("start_date")), _period_day(existing.get("end_date"))
-        if es and ee and start <= ee and es <= end:
-            clash = _period_label(existing.get("start_date"), existing.get("end_date"))
-            raise HTTPException(400, f"This overlaps the existing salary period {clash}")
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+    await _check_period_window(worker, body, period_id)
 
     # Money already handed over can't exceed what the month is now worth, or the
     # month would read as overpaid with no way to show it. What it is worth is
@@ -1358,14 +1511,14 @@ async def update_salary_period(period_id: str, body: SalaryPeriodIn, admin=Depen
     calc = _period_deduction({**period, **body.model_dump()}, absences)
     if calc["payable_salary"] + 0.0001 < paid:
         extra = (
-            f" (Rs. {body.total_salary} less Rs. {calc['deduction']} deducted for "
-            f"{calc['deducted_days']} absent day{'' if calc['deducted_days'] == 1 else 's'})"
+            f" ({_inr(body.total_salary)} less {_inr(calc['deduction'])} for "
+            f"{_plural(calc['deducted_days'], 'absent day')})"
             if calc["deduction"] > 0 else ""
         )
         raise HTTPException(
             400,
-            f"Rs. {paid} is already paid for this month — it would be payable at "
-            f"Rs. {calc['payable_salary']}{extra}, which is below that",
+            f"{_inr(paid)} is already paid for this month — it would be payable at "
+            f"{_inr(calc['payable_salary'])}{extra}, which is below that",
         )
 
     await db.salary_periods.update_one({"id": period_id}, {"$set": body.model_dump()})
@@ -1382,7 +1535,7 @@ async def delete_salary_period(period_id: str, _=Depends(require_cap("delete")))
     if paid > 0:
         raise HTTPException(
             400,
-            f"Rs. {paid} is already recorded against this month — delete those payments first",
+            f"{_inr(paid)} is already recorded against this month — delete those payments first",
         )
     await db.salary_periods.delete_one({"id": period_id})
     return {"ok": True}
@@ -1404,6 +1557,7 @@ async def _absence_out(
             break
     days = float(a.get("days", 0) or 0)
     per_day = float(host["per_day_wage"]) if host else 0.0
+    cost = _days_cost(host["total_salary"], host["days_in_period"], days) if host else 0.0
     _, span_end = _absence_span(a)
     return {
         **a,
@@ -1414,23 +1568,39 @@ async def _absence_out(
         # What this row on its own takes off. The month caps the total, so the
         # sum of these can read slightly above the month's actual deduction
         # when absences exceed a full month of work.
-        "deduction_amount": round(per_day * days, 2) if a.get("deduct") else 0.0,
+        "deduction_amount": cost if a.get("deduct") else 0.0,
     }
 
 
 async def _check_absence_fits(
-    worker_id: str,
+    worker: Dict[str, Any],
     body: WorkerAbsenceIn,
     absence_id: Optional[str] = None,
 ) -> None:
-    """Rejects an absence that would either double-count days already recorded
-    or push a month's payable salary below what has already been handed over."""
+    """Rejects an absence that hasn't happened yet, predates the worker, would
+    double-count days already recorded, or would push a month's payable salary
+    below what has already been handed over."""
+    worker_id = worker["id"]
     day = _period_day(body.date)
     if not day:
         raise HTTPException(400, "A valid absence date is required")
 
     candidate = {"date": body.date, "days": body.days, "deduct": bool(body.deduct)}
     new_start, new_end = _absence_span(candidate)
+
+    today = _today()
+    if new_end > today:
+        raise HTTPException(
+            400,
+            f"Absences can only be recorded for days already gone — {_dmy(new_start)}"
+            + (f" to {_dmy(new_end)}" if new_end != new_start else "")
+            + f" runs past today ({_dmy(today)}).",
+        )
+    joined = _local_day(worker.get("join_date"))
+    if joined and new_start < joined:
+        raise HTTPException(
+            400, f"{worker['name']} joined on {_dmy(joined)}, so cannot be absent before that"
+        )
 
     existing = await _worker_absence_docs(worker_id)
     for other in existing:
@@ -1440,8 +1610,8 @@ async def _check_absence_fits(
         if os_ and oe and new_start <= oe and os_ <= new_end:
             raise HTTPException(
                 400,
-                f"An absence is already recorded for {os_.strftime('%d/%m/%Y')}"
-                + (f" – {oe.strftime('%d/%m/%Y')}" if oe != os_ else ""),
+                f"An absence is already recorded for {_dmy(os_)}"
+                + (f" – {_dmy(oe)}" if oe != os_ else ""),
             )
 
     # Re-run the month's maths with this absence in place.
@@ -1459,7 +1629,7 @@ async def _check_absence_fits(
             raise HTTPException(
                 400,
                 f"Deducting this would leave {label} payable at "
-                f"Rs. {calc['payable_salary']}, below the Rs. {paid} already paid. "
+                f"{_inr(calc['payable_salary'])}, below the {_inr(paid)} already paid. "
                 "Turn the deduction off, or remove a payment first.",
             )
 
@@ -1476,9 +1646,14 @@ async def list_absences(worker_id: str, admin=Depends(get_current_admin)):
 
 @api.post("/workers/{worker_id}/absences")
 async def create_absence(worker_id: str, body: WorkerAbsenceIn, admin=Depends(get_current_admin)):
-    if not await db.workers.find_one({"id": worker_id}, {"_id": 0, "id": 1}):
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not worker:
         raise HTTPException(404, "Worker not found")
-    await _check_absence_fits(worker_id, body)
+    if worker.get("active") is False:
+        raise HTTPException(
+            400, f"{worker['name']} is inactive. Mark them active before recording an absence."
+        )
+    await _check_absence_fits(worker, body)
 
     doc = {
         **body.model_dump(),
@@ -1502,7 +1677,10 @@ async def update_absence(absence_id: str, body: WorkerAbsenceIn, admin=Depends(g
     if not existing:
         raise HTTPException(404, "Absence not found")
     worker_id = existing["worker_id"]
-    await _check_absence_fits(worker_id, body, absence_id=absence_id)
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+    await _check_absence_fits(worker, body, absence_id=absence_id)
 
     await db.worker_absences.update_one(
         {"id": absence_id},
@@ -1548,6 +1726,11 @@ async def add_salary_payment(worker_id: str, body: SalaryPaymentIn, admin=Depend
         raise HTTPException(404, "Worker not found")
     if body.amount <= 0:
         raise HTTPException(400, "Amount must be greater than zero")
+    paid_on = _local_day(body.payment_date)
+    if not paid_on:
+        raise HTTPException(400, "A valid payment date is required")
+    if paid_on > _today():
+        raise HTTPException(400, f"Payment date {_dmy(paid_on)} is in the future")
 
     periods = await _worker_periods(worker_id)
     if not periods:
@@ -1570,7 +1753,7 @@ async def add_salary_payment(worker_id: str, body: SalaryPaymentIn, admin=Depend
             else "Nothing is pending for this worker",
         )
     if body.amount > capacity + 0.0001:
-        raise HTTPException(400, f"Payment exceeds the pending salary of Rs. {capacity}")
+        raise HTTPException(400, f"That is more than the {_inr(capacity)} pending")
 
     remaining = float(body.amount)
     allocations: List[Dict[str, Any]] = []

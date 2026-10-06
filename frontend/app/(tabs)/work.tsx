@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ActivityIndicator,
@@ -18,6 +18,7 @@ import { apiFetch, useAuth, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { AlertModal, Card, DangerConfirmModal, EmptyState, FAB, TextField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
+import { owed, workerBadge, workerBadgeKind } from '@/src/utils/workerStatus';
 
 export interface WorkerRow {
   id: string;
@@ -41,6 +42,11 @@ export interface WorkerRow {
   total_pending: number;
   /** Pending only on months that have already ended — an in-progress month isn't late. */
   matured_pending: number;
+  /** Still owed on a month that hasn't ended yet — not due, but not cleared. */
+  upcoming_pending: number;
+  upcoming_month?: string | null;
+  upcoming_matures_on?: string | null;
+  /** Read off ended months only — see workerBadge. */
   status: 'pending' | 'partial' | 'completed';
   pending_months: string[];
   oldest_pending_month?: string | null;
@@ -88,17 +94,24 @@ export default function Work() {
   const [purging, setPurging] = useState(false);
   const [notice, setNotice] = useState('');
   const [downloading, setDownloading] = useState(false);
+  // Every focus fires a load, and an older one can come back after a newer one —
+  // only the latest request is allowed to paint, so the list never steps back
+  // to what it looked like before an edit.
+  const loadSeq = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
     try {
       setError('');
       const [list, s] = await Promise.all([
         apiFetch<WorkerRow[]>('/workers'),
         apiFetch<WorkSummary>('/work/summary'),
       ]);
+      if (seq !== loadSeq.current) return;
       setItems(list);
       setSummary(s);
     } catch (e: any) {
+      if (seq !== loadSeq.current) return;
       // A 404 here means the server predates this tab, which is a deployment
       // state rather than a user error — say so instead of an empty screen.
       setError(
@@ -159,13 +172,30 @@ export default function Work() {
       ) {
         return false;
       }
-      if (filter === 'due') return w.matured_pending > 0;
-      if (filter === 'partial') return w.status === 'partial';
-      if (filter === 'completed') return w.status === 'completed' && w.period_count > 0;
       if (filter === 'inactive') return w.active === false;
+      if (filter === 'all') return true;
+      // The salary filters are about people still on the payroll — someone
+      // marked inactive only shows under "Inactive" (and "All").
+      if (w.active === false) return false;
+      // Same decision as the badge, so a row never sits under a filter that
+      // contradicts the label on it.
+      const kind = workerBadgeKind(w);
+      if (filter === 'due') return kind === 'due' || kind === 'partial';
+      if (filter === 'partial') return kind === 'partial';
+      if (filter === 'completed') return kind === 'cleared' || kind === 'progress';
       return true;
     });
   }, [items, q, filter]);
+
+  // Totals for exactly the rows on screen, from the same response that drew
+  // them — so the cards follow the search and filter, and can't drift from the
+  // list the way a separately fetched summary did.
+  const totals = useMemo(() => ({
+    workers: visible.length,
+    paid: visible.reduce((s, w) => s + w.total_paid, 0),
+    due: visible.reduce((s, w) => s + owed(w.matured_pending), 0),
+  }), [visible]);
+  const narrowed = q.trim() !== '' || filter !== 'all';
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
@@ -190,11 +220,11 @@ export default function Work() {
           ) : null}
         </View>
 
-        {summary ? (
+        {!loading && !error ? (
           <View style={{ flexDirection: 'row', gap: spacing.sm, marginBottom: spacing.md }}>
-            <MiniStat label="Workers" value={String(summary.total_workers)} color={palette.onSurface} />
-            <MiniStat label="Paid" value={formatINR(summary.total_paid)} color={palette.success} />
-            <MiniStat label="Salary Due" value={formatINR(summary.matured_pending)} color={palette.error} />
+            <MiniStat label={narrowed ? 'Showing' : 'Workers'} value={String(totals.workers)} color={palette.onSurface} />
+            <MiniStat label="Paid" value={formatINR(totals.paid)} color={palette.success} />
+            <MiniStat label="Salary Due" value={formatINR(totals.due)} color={palette.error} />
           </View>
         ) : null}
 
@@ -247,14 +277,22 @@ export default function Work() {
           data={visible}
           keyExtractor={(w) => w.id}
           keyboardShouldPersistTaps="handled"
-          contentContainerStyle={{ padding: spacing.lg, paddingBottom: 100 }}
+          // Room under the last card for the floating "+" so it never sits on an amount.
+          contentContainerStyle={{ padding: spacing.lg, paddingBottom: 140 }}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} />}
           ListEmptyComponent={
             <Card>
               <EmptyState
-                icon={error ? 'cloud-offline-outline' : 'hammer-outline'}
-                title={error ? 'Could not load workers' : 'No workers found'}
-                subtitle={error || 'Add a worker to start tracking monthly salary.'}
+                icon={error ? 'cloud-offline-outline' : items.length ? 'search-outline' : 'hammer-outline'}
+                title={error ? 'Could not load workers' : items.length ? 'No matching workers' : 'No workers yet'}
+                subtitle={
+                  error ||
+                  (items.length
+                    ? q.trim()
+                      ? `Nobody matches "${q.trim()}"${filter !== 'all' ? ' under this filter' : ''}. Try another name, mobile or role.`
+                      : 'No workers fall under this filter right now.'
+                    : 'Add a worker to start tracking monthly salary.')
+                }
               />
             </Card>
           }
@@ -312,19 +350,11 @@ function MiniStat({ label, value, color }: { label: string; value: string; color
 function WorkerItem({ item }: { item: WorkerRow }) {
   const { palette } = useTheme();
 
-  // "Salary due" is the state that matters on this screen, so an overdue month
-  // outranks the plain paid/partial split the badge would otherwise show.
-  const meta =
-    item.matured_pending > 0
-      ? { color: palette.error, label: 'Salary Due' }
-      : item.period_count === 0
-      ? { color: palette.muted, label: 'No Months' }
-      : item.status === 'completed'
-      ? { color: palette.success, label: 'Cleared' }
-      : { color: palette.warning, label: 'Partial' };
+  const meta = workerBadge(item, palette);
 
+  // Paise left on an old month aren't "pending" — the badge already says so.
   const monthsLine =
-    item.pending_months.length === 0
+    !owed(item.matured_pending) || item.pending_months.length === 0
       ? null
       : item.pending_months.length === 1
       ? `Pending: ${item.pending_months[0]}`
@@ -364,7 +394,7 @@ function WorkerItem({ item }: { item: WorkerRow }) {
               <Text style={{ color: meta.color, fontWeight: '700', fontSize: fontSize.sm }}>{meta.label}</Text>
             </View>
             <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4 }}>
-              {item.matured_pending > 0 ? `${formatINR(item.matured_pending)} due` : formatINR(item.total_paid) + ' paid'}
+              {owed(item.matured_pending) ? `${formatINR(item.matured_pending)} due` : formatINR(item.total_paid) + ' paid'}
             </Text>
           </View>
         </View>

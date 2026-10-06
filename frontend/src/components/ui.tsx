@@ -179,9 +179,26 @@ interface DTProps {
   required?: boolean;
   testID?: string;
   error?: string;
+  /** 'date' drops the clock for fields that mean a day (joining, absence,
+   *  salary month) — the value is local midnight of the picked day. */
+  mode?: 'datetime' | 'date';
+  /** Last pickable day, inclusive — pass today to keep the field out of the future. */
+  maxDate?: Date;
+  /** First pickable day, inclusive. */
+  minDate?: Date;
 }
 
-export function DateTimeField({ label, value, onChange, required, testID, error }: DTProps) {
+const dayKey = (y: number, m: number, d: number) => y * 10000 + m * 100 + d;
+const dateKey = (d?: Date) => (d ? dayKey(d.getFullYear(), d.getMonth(), d.getDate()) : undefined);
+
+export function DateTimeField({ label, value, onChange, required, testID, error, mode = 'datetime', maxDate, minDate }: DTProps) {
+  const dateOnly = mode === 'date';
+  const maxKey = dateKey(maxDate);
+  const minKey = dateKey(minDate);
+  const outOfRange = (y: number, m: number, d: number) => {
+    const k = dayKey(y, m, d);
+    return (maxKey !== undefined && k > maxKey) || (minKey !== undefined && k < minKey);
+  };
   const { palette } = useTheme();
   const { width } = useWindowDimensions();
   const isLargeScreen = width > 680;
@@ -229,12 +246,19 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
     setOpen(true);
   };
 
+  // A stored value can sit outside today's bounds (an old future date, say) —
+  // the picker still opens on it, but won't confirm it until it's moved.
+  const selectionBlocked = outOfRange(selYear, selMonth, selDay);
+
   const handleConfirm = () => {
+    if (selectionBlocked) return;
     let hr24 = selHour12 % 12;
     if (selAmPm === 'PM') {
       hr24 += 12;
     }
-    const finalDate = new Date(selYear, selMonth, selDay, hr24, selMin, 0, 0);
+    const finalDate = dateOnly
+      ? new Date(selYear, selMonth, selDay, 0, 0, 0, 0)
+      : new Date(selYear, selMonth, selDay, hr24, selMin, 0, 0);
     onChange(finalDate.toISOString());
     setOpen(false);
   };
@@ -244,6 +268,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
     const dayStr = selDay.toString().padStart(2, '0');
     const monthStr = CAL_MONTHS[selMonth];
     const yearStr = selYear;
+    if (dateOnly) return `${dayStr} ${monthStr} ${yearStr}`;
     const hourStr = selHour12.toString().padStart(2, '0');
     const minStr = selMin.toString().padStart(2, '0');
     return `${dayStr} ${monthStr} ${yearStr}, ${hourStr}:${minStr} ${selAmPm}`;
@@ -273,9 +298,9 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
       isCurrentMonth: true,
     });
   }
-  // next month's leading days to complete grid (multiples of 7)
-  const gridRows = Math.ceil(calendarCells.length / 7);
-  const totalCells = gridRows * 7;
+  // next month's leading days — always six rows, so the sheet keeps one height
+  // and the month arrows stay under the thumb from one month to the next
+  const totalCells = 6 * 7;
   const nextDaysNeeded = totalCells - calendarCells.length;
   for (let i = 1; i <= nextDaysNeeded; i++) {
     calendarCells.push({
@@ -316,7 +341,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
   const minutesOptions = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55];
 
   // Selected date value string displayed in trigger text box
-  const displayVal = value ? isoToDisplay(value) : '';
+  const displayVal = value ? (dateOnly ? isoToDisplay(value).slice(0, 10) : isoToDisplay(value)) : '';
 
   return (
     <View style={{ marginBottom: spacing.md }}>
@@ -337,7 +362,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
       >
         <Ionicons name="calendar-outline" size={18} color={open ? palette.brand : palette.muted} style={{ marginRight: 8 }} />
         <Text style={{ flex: 1, color: displayVal ? palette.onSurface : palette.muted, fontSize: fontSize.lg }}>
-          {displayVal || 'Select Date & Time'}
+          {displayVal || (dateOnly ? 'Select Date' : 'Select Date & Time')}
         </Text>
         <Ionicons name="chevron-down" size={16} color={palette.muted} />
       </Pressable>
@@ -359,7 +384,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
             borderRadius: isLargeScreen ? 24 : 0,
             borderTopLeftRadius: 24,
             borderTopRightRadius: 24,
-            width: isLargeScreen ? 600 : '100%',
+            width: isLargeScreen ? (dateOnly ? 380 : 600) : '100%',
             maxWidth: '100%',
             overflow: 'hidden',
             shadowColor: '#000',
@@ -383,7 +408,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
             </LinearGradient>
 
             {/* Mobile Tab switchers (only if narrow screen) */}
-            {!isLargeScreen && (
+            {!isLargeScreen && !dateOnly && (
               <View style={{ flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: palette.border }}>
                 <Pressable
                   onPress={() => setActiveTab('date')}
@@ -427,7 +452,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
               style={{ maxHeight: 420 }}
             >
               {/* Date Column: visible on large screens or when active tab is 'date' on mobile */}
-              {(isLargeScreen || activeTab === 'date') && (
+              {(isLargeScreen || dateOnly || activeTab === 'date') && (
                 <View style={{ flex: 1, minWidth: 260 }}>
                   {/* Calendar Navigation */}
                   <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: yearPickerOpen ? spacing.sm : spacing.md }}>
@@ -493,9 +518,11 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
                   <View style={{ flexDirection: 'row', flexWrap: 'wrap' }}>
                     {calendarCells.map((cell, idx) => {
                       const isSelected = cell.day === selDay && cell.month === selMonth && cell.year === selYear;
+                      const disabled = outOfRange(cell.year, cell.month, cell.day);
                       return (
                         <Pressable
                           key={idx}
+                          disabled={disabled}
                           onPress={() => {
                             setSelDay(cell.day);
                             setSelMonth(cell.month);
@@ -525,6 +552,7 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
                               color: isSelected ? '#FFFFFF' : cell.isCurrentMonth ? palette.onSurface : palette.muted,
                               fontWeight: isSelected ? '700' : '400',
                               fontSize: fontSize.base,
+                              opacity: disabled ? 0.3 : 1,
                             }}>
                               {cell.day}
                             </Text>
@@ -537,12 +565,12 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
               )}
 
               {/* Vertical divider on Desktop */}
-              {isLargeScreen && (
+              {isLargeScreen && !dateOnly && (
                 <View style={{ width: 1, backgroundColor: palette.border, marginVertical: spacing.md }} />
               )}
 
               {/* Time Column: visible on large screens or when active tab is 'time' on mobile */}
-              {(isLargeScreen || activeTab === 'time') && (
+              {!dateOnly && (isLargeScreen || activeTab === 'time') && (
                 <View style={{ flex: 1, minWidth: 260 }}>
                   {/* Segmented AM/PM Toggle exactly like the image */}
                   <View style={{
@@ -691,16 +719,20 @@ export function DateTimeField({ label, value, onChange, required, testID, error 
               </Pressable>
               <Pressable
                 onPress={handleConfirm}
+                disabled={selectionBlocked}
                 style={{
                   flex: 2,
                   paddingVertical: 14,
                   borderRadius: radii.md,
                   backgroundColor: palette.brand,
                   alignItems: 'center',
+                  opacity: selectionBlocked ? 0.45 : 1,
                 }}
               >
                 <Text style={{ color: '#FFFFFF', fontWeight: '700' }}>
-                  Confirm — {selHour12.toString().padStart(2, '0')}:{selMin.toString().padStart(2, '0')} {selAmPm}
+                  {dateOnly
+                    ? `Confirm — ${formatPreview()}`
+                    : `Confirm — ${selHour12.toString().padStart(2, '0')}:${selMin.toString().padStart(2, '0')} ${selAmPm}`}
                 </Text>
               </Pressable>
             </View>
@@ -865,8 +897,10 @@ export function AlertModal({
   const isLargeScreen = width >= 700;
   const color = variant === 'success' ? palette.success : palette.error;
 
+  // No fade: while a fading dialog is on its way out it stops catching touches,
+  // so a quick second tap on "OK" landed on whatever button sat underneath.
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="none" onRequestClose={onClose}>
       <View style={{
         flex: 1,
         backgroundColor: 'rgba(0, 0, 0, 0.45)',

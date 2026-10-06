@@ -20,6 +20,7 @@ import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { AlertModal, Button, Card, ConfirmModal, DangerConfirmModal, EmptyState, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
 import { calendarDateToDisplay, calendarDateToLocalIso, isoToCalendarDate, isoToDisplay } from '@/src/utils/datetime';
+import { owed, wholeRupeeError, workerBadge } from '@/src/utils/workerStatus';
 
 interface Period {
   id: string;
@@ -79,22 +80,52 @@ interface SalaryPayment {
 
 const MODES = ['cash', 'upi', 'bank'];
 
-/** Month boundaries the way payroll means them: 1st 00:00 → last day 23:59. */
-function monthBounds(base: Date) {
-  const start = new Date(base.getFullYear(), base.getMonth(), 1, 0, 0, 0, 0);
-  const end = new Date(base.getFullYear(), base.getMonth() + 1, 0, 23, 59, 0, 0);
-  return { start: start.toISOString(), end: end.toISOString() };
+/** Must match _MAX_PERIOD_DAYS in backend/server.py. */
+const MAX_PERIOD_DAYS = 31;
+const DAY_MS = 24 * 3600 * 1000;
+
+/** Local midnight of a day. */
+const midnight = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+const todayLocal = () => midnight(new Date());
+/** Last day of the calendar month a day falls in. */
+const monthEnd = (d: Date) => new Date(d.getFullYear(), d.getMonth() + 1, 0);
+const daysInMonth = (d: Date) => monthEnd(d).getDate();
+/** Calendar days from a to b, both ends included — the server's divisor. */
+const spanDays = (a: Date, b: Date) => Math.round((midnight(b).getTime() - midnight(a).getTime()) / DAY_MS) + 1;
+const dmy = (d: Date) => calendarDateToDisplay(midnight(d).toISOString());
+
+/** What `days` off a month of `span` days costs — whole rupees, capped at the
+ *  month. Mirrors _days_cost in backend/server.py. */
+const daysCost = (total: number, span: number, days: number) =>
+  span > 0 && days > 0 ? Math.round(Math.min((total * days) / span, total)) : 0;
+
+/** The salary a stretch of days earns at a monthly rate: the full rate for a
+ *  whole month, prorated by the calendar month's length for a part one (the
+ *  first month after joining mid-month, say). */
+function proratedSalary(monthly: number, start: Date, end: Date): number {
+  const span = spanDays(start, end);
+  const full = daysInMonth(start);
+  if (span >= full) return monthly;
+  return Math.round((monthly * span) / full);
 }
 
-/** Spells out which months a part-payment actually settled. */
+/** Spells out which months a part-payment actually settled, and what is left —
+ *  telling an overdue balance apart from a month that simply hasn't ended.
+ *  Expects a worker that has been through settle(), so paise read as nothing. */
 function settlementSummary(paidLabel: string, allocs: AllocationLabel[], worker: any): string {
-  if (!allocs || allocs.length === 0) return `${paidLabel} recorded successfully.`;
-  const parts = allocs.map((a) => `${formatINR(a.amount)} to ${a.label}`).join(', ');
-  const tail =
-    worker && worker.matured_pending > 0
-      ? ` ${formatINR(worker.matured_pending)} is still pending${worker.oldest_pending_month ? ` from ${worker.oldest_pending_month}` : ''}.`
-      : ' All matured salary is now cleared.';
-  return `${paidLabel} recorded — ${parts}.${tail}`;
+  const parts = allocs && allocs.length
+    ? ` — ${allocs.map((a) => `${formatINR(a.amount)} to ${a.label}`).join(', ')}`
+    : '';
+  let tail: string;
+  if (worker && worker.matured_pending > 0) {
+    tail = ` ${formatINR(worker.matured_pending)} is still due${worker.oldest_pending_month ? ` from ${worker.oldest_pending_month}` : ''}.`;
+  } else if (worker && worker.upcoming_pending > 0) {
+    const when = worker.upcoming_matures_on ? ` on ${calendarDateToDisplay(worker.upcoming_matures_on)}` : '';
+    tail = ` Nothing is overdue. ${formatINR(worker.upcoming_pending)} is left for ${worker.upcoming_month || 'the current month'}, which falls due${when}.`;
+  } else {
+    tail = ' Every salary month is now fully paid.';
+  }
+  return `${paidLabel} recorded${parts}.${tail}`;
 }
 
 const r2 = (n: number) => Math.round(n * 100) / 100;
@@ -107,13 +138,50 @@ const r2 = (n: number) => Math.round(n * 100) / 100;
  *
  *  Absences are attributed to the month they start in, and the server already
  *  resolved that into `period_id` — so there is no date maths to repeat here. */
+/** Reads less than a rupee left on a month as paid, then rebuilds the
+ *  worker's owed totals from the months. Everything on this screen goes
+ *  through here, so no banner, message or button can quote "₹0 due". The
+ *  server does the same (_SETTLED_BELOW); this also covers a server that
+ *  predates it, and data paid to the paisa before deductions were rounded. */
+function settle(periods: Period[], worker: any) {
+  const nextPeriods: Period[] = periods.map((p) =>
+    owed(p.pending_amount)
+      ? p
+      : { ...p, pending_amount: 0, overdue_days: 0, status: 'completed' },
+  );
+  const byStart = (a: Period, b: Period) => a.start_date.localeCompare(b.start_date);
+  // Only a matured month can be owed — an in-progress one isn't late yet.
+  const overdue = nextPeriods.filter((p) => p.matured && p.pending_amount > 0).sort(byStart);
+  const running = nextPeriods.filter((p) => !p.matured && p.pending_amount > 0).sort(byStart)[0];
+  const totalPending = r2(nextPeriods.reduce((s, p) => s + p.pending_amount, 0));
+  const maturedPending = r2(overdue.reduce((s, p) => s + p.pending_amount, 0));
+
+  return {
+    periods: nextPeriods,
+    worker: worker && {
+      ...worker,
+      total_pending: totalPending,
+      matured_pending: maturedPending,
+      upcoming_pending: r2(Math.max(totalPending - maturedPending, 0)),
+      upcoming_month: running ? running.label : null,
+      upcoming_matures_on: running ? running.end_date : null,
+      status: !nextPeriods.length || !overdue.length
+        ? (nextPeriods.length ? 'completed' : 'pending')
+        : overdue.some((p) => p.paid_amount > 0) ? 'partial' : 'pending',
+      pending_months: overdue.map((p) => p.label),
+      oldest_pending_month: overdue.length ? overdue[0].label : null,
+      max_overdue_days: overdue.reduce((m, p) => Math.max(m, p.overdue_days), 0),
+    },
+  };
+}
+
 function rollUpSalary(periods: Period[], absences: Absence[], worker: any) {
   const nextPeriods = periods.map((p) => {
     const mine = absences.filter((a) => a.period_id === p.id);
     const deductedDays = r2(mine.reduce((s, a) => s + (a.deduct ? a.days : 0), 0));
     // Capped at the month's total, exactly as the server does, so payable can
     // never read negative while the request is in flight.
-    const deduction = r2(Math.min(p.per_day_wage * deductedDays, p.total_salary));
+    const deduction = daysCost(p.total_salary, p.days_in_period, deductedDays);
     const payable = r2(p.total_salary - deduction);
     return {
       ...p,
@@ -126,22 +194,15 @@ function rollUpSalary(periods: Period[], absences: Absence[], worker: any) {
   });
 
   const sum = (pick: (p: Period) => number) => r2(nextPeriods.reduce((s, p) => s + pick(p), 0));
-  // Only a matured month can be owed — an in-progress one isn't late yet.
-  const owed = nextPeriods.filter((p) => p.matured && p.pending_amount > 0);
   const totalDeduction = sum((p) => p.deduction);
-
+  const settled = settle(nextPeriods, worker);
   return {
-    periods: nextPeriods,
-    worker: worker && {
-      ...worker,
+    periods: settled.periods,
+    worker: settled.worker && {
+      ...settled.worker,
       total_deduction: totalDeduction,
       total_payable: r2(worker.total_salary - totalDeduction),
-      total_pending: sum((p) => p.pending_amount),
       deducted_days: sum((p) => p.deducted_days),
-      matured_pending: r2(owed.reduce((s, p) => s + p.pending_amount, 0)),
-      pending_months: owed.map((p) => p.label),
-      oldest_pending_month: owed.length ? owed[0].label : null,
-      max_overdue_days: owed.reduce((m, p) => Math.max(m, p.overdue_days), 0),
     },
   };
 }
@@ -176,6 +237,8 @@ export default function WorkerDetail() {
   const [mStart, setMStart] = useState('');
   const [mEnd, setMEnd] = useState('');
   const [mSalary, setMSalary] = useState('');
+  // Once the salary is typed by hand, changing the dates stops re-prorating it.
+  const [mSalaryTouched, setMSalaryTouched] = useState(false);
   const [mNote, setMNote] = useState('');
 
   // add/edit-absence form — a non-null editingAbsence switches it to edit mode
@@ -189,6 +252,9 @@ export default function WorkerDetail() {
   // The absence whose deduction is mid-flight, so its button can't be tapped twice.
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [modalErr, setModalErr] = useState('');
+  // Per-field complaints for whichever sheet is open — only one is at a time.
+  const [fieldErr, setFieldErr] = useState<Record<string, string | undefined>>({});
+  const clearField = (k: string) => setFieldErr((f) => (f[k] ? { ...f, [k]: undefined } : f));
   const [successMsg, setSuccessMsg] = useState('');
   const [confirmDeleteWorker, setConfirmDeleteWorker] = useState(false);
   const [confirmDeletePeriod, setConfirmDeletePeriod] = useState<Period | null>(null);
@@ -219,11 +285,12 @@ export default function WorkerDetail() {
         apiFetch<SalaryPayment[]>(`/workers/${id}/salary-payments`),
         apiFetch<Absence[]>(`/workers/${id}/absences`),
       ]);
-      setWorker(w);
-      setPeriods(p);
+      const settled = settle(p, w);
+      setWorker(settled.worker);
+      setPeriods(settled.periods);
       setPayments(pay);
       setAbsences(abs);
-      return w;
+      return settled.worker;
     } catch (e: any) {
       setLoadError(
         e?.message === 'Not Found'
@@ -243,9 +310,20 @@ export default function WorkerDetail() {
     [periods],
   );
 
+  /** What "oldest first" would settle right now: the overdue balance if there
+   *  is one, otherwise whatever is left on the month still running. */
+  const defaultPayAmount = () => {
+    if (!worker) return '';
+    const due = worker.matured_pending > 0 ? worker.matured_pending : worker.total_pending;
+    // Whole rupees, rounded down so the pre-fill never exceeds what is pending;
+    // the paise this leaves on an old month count as paid.
+    return due >= 1 ? String(Math.floor(due)) : '';
+  };
+
   const openPayModal = () => {
     setModalErr('');
-    setAmount('');
+    setFieldErr({});
+    setAmount(defaultPayAmount());
     setNote('');
     setMode('cash');
     setTargetPeriod('');
@@ -253,39 +331,136 @@ export default function WorkerDetail() {
     setShowPayModal(true);
   };
 
+  const pickPayTarget = (periodId: string) => {
+    setTargetPeriod(periodId);
+    const p = periods.find((x) => x.id === periodId);
+    setAmount(p ? String(Math.floor(p.pending_amount)) : defaultPayAmount());
+    clearField('amount');
+  };
+
   const closeMonthModal = () => {
     setShowMonthModal(false);
     setEditingPeriod(null);
   };
 
+  const joinDay = useMemo(
+    () => (worker?.join_date ? midnight(new Date(worker.join_date)) : null),
+    [worker?.join_date],
+  );
+
   const openMonthModal = (period?: Period) => {
     setModalErr('');
+    setFieldErr({});
     if (period) {
       setEditingPeriod(period);
       setMStart(calendarDateToLocalIso(period.start_date));
       setMEnd(calendarDateToLocalIso(period.end_date));
       setMSalary(String(period.total_salary));
+      setMSalaryTouched(true); // an existing month keeps its stored amount
       setMNote(period.note || '');
       setShowMonthModal(true);
       return;
     }
     setEditingPeriod(null);
-    // Default to the month after the latest recorded one, else the current month.
+    setMSalaryTouched(false);
+    // The day after the latest recorded month; with none yet, the joining day
+    // if they joined this month, else the 1st of this month.
     const latest = periods[0];
-    const base = latest ? new Date(new Date(latest.end_date).getTime() + 24 * 3600 * 1000) : new Date();
-    const { start, end } = monthBounds(base);
-    setMStart(start);
-    setMEnd(end);
-    setMSalary(worker?.monthly_salary ? String(worker.monthly_salary) : '');
+    const today = todayLocal();
+    let start: Date;
+    if (latest) {
+      start = midnight(new Date(new Date(calendarDateToLocalIso(latest.end_date)).getTime() + DAY_MS));
+    } else {
+      const firstOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+      start = joinDay && joinDay > firstOfMonth ? joinDay : firstOfMonth;
+    }
+    const end = monthEnd(start);
+    setMStart(start.toISOString());
+    setMEnd(end.toISOString());
+    setMSalary(worker?.monthly_salary ? String(proratedSalary(worker.monthly_salary, start, end)) : '');
     setMNote('');
     setShowMonthModal(true);
   };
 
+  /** A new start drags the end along to the end of that calendar month, so a
+   *  month can't silently stretch across four. When editing, the end only
+   *  moves if the old one no longer makes sense with the new start. */
+  const changeMonthStart = (iso: string) => {
+    setMStart(iso);
+    clearField('mStart');
+    clearField('mEnd');
+    const start = midnight(new Date(iso));
+    let end = mEnd ? midnight(new Date(mEnd)) : monthEnd(start);
+    if (!editingPeriod || end < start || spanDays(start, end) > MAX_PERIOD_DAYS) {
+      end = monthEnd(start);
+      setMEnd(end.toISOString());
+    }
+    if (!mSalaryTouched && worker?.monthly_salary) {
+      setMSalary(String(proratedSalary(worker.monthly_salary, start, end)));
+    }
+  };
+
+  const changeMonthEnd = (iso: string) => {
+    setMEnd(iso);
+    clearField('mEnd');
+    if (!mSalaryTouched && worker?.monthly_salary && mStart) {
+      setMSalary(String(proratedSalary(worker.monthly_salary, midnight(new Date(mStart)), midnight(new Date(iso)))));
+    }
+  };
+
+  /** The month form's problems, keyed by field. Same rules the server applies. */
+  const monthErrors = () => {
+    const errs: Record<string, string> = {};
+    const total = parseInt(mSalary, 10);
+    if (!mStart) errs.mStart = 'Pick the first day of the month';
+    if (!mEnd) errs.mEnd = 'Pick the last day of the month';
+    if (mStart && mEnd) {
+      const start = midnight(new Date(mStart));
+      const end = midnight(new Date(mEnd));
+      if (end < start) errs.mEnd = 'The end date is before the start date';
+      else if (spanDays(start, end) > MAX_PERIOD_DAYS) {
+        errs.mEnd = `That is ${spanDays(start, end)} days — a salary month can be at most ${MAX_PERIOD_DAYS}. Add each month separately.`;
+      }
+      if (joinDay && start < joinDay) {
+        errs.mStart = `${worker.name} joined on ${dmy(joinDay)} — start on or after that`;
+      } else if (start > todayLocal()) {
+        errs.mStart = 'This month has not started yet — add it once it begins';
+      }
+    }
+    if (!mSalary) errs.mSalary = 'Enter the salary for this month';
+    else if (wholeRupeeError(mSalary)) errs.mSalary = wholeRupeeError(mSalary)!;
+    else if (!total || total <= 0) errs.mSalary = 'Enter a salary above ₹0';
+    return errs;
+  };
+
+  /** The month's length and day rate, shown live under the dates. */
+  const monthPreview = useMemo(() => {
+    if (!mStart || !mEnd) return null;
+    const start = midnight(new Date(mStart));
+    const end = midnight(new Date(mEnd));
+    if (end < start) return null;
+    const span = spanDays(start, end);
+    const total = parseInt(mSalary, 10) || 0;
+    return { span, perDay: span > 0 ? total / span : 0, full: daysInMonth(start) };
+  }, [mStart, mEnd, mSalary]);
+
   const submitPayment = async () => {
     setModalErr('');
-    const amt = parseFloat(amount);
-    if (!amt || amt <= 0) { setModalErr('Enter a valid amount'); return; }
-    if (!payDate) { setModalErr('Please select a payment date'); return; }
+    const amt = parseInt(amount, 10);
+    const target = periods.find((p) => p.id === targetPeriod);
+    // Whole rupees can only ever settle the rupee part of what is pending.
+    const capacity = Math.floor((target ? target.pending_amount : worker.total_pending) + 0.0001);
+    const errs: Record<string, string> = {};
+    const rupeeErr = wholeRupeeError(amount);
+    if (rupeeErr) errs.amount = rupeeErr;
+    else if (!amt || amt <= 0) errs.amount = 'Enter the amount paid';
+    else if (amt > capacity) {
+      errs.amount = `That is more than the ${formatINR(capacity)} pending${target ? ` for ${target.label}` : ''}`;
+    }
+    if (!payDate) errs.payDate = 'Pick the payment date';
+    else if (new Date(payDate) > new Date()) errs.payDate = 'Payment date cannot be in the future';
+    setFieldErr(errs);
+    if (Object.keys(errs).length) return;
     setSubmitting(true);
     try {
       const res = await apiFetch<any>(`/workers/${id}/salary-payments`, {
@@ -299,10 +474,15 @@ export default function WorkerDetail() {
         }),
       });
       setShowPayModal(false);
-      await load();
-      setSuccessMsg(settlementSummary(formatINR(amt), res.allocation_labels, res.worker));
+      // The reloaded worker, not res.worker: it has been through settle(), so
+      // paise left on an old month don't come back as "₹0 is still due".
+      const fresh = await load();
+      setSuccessMsg(settlementSummary(formatINR(amt), res.allocation_labels, fresh || res.worker));
     } catch (e: any) {
-      setModalErr(e.message);
+      const msg = e.message || '';
+      if (/pending|amount/i.test(msg)) setFieldErr({ amount: msg });
+      else if (/payment date/i.test(msg)) setFieldErr({ payDate: msg });
+      else setModalErr(msg);
     } finally {
       setSubmitting(false);
     }
@@ -310,9 +490,10 @@ export default function WorkerDetail() {
 
   const submitMonth = async () => {
     setModalErr('');
-    const total = parseFloat(mSalary);
-    if (!mStart || !mEnd) { setModalErr('Select both the start and end date of the salary month'); return; }
-    if (!total || total <= 0) { setModalErr('Enter a valid total salary for this month'); return; }
+    const total = parseInt(mSalary, 10);
+    const errs = monthErrors();
+    setFieldErr(errs);
+    if (Object.keys(errs).length) return;
     setSubmitting(true);
     try {
       // Calendar dates, not instants — otherwise a month picked in IST is
@@ -335,7 +516,11 @@ export default function WorkerDetail() {
           : `Salary month ${saved.label} added for ${formatINR(total)}.`,
       );
     } catch (e: any) {
-      setModalErr(e.message);
+      const msg = e.message || '';
+      if (/joined|start in the future/i.test(msg)) setFieldErr({ mStart: msg });
+      else if (/at most|end date|overlaps/i.test(msg)) setFieldErr({ mEnd: msg });
+      else if (/salary|paid/i.test(msg)) setFieldErr({ mSalary: msg });
+      else setModalErr(msg);
     } finally {
       setSubmitting(false);
     }
@@ -348,6 +533,7 @@ export default function WorkerDetail() {
 
   const openAbsenceModal = (absence?: Absence) => {
     setModalErr('');
+    setFieldErr({});
     if (absence) {
       setEditingAbsence(absence);
       setADate(calendarDateToLocalIso(absence.date));
@@ -358,7 +544,7 @@ export default function WorkerDetail() {
       return;
     }
     setEditingAbsence(null);
-    setADate(new Date().toISOString());
+    setADate(todayLocal().toISOString());
     setADays('1');
     setAReason('');
     setADeduct(true);
@@ -377,22 +563,60 @@ export default function WorkerDetail() {
     }) || null;
   }, [aDate, periods]);
 
-  const absenceCost = useMemo(() => {
+  /** Problems with the date and day count, live — the same rules the server
+   *  applies, so the preview never quotes an amount for an entry that won't save. */
+  const absenceFieldErrors = useMemo(() => {
+    const errs: Record<string, string> = {};
     const d = parseFloat(aDays);
-    if (!absenceHostPeriod || !d || d <= 0) return 0;
-    return Math.round(absenceHostPeriod.per_day_wage * d * 100) / 100;
-  }, [absenceHostPeriod, aDays]);
+    if (!aDays) errs.aDays = 'Enter how many days were missed';
+    else if (!d || d <= 0) errs.aDays = 'Days must be more than zero';
+    else if (d > 31) errs.aDays = 'One entry can cover at most 31 days — split a longer absence';
+    else if (Math.round(d * 2) !== d * 2) errs.aDays = 'Use a whole number or a half — for example 1 or 1.5';
+    if (!aDate) errs.aDate = 'Pick the first day absent';
+    else {
+      const start = midnight(new Date(aDate));
+      const today = todayLocal();
+      if (joinDay && start < joinDay) errs.aDate = `${worker?.name} joined on ${dmy(joinDay)}`;
+      else if (start > today) errs.aDate = 'Absences can only be recorded for days already gone';
+      else if (!errs.aDays) {
+        const last = new Date(start.getTime() + (Math.ceil(d) - 1) * DAY_MS);
+        if (midnight(last) > today) {
+          errs.aDays = `${Math.ceil(d)} days from ${dmy(start)} runs to ${dmy(last)}, past today`;
+        }
+      }
+    }
+    return errs;
+  }, [aDate, aDays, joinDay, worker?.name]);
+
+  /** What saving would do to the host month: this entry's own cost, and
+   *  whether the month would drop below what has already been paid for it. */
+  const absencePreview = useMemo(() => {
+    const host = absenceHostPeriod;
+    const d = parseFloat(aDays);
+    if (!host || absenceFieldErrors.aDays || absenceFieldErrors.aDate || !d) return null;
+    const otherDays = absences
+      .filter((x) => x.period_id === host.id && x.deduct && x.id !== editingAbsence?.id)
+      .reduce((sum, x) => sum + x.days, 0);
+    const before = daysCost(host.total_salary, host.days_in_period, otherDays);
+    const after = daysCost(host.total_salary, host.days_in_period, otherDays + (aDeduct ? d : 0));
+    const payable = host.total_salary - after;
+    return {
+      cost: after - before,
+      payable,
+      // Once the month is used up, further days cost nothing more.
+      capped: aDeduct && after >= host.total_salary,
+      overpaid: payable + 0.0001 < host.paid_amount,
+    };
+  }, [absenceHostPeriod, aDays, aDeduct, absences, editingAbsence, absenceFieldErrors]);
 
   const submitAbsence = async () => {
     setModalErr('');
     const days = parseFloat(aDays);
-    if (!aDate) { setModalErr('Select the date the worker was absent'); return; }
-    if (!days || days <= 0) { setModalErr('Enter how many days were missed'); return; }
-    if (!aReason.trim()) { setModalErr('Enter why the worker was absent'); return; }
-    if (Math.round(days * 2) !== days * 2) {
-      setModalErr('Days must be a whole number or a half — for example 1 or 1.5');
-      return;
-    }
+    const errs: Record<string, string> = { ...absenceFieldErrors };
+    if (!aReason.trim()) errs.aReason = 'Enter why the worker was absent';
+    setFieldErr(errs);
+    if (Object.keys(errs).length) return;
+    if (absencePreview?.overpaid) return; // the preview already says why
     setSubmitting(true);
     try {
       // A calendar date, not an instant, for the same reason salary months are:
@@ -418,7 +642,10 @@ export default function WorkerDetail() {
           : `${dayWord} absent from ${calendarDateToDisplay(saved.date)} recorded as paid leave — the salary is unchanged.`,
       );
     } catch (e: any) {
-      setModalErr(e.message);
+      const msg = e.message || '';
+      if (/joined|already recorded|days already gone/i.test(msg)) setFieldErr({ aDate: msg });
+      else if (/31 days|whole number|half|days must/i.test(msg)) setFieldErr({ aDays: msg });
+      else setModalErr(msg);
     } finally {
       setSubmitting(false);
     }
@@ -437,9 +664,10 @@ export default function WorkerDetail() {
     const next = !a.deduct;
     const previous = { worker, periods, absences };
 
+    const host = periods.find((p) => p.id === a.period_id);
     const nextAbsences = absences.map((x) =>
       x.id === a.id
-        ? { ...x, deduct: next, deduction_amount: next ? r2(x.per_day_wage * x.days) : 0 }
+        ? { ...x, deduct: next, deduction_amount: next && host ? daysCost(host.total_salary, host.days_in_period, x.days) : 0 }
         : x,
     );
     const rolled = rollUpSalary(periods, nextAbsences, worker);
@@ -568,7 +796,11 @@ export default function WorkerDetail() {
     );
   }
 
-  const dueColor = worker.matured_pending > 0 ? palette.error : palette.success;
+  const badge = workerBadge(worker, palette);
+  const inactive = worker.active === false;
+  // Nothing to settle means nothing to pay — the server would only refuse it.
+  // settle() has already zeroed paise, so anything left here is at least ₹1.
+  const canPay = worker.total_pending > 0;
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
@@ -604,16 +836,28 @@ export default function WorkerDetail() {
                 {(worker.designation || 'Worker')} · {formatINR(worker.monthly_salary)}/month
               </Text>
             </View>
-            <View style={{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: radii.pill, backgroundColor: dueColor + '22' }}>
-              <Text style={{ color: dueColor, fontWeight: '700', fontSize: fontSize.sm }}>
-                {worker.matured_pending > 0 ? 'Salary Due' : 'Cleared'}
-              </Text>
+            <View style={{ alignItems: 'flex-end', gap: 4 }}>
+              <View style={{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: radii.pill, backgroundColor: badge.color + '22' }}>
+                <Text style={{ color: badge.color, fontWeight: '700', fontSize: fontSize.sm }}>{badge.label}</Text>
+              </View>
+              {inactive ? (
+                <View style={{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: radii.pill, backgroundColor: palette.muted + '22' }}>
+                  <Text style={{ color: palette.muted, fontWeight: '700', fontSize: fontSize.sm }}>Inactive</Text>
+                </View>
+              ) : null}
             </View>
           </View>
 
+          {inactive ? (
+            <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: spacing.md }}>
+              {`${worker.name} is marked inactive, so new salary months and absences can't be added.`}
+              {canPay ? ' Pending salary can still be paid to settle up.' : ''}
+            </Text>
+          ) : null}
+
           <View style={{ marginTop: spacing.lg, gap: 6 }}>
             <InfoRow icon="call" label="Mobile" value={worker.mobile || '—'} />
-            <InfoRow icon="calendar" label="Joined" value={isoToDisplay(worker.join_date) || '—'} />
+            <InfoRow icon="calendar" label="Joined" value={worker.join_date ? dmy(new Date(worker.join_date)) : '—'} />
             <InfoRow icon="time" label="Last Paid" value={isoToDisplay(worker.last_payment_date) || 'Never'} />
             <InfoRow icon="layers" label="Months" value={`${worker.period_count} salary month${worker.period_count === 1 ? '' : 's'} recorded`} />
             <InfoRow
@@ -649,6 +893,14 @@ export default function WorkerDetail() {
               <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.warning }}>{formatINR(worker.total_pending)}</Text>
             </View>
           </View>
+
+          {worker.upcoming_pending > 0 ? (
+            <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: spacing.sm }}>
+              {worker.matured_pending > 0 ? `${formatINR(worker.matured_pending)} due now · ` : 'Nothing due now · '}
+              {formatINR(worker.upcoming_pending)} for {worker.upcoming_month || 'the current month'}
+              {worker.upcoming_matures_on ? `, due ${calendarDateToDisplay(worker.upcoming_matures_on)}` : ''}
+            </Text>
+          ) : null}
 
           {worker.total_deduction > 0 ? (
             <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: spacing.sm }}>
@@ -689,7 +941,12 @@ export default function WorkerDetail() {
 
         <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: spacing.xl, marginBottom: spacing.md }}>
           <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>Salary Months</Text>
-          <Pressable onPress={() => openMonthModal()} testID="add-salary-month" style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <Pressable
+            onPress={() => openMonthModal()}
+            disabled={inactive}
+            testID="add-salary-month"
+            style={{ flexDirection: 'row', alignItems: 'center', opacity: inactive ? 0.4 : 1 }}
+          >
             <Ionicons name="add-circle" size={18} color={palette.brand} />
             <Text style={{ color: palette.brand, fontWeight: '700', marginLeft: 4 }}>Add Month</Text>
           </Pressable>
@@ -724,7 +981,12 @@ export default function WorkerDetail() {
                 : 'Days the worker did not come to work'}
             </Text>
           </View>
-          <Pressable onPress={() => openAbsenceModal()} testID="add-absence" style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <Pressable
+            onPress={() => openAbsenceModal()}
+            disabled={inactive}
+            testID="add-absence"
+            style={{ flexDirection: 'row', alignItems: 'center', opacity: inactive ? 0.4 : 1 }}
+          >
             <Ionicons name="add-circle" size={18} color={palette.brand} />
             <Text style={{ color: palette.brand, fontWeight: '700', marginLeft: 4 }}>Add Absence</Text>
           </Pressable>
@@ -850,7 +1112,13 @@ export default function WorkerDetail() {
       </ScrollView>
 
       <View style={{ position: 'absolute', left: 0, right: 0, bottom: 0, padding: spacing.lg, backgroundColor: palette.surfaceSecondary, borderTopWidth: 1, borderTopColor: palette.border }}>
-        <Button title="Pay Salary" icon="cash-outline" onPress={openPayModal} testID="pay-salary-btn" />
+        <Button
+          title={canPay ? 'Pay Salary' : periods.length ? 'Nothing pending to pay' : 'Add a salary month to pay'}
+          icon="cash-outline"
+          onPress={openPayModal}
+          disabled={!canPay}
+          testID="pay-salary-btn"
+        />
       </View>
 
       {/* ── Pay salary ────────────────────────────────────── */}
@@ -865,8 +1133,9 @@ export default function WorkerDetail() {
               <TextField
                 label="Amount (₹) *"
                 value={amount}
-                onChangeText={(t) => setAmount(t.replace(/[^0-9.]/g, ''))}
-                keyboardType="numeric"
+                onChangeText={(t) => { setAmount(t.replace(/[^0-9.]/g, '')); clearField('amount'); }}
+                keyboardType="number-pad"
+                error={fieldErr.amount || wholeRupeeError(amount)}
                 testID="salary-amount"
               />
 
@@ -874,7 +1143,7 @@ export default function WorkerDetail() {
               <View style={{ gap: 8, marginBottom: spacing.md }}>
                 <Pressable
                   testID="salary-target-auto"
-                  onPress={() => setTargetPeriod('')}
+                  onPress={() => pickPayTarget('')}
                   style={{
                     padding: 12,
                     borderRadius: radii.md,
@@ -897,7 +1166,7 @@ export default function WorkerDetail() {
                     <Pressable
                       key={p.id}
                       testID={`salary-target-${p.id}`}
-                      onPress={() => setTargetPeriod(p.id)}
+                      onPress={() => pickPayTarget(p.id)}
                       style={{
                         padding: 12,
                         borderRadius: radii.md,
@@ -908,14 +1177,23 @@ export default function WorkerDetail() {
                     >
                       <Text style={{ color: on ? '#fff' : palette.onSurface, fontWeight: '700' }}>{p.label} only</Text>
                       <Text style={{ color: on ? '#ffffffcc' : palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>
-                        {formatINR(p.pending_amount)} pending of {formatINR(p.total_salary)}
+                        {formatINR(p.pending_amount)} pending of {formatINR(p.payable_salary)} payable
+                        {p.matured ? '' : ' · month in progress'}
                       </Text>
                     </Pressable>
                   );
                 })}
               </View>
 
-              <DateTimeField label="Payment Date & Time" value={payDate} onChange={setPayDate} required testID="salary-date" />
+              <DateTimeField
+                label="Payment Date & Time"
+                value={payDate}
+                onChange={(v) => { setPayDate(v); clearField('payDate'); }}
+                maxDate={todayLocal()}
+                error={fieldErr.payDate}
+                required
+                testID="salary-date"
+              />
 
               <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>Mode</Text>
               <View style={{ flexDirection: 'row', gap: 8, marginBottom: spacing.md }}>
@@ -961,15 +1239,44 @@ export default function WorkerDetail() {
                   : 'The salary matures on the end date — only then does it show as pending.'}
               </Text>
 
-              <DateTimeField label="Month Start Date" value={mStart} onChange={setMStart} required testID="month-start" />
-              <DateTimeField label="Month End Date (salary matures)" value={mEnd} onChange={setMEnd} required testID="month-end" />
+              <DateTimeField
+                label="Month Start Date"
+                mode="date"
+                value={mStart}
+                onChange={changeMonthStart}
+                minDate={joinDay || undefined}
+                maxDate={todayLocal()}
+                error={fieldErr.mStart}
+                required
+                testID="month-start"
+              />
+              <DateTimeField
+                label="Month End Date (salary matures)"
+                mode="date"
+                value={mEnd}
+                onChange={changeMonthEnd}
+                minDate={mStart ? midnight(new Date(mStart)) : undefined}
+                maxDate={mStart ? new Date(midnight(new Date(mStart)).getTime() + (MAX_PERIOD_DAYS - 1) * DAY_MS) : undefined}
+                error={fieldErr.mEnd}
+                required
+                testID="month-end"
+              />
               <TextField
                 label="Total Salary for this month (₹) *"
                 value={mSalary}
-                onChangeText={(t) => setMSalary(t.replace(/[^0-9.]/g, ''))}
-                keyboardType="numeric"
+                onChangeText={(t) => { setMSalary(t.replace(/[^0-9.]/g, '')); setMSalaryTouched(true); clearField('mSalary'); }}
+                keyboardType="number-pad"
+                error={fieldErr.mSalary || wholeRupeeError(mSalary)}
                 testID="month-salary"
               />
+              {monthPreview && !fieldErr.mSalary && !wholeRupeeError(mSalary) ? (
+                <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -8, marginBottom: spacing.md }}>
+                  {monthPreview.span} day{monthPreview.span === 1 ? '' : 's'} · {formatINR(monthPreview.perDay)} a day
+                  {!editingPeriod && !mSalaryTouched && monthPreview.span < monthPreview.full && worker.monthly_salary
+                    ? ` · prorated from ${formatINR(worker.monthly_salary)} for ${monthPreview.span} of ${monthPreview.full} days`
+                    : ''}
+                </Text>
+              ) : null}
               <TextField label="Note (optional)" value={mNote} onChangeText={setMNote} testID="month-note" />
               <Button
                 title={editingPeriod ? 'Save Changes' : 'Add Month'}
@@ -998,20 +1305,37 @@ export default function WorkerDetail() {
                 Record the days {worker.name} did not come to work. The salary only changes if you switch the deduction on below.
               </Text>
 
-              <DateTimeField label="First day absent" value={aDate} onChange={setADate} required testID="absence-date" />
+              <DateTimeField
+                label="First day absent"
+                mode="date"
+                value={aDate}
+                onChange={(v) => { setADate(v); clearField('aDate'); }}
+                minDate={joinDay || undefined}
+                maxDate={todayLocal()}
+                error={fieldErr.aDate || absenceFieldErrors.aDate}
+                required
+                testID="absence-date"
+              />
 
               <TextField
                 label="How many days? *"
                 value={aDays}
-                onChangeText={(t) => setADays(t.replace(/[^0-9.]/g, ''))}
+                onChangeText={(t) => { setADays(t.replace(/[^0-9.]/g, '')); clearField('aDays'); }}
                 keyboardType="numeric"
+                error={fieldErr.aDays || absenceFieldErrors.aDays}
                 testID="absence-days"
               />
               <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -8, marginBottom: spacing.md }}>
                 Use 0.5 for a half day. Consecutive days go in as one entry.
               </Text>
 
-              <TextField label="Reason *" value={aReason} onChangeText={setAReason} testID="absence-reason" />
+              <TextField
+                label="Reason *"
+                value={aReason}
+                onChangeText={(t) => { setAReason(t); clearField('aReason'); }}
+                error={fieldErr.aReason}
+                testID="absence-reason"
+              />
 
               <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>Deduct from salary?</Text>
               <View style={{ flexDirection: 'row', gap: 8, marginBottom: spacing.md }}>
@@ -1044,17 +1368,32 @@ export default function WorkerDetail() {
 
               {/* What this actually costs, quoted before it is saved. */}
               <View style={{ backgroundColor: palette.surfaceTertiary, borderRadius: radii.md, padding: spacing.md, marginBottom: spacing.md }}>
-                {absenceHostPeriod ? (
+                {absenceFieldErrors.aDate || absenceFieldErrors.aDays ? (
+                  <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm }}>
+                    Fix the date and days above to see what this costs.
+                  </Text>
+                ) : absenceHostPeriod && absencePreview ? (
                   <>
                     <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm }}>
                       {absenceHostPeriod.label} · {formatINR(absenceHostPeriod.total_salary)} over {absenceHostPeriod.days_in_period} days
                       {' = '}{formatINR(absenceHostPeriod.per_day_wage)} a day
                     </Text>
-                    <Text style={{ color: aDeduct ? palette.error : palette.success, fontWeight: '700', marginTop: 4 }}>
+                    <Text style={{ color: absencePreview.overpaid ? palette.error : aDeduct ? palette.error : palette.success, fontWeight: '700', marginTop: 4 }}>
                       {aDeduct
-                        ? `${formatINR(absenceCost)} will come off ${absenceHostPeriod.label}`
-                        : `Nothing comes off — ${absenceHostPeriod.label} stays at ${formatINR(absenceHostPeriod.payable_salary)}`}
+                        ? `${formatINR(absencePreview.cost)} will come off ${absenceHostPeriod.label}, leaving ${formatINR(absencePreview.payable)} payable`
+                        : `Nothing comes off — ${absenceHostPeriod.label} stays at ${formatINR(absencePreview.payable)}`}
                     </Text>
+                    {absencePreview.capped && !absencePreview.overpaid ? (
+                      <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: 4 }}>
+                        That uses up the whole month — the deduction stops at its full salary.
+                      </Text>
+                    ) : null}
+                    {absencePreview.overpaid ? (
+                      <Text style={{ color: palette.error, fontSize: fontSize.sm, marginTop: 4 }}>
+                        {formatINR(absenceHostPeriod.paid_amount)} is already paid for {absenceHostPeriod.label}, more than it would be worth.
+                        {` Choose "Don't deduct", or remove a payment first.`}
+                      </Text>
+                    ) : null}
                   </>
                 ) : (
                   <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm }}>
@@ -1067,6 +1406,7 @@ export default function WorkerDetail() {
                 title={editingAbsence ? 'Save Changes' : 'Add Absence'}
                 onPress={submitAbsence}
                 loading={submitting}
+                disabled={!!absencePreview?.overpaid}
                 testID="absence-save"
               />
               <View style={{ height: spacing.sm }} />

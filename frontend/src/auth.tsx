@@ -23,8 +23,12 @@ function extractErrorMessage(data: any, fallback: string): string {
         if (typeof d === 'string') return d;
         const loc = Array.isArray(d?.loc) ? d.loc : [];
         const field = loc.length ? String(loc[loc.length - 1]).replace(/_/g, ' ') : '';
-        const msg = String(d?.msg || 'Invalid value').replace(/^Value error,\s*/, '');
-        return field ? `${field}: ${msg}` : msg;
+        const raw = String(d?.msg || 'Invalid value');
+        // Our own validators already write a full sentence ("A single absence
+        // cannot be longer than 31 days") — prefixing the field name to those
+        // only leaks the API's naming into the UI.
+        if (/^Value error,/.test(raw)) return raw.replace(/^Value error,\s*/, '');
+        return field ? `${field}: ${raw}` : raw;
       })
       .join('; ');
   }

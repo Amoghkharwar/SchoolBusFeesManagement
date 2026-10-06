@@ -7,7 +7,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { AlertModal, Button, TextField, DateTimeField } from '@/src/components/ui';
-import { wholeRupeeError } from '@/src/utils/workerStatus';
+import { wholeRupeeError } from '@/src/utils/format';
 
 type FieldKey = 'name' | 'mobile' | 'salary' | 'joinDate';
 

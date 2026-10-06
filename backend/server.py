@@ -281,8 +281,26 @@ async def push_report(title: str, body: str, url: str = "/") -> Dict[str, Any]:
     return {"sent": sent, "total": len(subs), "errors": errors}
 
 
-async def send_push_to_all(title: str, body: str, url: str = "/") -> int:
-    return (await push_report(title, body, url))["sent"]
+# Pushes in flight. The event loop only keeps weak references to tasks, so one
+# nobody holds can be garbage-collected halfway through delivery.
+_push_tasks: "set[Any]" = set()
+
+
+async def send_push_to_all(title: str, body: str, url: str = "/") -> None:
+    """Sends in the background. Saving a school or student used to wait on every
+    device's push service (up to 10 s each) before it answered, which is most of
+    why a save took 6–8 seconds. Nothing the save returns depends on delivery."""
+    import asyncio
+
+    async def run() -> None:
+        try:
+            await push_report(title, body, url)
+        except Exception as e:  # never let a notification failure surface anywhere
+            logger.warning("Background push '%s' failed: %s", title, e)
+
+    task = asyncio.create_task(run())
+    _push_tasks.add(task)
+    task.add_done_callback(_push_tasks.discard)
 
 
 # ---------- Financial Year (Indian Default: April → March) ----------
@@ -403,6 +421,36 @@ class SchoolIn(BaseModel):
     fy_start_month: Optional[int] = 4  # 1-12 (e.g. 3=March for JB School, 4=April default, 5=May for DSilva School)
     fy_end_month: Optional[int] = 3    # 1-12 (e.g. 2=Feb for JB School, 3=March default, 6=June for DSilva School)
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        name = " ".join((v or "").split())
+        if not name:
+            raise ValueError("School name is required")
+        return name
+
+    @field_validator("contact_phone")
+    @classmethod
+    def validate_contact_phone(cls, v: Optional[str]) -> str:
+        """Optional, but a real number when given. A school's office line is
+        often a landline, so any 10 digits with the STD code count — not only
+        a mobile the way the parent and worker numbers must be."""
+        raw = (v or "").strip()
+        if not raw:
+            return ""
+        digits = re.sub(r"[\s\-()]", "", raw)
+        if digits.startswith("+91"):
+            digits = digits[3:]
+        elif digits.startswith("91") and len(digits) == 12:
+            digits = digits[2:]
+        elif digits.startswith("0") and len(digits) == 11:
+            digits = digits[1:]
+        if not re.fullmatch(r"[1-9]\d{9}", digits):
+            raise ValueError(
+                "Contact phone must be a 10-digit number — a mobile, or a landline with its STD code"
+            )
+        return digits
+
 
 class StudentIn(BaseModel):
     name: str
@@ -418,6 +466,20 @@ class StudentIn(BaseModel):
     # Service start within the current financial year.
     start_date: Optional[str] = None
     due_date: str  # first due date of the year; later ones follow payments
+    # Off when the student has left. The record and its payments stay; the
+    # student just drops out of the due/overdue lists and reminders. Deleting
+    # was the only option before, and it took the payment history with it.
+    active: Optional[bool] = True
+
+    @field_validator("yearly_fee")
+    @classmethod
+    def validate_yearly_fee(cls, v: float) -> float:
+        # ₹0 is a real fee: a free or scholarship seat rides the bus too.
+        if v == 0:
+            return 0.0
+        if v is not None and v < 0:
+            raise ValueError("Yearly fee can't be negative — use 0 for a free or scholarship student")
+        return _whole_rupees(v, "Yearly fee")
 
     @field_validator("parent_mobile")
     @classmethod
@@ -440,6 +502,11 @@ class PaymentIn(BaseModel):
     mode: str  # cash / upi / bank
     note: Optional[str] = ""
     next_due_date: Optional[str] = None  # ISO datetime — next fee due
+
+    @field_validator("amount")
+    @classmethod
+    def validate_amount(cls, v: float) -> float:
+        return _whole_rupees(v, "Amount")
 
 
 def _whole_rupees(v: float, what: str) -> float:
@@ -534,11 +601,23 @@ class WorkerAbsenceIn(BaseModel):
 
 # ---------- Helpers ----------
 def compute_status(yearly: float, paid: float) -> str:
+    if yearly <= 0:
+        return "completed"  # free / scholarship — nothing is ever owed
     if paid <= 0:
         return "pending"
-    if paid + 0.0001 >= yearly:
+    # Less than a rupee left is paid: fees are whole rupees, and a fee that
+    # still carries paise (₹12,000.50) is settled by the rupees shown for it.
+    if yearly - paid < 1:
         return "completed"
     return "partial"
+
+
+def _fee_pending(yearly: float, paid: float) -> float:
+    """What is still owed on a fee, in whole rupees — the amount the screen
+    shows and the most a payment may be. Rounded down, so ₹7,000.50 left reads
+    ₹7,000, and paying that ₹7,000 clears the fee."""
+    remaining = float(yearly) - float(paid)
+    return float(math.floor(remaining + 1e-6)) if remaining >= 1 else 0.0
 
 
 async def student_to_out(doc: Dict[str, Any], fy: Optional[str] = None) -> Dict[str, Any]:
@@ -563,15 +642,19 @@ async def student_to_out(doc: Dict[str, Any], fy: Optional[str] = None) -> Dict[
         if last.get("next_due_date"):
             next_due = last["next_due_date"]
     overdue_days = 0
+    if status_ == "completed":
+        # Nothing left to fall due — a fully paid fee kept showing the year's
+        # first due date as "Next Due".
+        next_due = None
     nd = _parse_dt(next_due)
-    if nd and status_ != "completed":
+    if nd:
         delta = (datetime.now(timezone.utc) - nd).days
         overdue_days = max(delta, 0)
     return {
         **{k: v for k, v in doc.items() if k != "_id"},
         "school_name": (school or {}).get("name", "—"),
         "paid_amount": round(paid, 2),
-        "pending_amount": round(max(yearly - paid, 0), 2),
+        "pending_amount": _fee_pending(yearly, paid),
         "status": status_,
         "last_payment_date": last_payment_date,
         "next_due_date": next_due,
@@ -753,8 +836,21 @@ async def list_schools(admin=Depends(get_current_admin)):
     return out
 
 
+async def _check_school_name(name: str, school_id: Optional[str] = None) -> None:
+    """One school per name, ignoring case and spacing — "jb school" is the
+    "JB School" already on the list, not a second school."""
+    pattern = r"^\s*" + r"\s+".join(re.escape(w) for w in name.split()) + r"\s*$"
+    query: Dict[str, Any] = {"name": {"$regex": pattern, "$options": "i"}}
+    if school_id:
+        query["id"] = {"$ne": school_id}
+    clash = await db.schools.find_one(query, {"_id": 0, "name": 1})
+    if clash:
+        raise HTTPException(400, f"{clash['name']} is already added")
+
+
 @api.post("/schools")
 async def create_school(body: SchoolIn, admin=Depends(get_current_admin)):
+    await _check_school_name(body.name)
     doc = {**body.model_dump(), "id": str(uuid.uuid4()), "created_at": now_iso()}
     await db.schools.insert_one(dict(doc))
     actor = admin.get("full_name") or admin.get("email") or "Someone"
@@ -772,6 +868,7 @@ async def get_school(school_id: str, admin=Depends(get_current_admin)):
 
 @api.put("/schools/{school_id}")
 async def update_school(school_id: str, body: SchoolIn, admin=Depends(get_current_admin)):
+    await _check_school_name(body.name, school_id)
     res = await db.schools.update_one({"id": school_id}, {"$set": body.model_dump()})
     if res.matched_count == 0:
         raise HTTPException(404, "School not found")
@@ -779,7 +876,7 @@ async def update_school(school_id: str, body: SchoolIn, admin=Depends(get_curren
 
 
 @api.delete("/schools/{school_id}")
-async def delete_school(school_id: str, admin=Depends(get_current_admin)):
+async def delete_school(school_id: str, _=Depends(require_cap("delete"))):
     students = await db.students.find({"school_id": school_id}, {"id": 1, "_id": 0}).to_list(10000)
     sids = [s["id"] for s in students]
     if sids:
@@ -798,11 +895,16 @@ async def list_students(
     standard: Optional[str] = None,
     due: Optional[str] = None,
     fy: Optional[str] = None,
+    active: Optional[bool] = None,
     admin=Depends(get_current_admin),
 ):
     query: Dict[str, Any] = {}
     if school_id:
         query["school_id"] = school_id
+    if active is False:
+        query["active"] = False
+    elif active is True:
+        query["active"] = {"$ne": False}  # records from before the flag count as active
     if standard:
         query["standard"] = standard
     if search:
@@ -833,22 +935,58 @@ async def list_students(
     return out
 
 
-def _duplicate_student_query(body: StudentIn, exclude_id: Optional[str] = None) -> Dict[str, Any]:
-    """Matches an existing student with the same name, parent, mobile, class,
-    pickup location, and fee within the same school — a near-certain sign the
-    same enrollment is being entered twice."""
+def _loose_name(name: str) -> Dict[str, Any]:
+    """Matches a name ignoring case and spacing — "asha  rao" is "Asha Rao"."""
+    words = (name or "").split()
+    return {"$regex": r"^\s*" + r"\s+".join(re.escape(w) for w in words) + r"\s*$", "$options": "i"}
+
+
+async def _check_duplicate_student(body: StudentIn, existing: Optional[Dict[str, Any]] = None) -> None:
+    """The same child is the same name under the same parent's number at the
+    same school. Matching on every field (class, pickup, fee too) let a second
+    copy through the moment any one of them differed. Siblings share the
+    number but not the name, so they still go in. On an edit it only runs
+    when one of those three changes, so an older pair doesn't lock both
+    records out of being edited."""
+    if existing and (
+        " ".join(body.name.split()).lower() == " ".join(str(existing.get("name", "")).split()).lower()
+        and body.parent_mobile == existing.get("parent_mobile")
+        and body.school_id == existing.get("school_id")
+    ):
+        return
     q: Dict[str, Any] = {
         "school_id": body.school_id,
-        "name": {"$regex": f"^{re.escape(body.name.strip())}$", "$options": "i"},
-        "parent_name": {"$regex": f"^{re.escape(body.parent_name.strip())}$", "$options": "i"},
+        "name": _loose_name(body.name),
         "parent_mobile": body.parent_mobile,
-        "standard": {"$regex": f"^{re.escape(body.standard.strip())}$", "$options": "i"},
-        "pickup_location": {"$regex": f"^{re.escape((body.pickup_location or '').strip())}$", "$options": "i"},
-        "yearly_fee": body.yearly_fee,
     }
-    if exclude_id:
-        q["id"] = {"$ne": exclude_id}
-    return q
+    if existing:
+        q["id"] = {"$ne": existing["id"]}
+    clash = await db.students.find_one(q, {"_id": 0, "name": 1, "standard": 1})
+    if clash:
+        raise HTTPException(
+            400,
+            f"{clash['name']} (Class {clash.get('standard') or '—'}) is already added at this school "
+            f"with mobile {body.parent_mobile}",
+        )
+
+
+def _check_student_dates(body: StudentIn) -> None:
+    """A due date before the student even starts makes them overdue the moment
+    they are saved — the year's default (7 July) did exactly that for anyone
+    admitted after it."""
+    start = _local_day(body.start_date or body.admission_date)
+    due = _local_day(body.due_date)
+    if not due:
+        raise HTTPException(400, "A valid due date is required")
+    if start and due < start:
+        raise HTTPException(
+            400, f"Due date {_dmy(due)} is before the start date {_dmy(start)} — pick a date on or after it"
+        )
+
+
+async def _student_paid(student_id: str) -> float:
+    payments = await db.payments.find({"student_id": student_id}, {"_id": 0, "amount": 1}).to_list(1000)
+    return round(sum(float(p.get("amount", 0)) for p in payments), 2)
 
 
 @api.post("/students")
@@ -859,8 +997,8 @@ async def create_student(body: StudentIn, admin=Depends(get_current_admin)):
     fy_err = await _fy_entry_error(body.admission_date, "add student")
     if fy_err:
         raise HTTPException(400, fy_err)
-    if await db.students.find_one(_duplicate_student_query(body)):
-        raise HTTPException(400, "A student with the same name, parent, mobile, class, pickup location, and fee already exists")
+    _check_student_dates(body)
+    await _check_duplicate_student(body)
     doc = {**body.model_dump(), "id": str(uuid.uuid4()), "created_at": now_iso()}
     # A student joining mid-year starts the day they were admitted.
     if not doc.get("start_date"):
@@ -888,8 +1026,28 @@ async def update_student(student_id: str, body: StudentIn, admin=Depends(get_cur
     school = await db.schools.find_one({"id": body.school_id}, {"_id": 0})
     if not school:
         raise HTTPException(400, "Invalid school_id")
-    if await db.students.find_one(_duplicate_student_query(body, exclude_id=student_id)):
-        raise HTTPException(400, "A student with the same name, parent, mobile, class, pickup location, and fee already exists")
+    current = await db.students.find_one({"id": student_id}, {"_id": 0})
+    if not current:
+        raise HTTPException(404, "Student not found")
+    await _check_duplicate_student(body, current)
+    _check_student_dates(body)
+    # The fee can't drop below what the parent has already handed over — that
+    # leaves money collected against nothing, with no refund or credit to show.
+    paid = await _student_paid(student_id)
+    if body.yearly_fee + 0.0001 < paid:
+        raise HTTPException(
+            400, f"{_inr(paid)} is already paid for this student — the yearly fee can't go below that"
+        )
+    # Only a student who has paid in full can leave. Inactive students drop off
+    # the overdue list and reminders, so letting one go with money still owed
+    # would quietly write that money off.
+    if body.active is False:
+        owed = _fee_pending(body.yearly_fee, paid)
+        if owed > 0:
+            raise HTTPException(
+                400,
+                f"{body.name.strip()} still owes {_inr(owed)} — collect the full fee before marking them inactive",
+            )
     patch = body.model_dump()
     if not patch.get("start_date"):
         existing = await db.students.find_one({"id": student_id}, {"_id": 0, "start_date": 1})
@@ -902,7 +1060,7 @@ async def update_student(student_id: str, body: StudentIn, admin=Depends(get_cur
 
 
 @api.delete("/students/{student_id}")
-async def delete_student(student_id: str, admin=Depends(get_current_admin)):
+async def delete_student(student_id: str, _=Depends(require_cap("delete"))):
     await db.payments.delete_many({"student_id": student_id})
     await db.students.delete_one({"id": student_id})
     return {"ok": True}
@@ -974,14 +1132,36 @@ async def add_payment(student_id: str, body: PaymentIn, admin=Depends(get_curren
     fy_err = await _fy_entry_error(body.payment_date, "record payment")
     if fy_err:
         raise HTTPException(400, fy_err)
-    existing_payments = await db.payments.find({"student_id": student_id}, {"_id": 0}).to_list(1000)
-    already_paid = sum(float(p["amount"]) for p in existing_payments)
-    yearly_fee = float(student["yearly_fee"])
-    remaining = round(yearly_fee - already_paid, 2)
-    if body.amount > remaining:
-        if remaining <= 0:
-            raise HTTPException(400, "Yearly fee is already fully paid; no balance remaining")
-        raise HTTPException(400, f"Payment exceeds remaining balance of Rs. {remaining}")
+    already_paid = await _student_paid(student_id)
+    pending = _fee_pending(float(student["yearly_fee"]), already_paid)
+    if float(student["yearly_fee"]) <= 0:
+        raise HTTPException(400, "This student has no fee (free / scholarship)")
+    if pending <= 0:
+        raise HTTPException(400, "The yearly fee is already fully paid")
+    # Checked against the whole rupees shown as pending, so the amount on the
+    # screen is always payable — a ₹12,000.50 fee showed ₹7,001 pending and then
+    # refused ₹7,001 as more than the 7000.5 left.
+    if body.amount > pending:
+        raise HTTPException(400, f"That is more than the {_inr(pending)} pending")
+    paid_on = _local_day(body.payment_date)
+    if not paid_on:
+        raise HTTPException(400, "A valid payment date is required")
+    # A payment dated ahead shows as the "last payment" and lands in the wrong
+    # day's collection on every report.
+    if paid_on > _today():
+        raise HTTPException(400, f"Payment date {_dmy(paid_on)} is in the future")
+    next_due = _local_day(body.next_due_date) if body.next_due_date else None
+    if body.next_due_date and not next_due:
+        raise HTTPException(400, "The next due date is not a valid date")
+    # A next due date already behind the payment — or behind the day the
+    # student even started — makes them overdue the moment it is saved.
+    started = _local_day(student.get("start_date") or student.get("admission_date"))
+    floor_day = max(d for d in (paid_on, started) if d)
+    if next_due and next_due < floor_day:
+        what = "the payment date" if floor_day == paid_on else "the student's start date"
+        raise HTTPException(
+            400, f"Next due date {_dmy(next_due)} is before {what} ({_dmy(floor_day)})"
+        )
     doc = {
         **body.model_dump(),
         "id": str(uuid.uuid4()),
@@ -993,7 +1173,19 @@ async def add_payment(student_id: str, body: PaymentIn, admin=Depends(get_curren
 
 
 @api.delete("/payments/{payment_id}")
-async def delete_payment(payment_id: str, admin=Depends(get_current_admin)):
+async def delete_payment(payment_id: str, _=Depends(require_cap("delete"))):
+    """How a wrong payment gets corrected: delete it and record it again. The
+    next due date it set goes with it, falling back to the previous payment's."""
+    payment = await db.payments.find_one({"id": payment_id}, {"_id": 0, "student_id": 1})
+    if not payment:
+        raise HTTPException(404, "Payment not found")
+    student = await db.students.find_one({"id": payment["student_id"]}, {"_id": 0, "name": 1, "active": 1})
+    # Inactive means paid in full; taking a payment away would leave an
+    # inactive student owing money that nothing chases.
+    if student and student.get("active") is False:
+        raise HTTPException(
+            400, f"{student['name']} is inactive — mark them active again before deleting a payment"
+        )
     await db.payments.delete_one({"id": payment_id})
     return {"ok": True}
 
@@ -2227,6 +2419,8 @@ async def pending_fees(fy: Optional[str] = None, admin=Depends(get_current_admin
     out = []
     today = datetime.now(timezone.utc)
     for d in docs:
+        if d.get("active") is False:
+            continue  # left the service — no reminders; the record is kept
         full = await student_to_out(d, fy=fy)
         if full["status"] == "completed":
             continue
@@ -2244,6 +2438,7 @@ async def dashboard_summary(fy: Optional[str] = None, admin=Depends(get_current_
     docs = await db.students.find({}, {"_id": 0}).to_list(10000)
     total_schools = await db.schools.count_documents({})
     total_students = len(docs)
+    inactive_students = sum(1 for d in docs if d.get("active") is False)
     total_yearly = sum(float(d["yearly_fee"]) for d in docs)
     sids = [d["id"] for d in docs]
     # An empty roster must mean no payments, not every payment ever taken — an
@@ -2264,6 +2459,8 @@ async def dashboard_summary(fy: Optional[str] = None, admin=Depends(get_current_
     return {
         "total_schools": total_schools,
         "total_students": total_students,
+        "active_students": total_students - inactive_students,
+        "inactive_students": inactive_students,
         "total_yearly": round(total_yearly, 2),
         "total_collected": round(total_collected, 2),
         "total_pending": round(pending_total, 2),
@@ -3022,6 +3219,8 @@ async def bulk_pending(fy: Optional[str] = None, admin=Depends(get_current_admin
     out = []
     today = datetime.now(timezone.utc)
     for d in docs:
+        if d.get("active") is False:
+            continue  # left the service — no reminders; the record is kept
         full = await student_to_out(d, fy=fy)
         if full["status"] == "completed":
             continue

@@ -20,9 +20,9 @@ import { apiFetch, useAuth, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
 import type { FYMeta } from '@/src/fy';
 import { useFY } from '@/src/fy';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
-import { formatINR } from '@/src/utils/format';
+import { formatINR, plural } from '@/src/utils/format';
 import { calendarDateToDisplay, calendarDateToLocalIso, isoToCalendarDate } from '@/src/utils/datetime';
-import { AlertModal, Card, DateTimeField, EmptyState } from '@/src/components/ui';
+import { AlertModal, Card, DangerConfirmModal, DateTimeField, EmptyState } from '@/src/components/ui';
 import type { PushState } from '@/src/push';
 import { enablePush, pushPermission, showLocalTest, syncPush } from '@/src/push';
 import { Skeleton, SkeletonCard, SkeletonKPI } from '@/src/components/Skeleton';
@@ -30,11 +30,22 @@ import { Skeleton, SkeletonCard, SkeletonKPI } from '@/src/components/Skeleton';
 interface Summary {
   total_schools: number;
   total_students: number;
+  /** Students marked inactive (left, fee fully paid). */
+  inactive_students?: number;
   total_yearly: number;
   total_collected: number;
   total_pending: number;
   total_completed: number;
 }
+/** A student who has left — fee fully paid, kept on record until an admin deletes them. */
+interface InactiveStudent {
+  id: string;
+  name: string;
+  school_name: string;
+  standard: string;
+  paid_amount: number;
+}
+
 interface SchoolStat {
   school_id: string;
   school_name: string;
@@ -72,6 +83,11 @@ export default function Dashboard() {
   const [actionFY, setActionFY] = useState<FYMeta | null>(null);
   const [actionBusy, setActionBusy] = useState<'close' | 'delete' | 'reset' | 'pdf' | 'excel' | null>(null);
   const [actionMsg, setActionMsg] = useState('');
+
+  const [inactiveStudents, setInactiveStudents] = useState<InactiveStudent[]>([]);
+  const [deleteTarget, setDeleteTarget] = useState<InactiveStudent | null>(null);
+  const [deletingStudent, setDeletingStudent] = useState(false);
+  const [deleteMsg, setDeleteMsg] = useState<{ ok: boolean; text: string } | null>(null);
   // Inline confirm step (replaces Alert.alert so it works on web too)
   const [confirmStep, setConfirmStep] = useState<ConfirmStep>(null);
 
@@ -307,12 +323,14 @@ export default function Dashboard() {
   const load = useCallback(async () => {
     try {
       const q = fy ? `?fy=${fy}` : '';
-      const [s, by] = await Promise.all([
+      const [s, by, gone] = await Promise.all([
         apiFetch<Summary>(`/dashboard/summary${q}`),
         apiFetch<SchoolStat[]>(`/dashboard/by-school${q}`),
+        apiFetch<InactiveStudent[]>('/students?active=false'),
       ]);
       setSummary(s);
       setSchools(by);
+      setInactiveStudents([...gone].sort((a, b) => a.name.localeCompare(b.name)));
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -324,6 +342,25 @@ export default function Dashboard() {
     refreshFY();
     load();
   }, [load, refreshFY]));
+
+  /** Permanent: the student and every payment recorded for them. Admin only —
+   *  the server refuses anyone without the "delete" permission. */
+  const deleteInactiveStudent = async () => {
+    if (!deleteTarget) return;
+    setDeletingStudent(true);
+    try {
+      await apiFetch(`/students/${deleteTarget.id}`, { method: 'DELETE' });
+      const name = deleteTarget.name;
+      setDeleteTarget(null);
+      await load();
+      setDeleteMsg({ ok: true, text: `${name} and their payment history were deleted.` });
+    } catch (e: any) {
+      setDeleteTarget(null);
+      setDeleteMsg({ ok: false, text: e.message || 'Could not delete the student.' });
+    } finally {
+      setDeletingStudent(false);
+    }
+  };
 
   const cycleTheme = () => {
     setMode(mode === 'light' ? 'dark' : mode === 'dark' ? 'system' : 'light');
@@ -454,6 +491,46 @@ export default function Dashboard() {
               <KPI icon="cash" label="Collected" value={formatINR(summary?.total_collected)} accent="success" />
               <KPI icon="alert-circle" label="Pending" value={formatINR(summary?.total_pending)} accent="warning" />
             </View>
+
+            <Text style={[styles.sectionTitle, { color: palette.onSurface }]}>
+              Inactive students · {summary?.inactive_students ?? inactiveStudents.length}
+            </Text>
+            {inactiveStudents.length === 0 ? (
+              <Card style={{ marginBottom: spacing.lg }}>
+                <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>
+                  None. A student whose fee is fully paid can be marked inactive from their edit screen when they leave.
+                </Text>
+              </Card>
+            ) : (
+              <Card style={{ marginBottom: spacing.lg, paddingVertical: spacing.sm }}>
+                {inactiveStudents.map((st, i) => (
+                  <View
+                    key={st.id}
+                    style={{
+                      flexDirection: 'row', alignItems: 'center', paddingVertical: spacing.sm,
+                      borderTopWidth: i === 0 ? 0 : 1, borderTopColor: palette.border,
+                    }}
+                  >
+                    <Pressable onPress={() => router.push(`/student/${st.id}` as any)} testID={`inactive-student-${st.id}`} style={{ flex: 1 }}>
+                      <Text style={{ color: palette.onSurface, fontWeight: '700' }} numberOfLines={1}>{st.name}</Text>
+                      <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }} numberOfLines={1}>
+                        {st.school_name} · Class {st.standard} · {formatINR(st.paid_amount)} paid
+                      </Text>
+                    </Pressable>
+                    {isAdmin ? (
+                      <Pressable
+                        onPress={() => setDeleteTarget(st)}
+                        testID={`delete-inactive-${st.id}`}
+                        style={{ padding: 8, marginLeft: spacing.sm }}
+                      >
+                        <Ionicons name="trash-outline" size={18} color={palette.error} />
+                      </Pressable>
+                    ) : null}
+                  </View>
+                ))}
+              </Card>
+            )}
+
             <Text style={[styles.sectionTitle, { color: palette.onSurface }]}>School-wise summary</Text>
             {schools.length === 0 ? (
               <Card>
@@ -470,7 +547,7 @@ export default function Dashboard() {
                       </View>
                       <View style={{ flex: 1, marginLeft: spacing.md }}>
                         <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>{s.school_name}</Text>
-                        <Text style={{ color: palette.muted, marginTop: 2, fontSize: fontSize.sm }}>{s.student_count} students</Text>
+                        <Text style={{ color: palette.muted, marginTop: 2, fontSize: fontSize.sm }}>{plural(s.student_count, 'student')}</Text>
                       </View>
                       <Ionicons name="chevron-forward" size={20} color={palette.muted} />
                     </View>
@@ -763,6 +840,31 @@ export default function Dashboard() {
           </Pressable>
         </Pressable>
       </Modal>
+
+      <DangerConfirmModal
+        visible={!!deleteTarget}
+        title={deleteTarget ? `Delete ${deleteTarget.name} permanently?` : ''}
+        message={
+          deleteTarget
+            ? `${deleteTarget.name} and every payment recorded for them are removed for good. This only affects ${deleteTarget.name}.`
+            : ''
+        }
+        bullets={deleteTarget ? [`${formatINR(deleteTarget.paid_amount)} of payments in their history`] : []}
+        confirmWord={deleteTarget?.name || 'DELETE'}
+        busy={deletingStudent}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={deleteInactiveStudent}
+        testID="inactive-delete-confirm"
+      />
+
+      <AlertModal
+        visible={!!deleteMsg}
+        variant={deleteMsg?.ok ? 'success' : 'error'}
+        title={deleteMsg?.ok ? 'Student deleted' : 'Could not delete'}
+        message={deleteMsg?.text || ''}
+        onClose={() => setDeleteMsg(null)}
+        testID="inactive-delete-result"
+      />
 
       <AlertModal
         visible={!!pushMsg}

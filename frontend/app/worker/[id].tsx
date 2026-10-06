@@ -18,9 +18,9 @@ import { Ionicons } from '@expo/vector-icons';
 import { apiFetch, useAuth, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { AlertModal, Button, Card, ConfirmModal, DangerConfirmModal, EmptyState, TextField, DateTimeField } from '@/src/components/ui';
-import { formatINR } from '@/src/utils/format';
+import { formatINR, plural, wholeRupeeError } from '@/src/utils/format';
 import { calendarDateToDisplay, calendarDateToLocalIso, isoToCalendarDate, isoToDisplay } from '@/src/utils/datetime';
-import { owed, wholeRupeeError, workerBadge } from '@/src/utils/workerStatus';
+import { owed, workerBadge } from '@/src/utils/workerStatus';
 
 interface Period {
   id: string;
@@ -918,7 +918,7 @@ export default function WorkerDetail() {
                 {formatINR(worker.matured_pending)} pending
               </Text>
               {worker.max_overdue_days > 0 ? (
-                <Text style={{ color: palette.error, fontSize: fontSize.sm }}>{worker.max_overdue_days} days late</Text>
+                <Text style={{ color: palette.error, fontSize: fontSize.sm }}>{plural(worker.max_overdue_days, 'day')} late</Text>
               ) : null}
             </View>
             <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: 6 }}>

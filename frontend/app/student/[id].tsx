@@ -13,11 +13,11 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
-import { apiFetch } from '@/src/auth';
+import { apiFetch, useAuth } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
-import { AlertModal, Button, Card, ConfirmModal, EmptyState, StatusBadge, TextField, DateTimeField } from '@/src/components/ui';
-import { formatINR, openWhatsApp, reminderMessage } from '@/src/utils/format';
-import { isoToDisplay } from '@/src/utils/datetime';
+import { AlertModal, Button, Card, ConfirmModal, DangerConfirmModal, EmptyState, StatusBadge, TextField, DateTimeField } from '@/src/components/ui';
+import { formatINR, formatINRExact, openWhatsApp, plural, reminderMessage, wholeRupeeError } from '@/src/utils/format';
+import { calendarDateToDisplay, isoToDisplay } from '@/src/utils/datetime';
 
 interface Payment {
   id: string;
@@ -31,7 +31,13 @@ interface Payment {
 
 const MODES = ['cash', 'upi', 'bank'];
 
-const dayLabel = (n: number) => `${n} day${n === 1 ? '' : 's'}`;
+const dayLabel = (n: number) => plural(n, 'day');
+
+/** Local midnight of the day an ISO instant falls on. */
+const dayOf = (iso: string) => {
+  const d = new Date(iso);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+};
 
 // Spells out what the payment did to an overdue record, so clearing an overdue
 // reads differently from merely denting it.
@@ -54,7 +60,8 @@ function paymentSummary(paidLabel: string, overdueBefore: number, s: any): strin
   }
 
   if (stillOverdue) {
-    return `${paidLabel} recorded, but this record is still overdue by ${dayLabel(s.overdue_days)} — ${pending}.`;
+    const dueOn = calendarDateToDisplay(s.next_due_date || s.due_date);
+    return `${paidLabel} recorded, but this record is still overdue by ${dayLabel(s.overdue_days)}${dueOn ? ` (due ${dueOn})` : ''} — ${pending}. Set a next due date when recording a payment to move it.`;
   }
 
   return `${paidLabel} recorded. ${pending}.`;
@@ -76,12 +83,21 @@ export default function StudentDetail() {
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [modalErr, setModalErr] = useState('');
+  const [fieldErr, setFieldErr] = useState<{ amount?: string; nextDue?: string }>({});
+  const [loadError, setLoadError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmDeletePayment, setConfirmDeletePayment] = useState<Payment | null>(null);
+  // Deleting a student or a payment needs the "delete" permission (admins);
+  // the server refuses it for everyone else, so don't offer the button.
+  const { admin } = useAuth();
+  const canDelete = !!(admin?.capabilities?.delete ?? admin?.role === 'admin');
 
   const load = useCallback(async () => {
     if (!id) return null;
     try {
+      setLoadError('');
       const [s, p] = await Promise.all([
         apiFetch<any>(`/students/${id}`),
         apiFetch<Payment[]>(`/students/${id}/payments`),
@@ -89,6 +105,10 @@ export default function StudentDetail() {
       setStudent(s);
       setPayments(p);
       return s;
+    } catch (e: any) {
+      // Without this a failed request left the page on its spinner for good.
+      setLoadError(e?.message || 'Could not load this student.');
+      return null;
     } finally {
       setLoading(false);
     }
@@ -96,15 +116,36 @@ export default function StudentDetail() {
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
+  const pendingNow: number = student?.pending_amount ?? 0;
+  const amtNum = parseInt(amount, 10);
+  // A payment that clears the fee has no "next" due date — the field is hidden.
+  const clearsFee = !wholeRupeeError(amount) && amtNum > 0 && amtNum >= pendingNow;
+
+  const openPayment = () => {
+    setFieldErr({});
+    setModalErr('');
+    setShowModal(true);
+  };
+
   const submitPayment = async () => {
     setModalErr('');
-    const amt = parseFloat(amount);
-    if (!amt || amt <= 0) { setModalErr('Enter a valid amount'); return; }
-    if (!date) { setModalErr('Please select a payment date'); return; }
-    let nextIso: string | null = null;
-    if (nextDue.trim()) {
-      nextIso = nextDue || null;
+    const amt = parseInt(amount, 10);
+    const errs: { amount?: string; nextDue?: string } = {};
+    if (wholeRupeeError(amount)) errs.amount = wholeRupeeError(amount);
+    else if (!amt || amt <= 0) errs.amount = 'Enter the amount paid';
+    else if (amt > pendingNow) errs.amount = `That is more than the ${formatINR(pendingNow)} pending`;
+    if (!clearsFee && nextDue && date && dayOf(nextDue) < dayOf(date)) {
+      errs.nextDue = "The next due date can't be before the payment date";
     }
+    if (date && dayOf(date) > dayOf(new Date().toISOString())) {
+      setModalErr('The payment date is in the future — pick today or an earlier day');
+      setFieldErr(errs);
+      return;
+    }
+    setFieldErr(errs);
+    if (errs.amount || errs.nextDue) return;
+    if (!date) { setModalErr('Please select a payment date'); return; }
+    const nextIso: string | null = !clearsFee && nextDue ? nextDue : null;
     const overdueBefore = student?.overdue_days ?? 0;
     setSubmitting(true);
     try {
@@ -117,20 +158,90 @@ export default function StudentDetail() {
       const fresh = await load();
       setSuccessMsg(paymentSummary(formatINR(amt), overdueBefore, fresh));
     } catch (e: any) {
-      setModalErr(e.message);
+      const msg = e.message || '';
+      if (/pending|amount|fully paid/i.test(msg)) setFieldErr({ amount: msg });
+      else if (/next due/i.test(msg)) setFieldErr({ nextDue: msg });
+      else setModalErr(msg);
     } finally {
       setSubmitting(false);
     }
   };
 
   const remove = async () => {
-    await apiFetch(`/students/${id}`, { method: 'DELETE' });
-    router.back();
+    setDeleting(true);
+    try {
+      await apiFetch(`/students/${id}`, { method: 'DELETE' });
+      setShowDeleteConfirm(false);
+      router.back();
+    } catch (e: any) {
+      setShowDeleteConfirm(false);
+      setModalErr(e.message);
+    } finally {
+      setDeleting(false);
+    }
   };
 
-  if (loading || !student) {
+  /** Keeps the record and its payments, and takes the student off the overdue
+   *  list — what "they left" usually means, offered right in the delete dialog. */
+  const markInactive = async () => {
+    setDeleting(true);
+    try {
+      await apiFetch(`/students/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          name: student.name, parent_name: student.parent_name, parent_mobile: student.parent_mobile,
+          school_id: student.school_id, standard: student.standard, pickup_location: student.pickup_location || '',
+          yearly_fee: student.yearly_fee, admission_date: student.admission_date,
+          start_date: student.start_date, due_date: student.due_date, active: false,
+        }),
+      });
+      setShowDeleteConfirm(false);
+      await load();
+      setSuccessMsg(`${student.name} is marked inactive. The record and payment history are kept.`);
+    } catch (e: any) {
+      setShowDeleteConfirm(false);
+      setModalErr(e.message);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  /** A wrong payment is corrected by deleting it and recording it again. */
+  const removePayment = async (p: Payment) => {
+    try {
+      await apiFetch(`/payments/${p.id}`, { method: 'DELETE' });
+      await load();
+    } catch (e: any) {
+      setModalErr(e.message);
+    }
+  };
+
+  if (loading) {
     return <ActivityIndicator color={palette.brand} style={{ flex: 1, marginTop: 80 }} />;
   }
+
+  if (!student) {
+    return (
+      <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
+          <Pressable onPress={() => router.back()} style={{ padding: 6 }} testID="student-back">
+            <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
+          </Pressable>
+          <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>Student</Text>
+        </View>
+        <View style={{ padding: spacing.lg }}>
+          <Card>
+            <EmptyState icon="cloud-offline-outline" title="Could not load this student" subtitle={loadError || 'Please try again.'} />
+            <Button title="Retry" onPress={() => { setLoading(true); load(); }} testID="student-retry" />
+          </Card>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  const fullyPaid = student.status === 'completed' || pendingNow <= 0;
+  const free = Number(student.yearly_fee) <= 0;
+  const inactive = student.active === false;
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
@@ -142,9 +253,11 @@ export default function StudentDetail() {
         <Pressable onPress={() => router.push(`/student/edit/${id}` as any)} testID="student-edit" style={{ padding: 6 }}>
           <Ionicons name="create-outline" size={22} color={palette.onSurface} />
         </Pressable>
-        <Pressable onPress={() => setShowDeleteConfirm(true)} testID="student-delete" style={{ padding: 6, marginLeft: 4 }}>
-          <Ionicons name="trash-outline" size={22} color={palette.error} />
-        </Pressable>
+        {canDelete ? (
+          <Pressable onPress={() => setShowDeleteConfirm(true)} testID="student-delete" style={{ padding: 6, marginLeft: 4 }}>
+            <Ionicons name="trash-outline" size={22} color={palette.error} />
+          </Pressable>
+        ) : null}
       </View>
 
       <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 120 }}>
@@ -159,27 +272,55 @@ export default function StudentDetail() {
               <Text style={{ fontSize: fontSize.xl, fontWeight: '700', color: palette.onSurface }}>{student.name}</Text>
               <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>{student.school_name} · Class {student.standard}</Text>
             </View>
-            <StatusBadge status={student.status} />
+            <View style={{ alignItems: 'flex-end', gap: 4 }}>
+              {free ? (
+                <View style={{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: radii.pill, backgroundColor: palette.success + '22' }}>
+                  <Text style={{ color: palette.success, fontWeight: '700', fontSize: fontSize.sm }}>Free</Text>
+                </View>
+              ) : (
+                <StatusBadge status={student.status} />
+              )}
+              {inactive ? (
+                <View style={{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: radii.pill, backgroundColor: palette.muted + '22' }}>
+                  <Text style={{ color: palette.muted, fontWeight: '700', fontSize: fontSize.sm }}>Inactive</Text>
+                </View>
+              ) : null}
+            </View>
           </View>
+          {inactive ? (
+            <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: spacing.md }}>
+              {`${student.name} is marked inactive — off the overdue list and reminders. Edit the student to make them active again.`}
+            </Text>
+          ) : null}
 
           <View style={{ marginTop: spacing.lg, gap: 6 }}>
             <InfoRow icon="call" label="Parent" value={`${student.parent_name} · ${student.parent_mobile}`} />
-            <InfoRow icon="location" label="Pickup" value={student.pickup_location || '—'} />
-            <InfoRow icon="calendar" label="Admission" value={isoToDisplay(student.admission_date) || '—'} />
-            <InfoRow icon="time" label="Next Due" value={isoToDisplay(student.next_due_date || student.due_date) || '—'} />
+            <InfoRow icon="location" label="Pickup" value={student.pickup_location || 'Not set'} />
+            <InfoRow icon="calendar" label="Admission" value={calendarDateToDisplay(student.admission_date) || '—'} />
+            <InfoRow
+              icon="time"
+              label="Next Due"
+              value={
+                free
+                  ? 'No fee — free / scholarship'
+                  : fullyPaid
+                  ? 'Nothing due — fee fully paid'
+                  : calendarDateToDisplay(student.next_due_date || student.due_date) || '—'
+              }
+            />
             {student.overdue_days > 0 ? (
-              <InfoRow icon="warning" label="Overdue" value={`${student.overdue_days} days`} />
+              <InfoRow icon="warning" label="Overdue" value={dayLabel(student.overdue_days)} />
             ) : null}
           </View>
 
           <View style={{ flexDirection: 'row', marginTop: spacing.lg, gap: spacing.md }}>
             <View style={{ flex: 1 }}>
               <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>Yearly</Text>
-              <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>{formatINR(student.yearly_fee)}</Text>
+              <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>{formatINRExact(student.yearly_fee)}</Text>
             </View>
             <View style={{ flex: 1 }}>
               <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>Paid</Text>
-              <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.success }}>{formatINR(student.paid_amount)}</Text>
+              <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.success }}>{formatINRExact(student.paid_amount)}</Text>
             </View>
             <View style={{ flex: 1 }}>
               <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>Pending</Text>
@@ -187,10 +328,10 @@ export default function StudentDetail() {
             </View>
           </View>
 
-          {student.status !== 'completed' && (
+          {student.status !== 'completed' && !inactive && (
             <Pressable
               testID="student-whatsapp"
-              onPress={() => openWhatsApp(student.parent_mobile, reminderMessage({ studentName: student.name, school: student.school_name, pending: student.pending_amount, dueDate: student.due_date }))}
+              onPress={() => openWhatsApp(student.parent_mobile, reminderMessage({ studentName: student.name, school: student.school_name, pending: student.pending_amount, dueDate: student.next_due_date || student.due_date }))}
               style={{ marginTop: spacing.md, backgroundColor: palette.success, borderRadius: radii.md, paddingVertical: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center' }}
             >
               <Ionicons name="logo-whatsapp" size={20} color="#fff" />
@@ -211,13 +352,20 @@ export default function StudentDetail() {
               </View>
               <Card style={{ flex: 1 }}>
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-                  <Text style={{ color: palette.onSurface, fontWeight: '700', fontSize: fontSize.lg }}>{formatINR(p.amount)}</Text>
-                  <Text style={{ color: palette.muted, fontSize: fontSize.sm, textTransform: 'uppercase' }}>{p.mode}</Text>
+                  <Text style={{ color: palette.onSurface, fontWeight: '700', fontSize: fontSize.lg }}>{formatINRExact(p.amount)}</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <Text style={{ color: palette.muted, fontSize: fontSize.sm, textTransform: 'uppercase' }}>{p.mode}</Text>
+                    {canDelete && !inactive ? (
+                      <Pressable onPress={() => setConfirmDeletePayment(p)} testID={`delete-payment-${p.id}`} style={{ padding: 4, marginLeft: 8 }}>
+                        <Ionicons name="trash-outline" size={16} color={palette.error} />
+                      </Pressable>
+                    ) : null}
+                  </View>
                 </View>
                 <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 4 }}>{isoToDisplay(p.payment_date)}</Text>
                 {p.next_due_date ? (
                   <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>
-                    Next due: {isoToDisplay(p.next_due_date)}
+                    Next due: {calendarDateToDisplay(p.next_due_date)}
                   </Text>
                 ) : null}
                 {p.note ? <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginTop: 4 }}>{p.note}</Text> : null}
@@ -228,7 +376,13 @@ export default function StudentDetail() {
       </ScrollView>
 
       <View style={{ position: 'absolute', left: 0, right: 0, bottom: 0, padding: spacing.lg, backgroundColor: palette.surfaceSecondary, borderTopWidth: 1, borderTopColor: palette.border }}>
-        <Button title="Record Payment" icon="add-circle" onPress={() => setShowModal(true)} testID="record-payment-btn" />
+        <Button
+          title={free ? 'No fee to collect' : fullyPaid ? 'Fee fully paid' : 'Record Payment'}
+          icon={fullyPaid ? 'checkmark-circle' : 'add-circle'}
+          onPress={openPayment}
+          disabled={fullyPaid}
+          testID="record-payment-btn"
+        />
       </View>
 
       <Modal visible={showModal} transparent animationType="slide" onRequestClose={() => setShowModal(false)}>
@@ -240,12 +394,47 @@ export default function StudentDetail() {
             <TextField
               label="Amount (₹) *"
               value={amount}
-              onChangeText={(t) => setAmount(t.replace(/[^0-9.]/g, ''))}
-              keyboardType="numeric"
+              onChangeText={(t) => { setAmount(t.replace(/[^0-9.]/g, '')); setFieldErr((f) => ({ ...f, amount: undefined })); }}
+              keyboardType="number-pad"
+              error={fieldErr.amount || wholeRupeeError(amount)}
               testID="payment-amount"
             />
-            <DateTimeField label="Payment Date & Time" value={date} onChange={setDate} required testID="payment-date" />
-            <DateTimeField label="Next Fee Due Date" value={nextDue} onChange={setNextDue} testID="payment-next-due" />
+            {!fieldErr.amount && !wholeRupeeError(amount) ? (
+              <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -8, marginBottom: spacing.md }}>
+                {formatINR(pendingNow)} pending
+              </Text>
+            ) : null}
+            <DateTimeField
+              label="Payment Date & Time"
+              value={date}
+              onChange={setDate}
+              maxDate={dayOf(new Date().toISOString())}
+              required
+              testID="payment-date"
+            />
+            {clearsFee ? (
+              <Text style={{ color: palette.success, fontSize: fontSize.sm, marginBottom: spacing.md }}>
+                This clears the fee — no next due date is needed.
+              </Text>
+            ) : (
+              <>
+                <DateTimeField
+                  label="Next Fee Due Date"
+                  mode="date"
+                  value={nextDue}
+                  onChange={(v) => { setNextDue(v); setFieldErr((f) => ({ ...f, nextDue: undefined })); }}
+                  minDate={date ? dayOf(date) : undefined}
+                  error={fieldErr.nextDue}
+                  testID="payment-next-due"
+                />
+                {!fieldErr.nextDue ? (
+                  <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -6, marginBottom: spacing.md }}>
+                    When the rest is due. Leave it blank to keep the current due date
+                    {student.next_due_date || student.due_date ? ` (${calendarDateToDisplay(student.next_due_date || student.due_date)})` : ''}.
+                  </Text>
+                ) : null}
+              </>
+            )}
             <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginBottom: 6 }}>Mode</Text>
             <View style={{ flexDirection: 'row', gap: 8, marginBottom: spacing.md }}>
               {MODES.map((m) => {
@@ -287,14 +476,40 @@ export default function StudentDetail() {
         testID="payment-form-success"
       />
 
-      <ConfirmModal
+      <DangerConfirmModal
         visible={showDeleteConfirm}
-        title="Delete student?"
-        message="This will remove all payment history."
-        confirmLabel="Delete"
+        title={`Delete ${student.name}?`}
+        message={`The student and every payment recorded for them are removed for good. If ${student.name} has only left, mark them inactive instead — the record stays.`}
+        bullets={[
+          `${payments.length} payment${payments.length === 1 ? '' : 's'} totalling ${formatINRExact(student.paid_amount)}`,
+        ]}
+        confirmWord={student.name}
+        busy={deleting}
+        // Leaving (inactive) is only for a fully paid student.
+        actionLabel={inactive || !fullyPaid ? undefined : 'Mark inactive instead'}
+        onAction={inactive || !fullyPaid ? undefined : markInactive}
+        note={
+          !inactive && !fullyPaid
+            ? `${formatINR(pendingNow)} is still pending, so ${student.name} can't be marked inactive until the full fee is paid.`
+            : undefined
+        }
         onCancel={() => setShowDeleteConfirm(false)}
-        onConfirm={() => { setShowDeleteConfirm(false); remove(); }}
+        onConfirm={remove}
         testID="student-delete-confirm"
+      />
+
+      <ConfirmModal
+        visible={!!confirmDeletePayment}
+        title="Delete this payment?"
+        message={
+          confirmDeletePayment
+            ? `${formatINRExact(confirmDeletePayment.amount)} paid on ${isoToDisplay(confirmDeletePayment.payment_date)} will be removed and go back to pending. Record it again with the right details if it was entered wrongly.`
+            : ''
+        }
+        confirmLabel="Delete"
+        onCancel={() => setConfirmDeletePayment(null)}
+        onConfirm={() => { const p = confirmDeletePayment; setConfirmDeletePayment(null); if (p) removePayment(p); }}
+        testID="payment-delete-confirm"
       />
     </SafeAreaView>
   );

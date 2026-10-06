@@ -475,34 +475,58 @@ export function DateTimeField({ label, value, onChange, required, testID, error,
                     </View>
                   </View>
 
-                  {/* Year picker — tap a year to jump straight to it */}
+                  {/* Month + year picker — jump straight to any month instead of
+                      stepping the arrow (July → October was three taps). Picking
+                      a year keeps the panel open so a month can follow; picking
+                      a month closes it. */}
                   {yearPickerOpen && (
-                    <ScrollView
-                      keyboardShouldPersistTaps="handled"
-                      style={{ maxHeight: 160, marginBottom: spacing.md, borderWidth: 1, borderColor: palette.border, borderRadius: radii.md }}
-                      contentContainerStyle={{ padding: 6 }}
-                    >
-                      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
-                        {yearOptions.map((y) => {
-                          const isSel = y === navYear;
+                    <View style={{ marginBottom: spacing.md }}>
+                      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                        {CAL_MONTHS.map((m, i) => {
+                          const isSel = i === navMonth;
                           return (
                             <Pressable
-                              key={y}
-                              onPress={() => { setNavYear(y); setYearPickerOpen(false); }}
+                              key={m}
+                              onPress={() => { setNavMonth(i); setYearPickerOpen(false); }}
                               style={{
-                                paddingHorizontal: 12, paddingVertical: 8, borderRadius: radii.sm,
+                                width: '23%', paddingVertical: 8, borderRadius: radii.sm, alignItems: 'center',
                                 backgroundColor: isSel ? palette.brand : palette.surfaceTertiary,
-                                minWidth: 64, alignItems: 'center',
                               }}
                             >
                               <Text style={{ color: isSel ? '#fff' : palette.onSurface, fontWeight: '600', fontSize: fontSize.sm }}>
-                                {y}
+                                {m}
                               </Text>
                             </Pressable>
                           );
                         })}
                       </View>
-                    </ScrollView>
+                      <ScrollView
+                        keyboardShouldPersistTaps="handled"
+                        style={{ maxHeight: 120, borderWidth: 1, borderColor: palette.border, borderRadius: radii.md }}
+                        contentContainerStyle={{ padding: 6 }}
+                      >
+                        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+                          {yearOptions.map((y) => {
+                            const isSel = y === navYear;
+                            return (
+                              <Pressable
+                                key={y}
+                                onPress={() => setNavYear(y)}
+                                style={{
+                                  paddingHorizontal: 12, paddingVertical: 8, borderRadius: radii.sm,
+                                  backgroundColor: isSel ? palette.brand : palette.surfaceTertiary,
+                                  minWidth: 64, alignItems: 'center',
+                                }}
+                              >
+                                <Text style={{ color: isSel ? '#fff' : palette.onSurface, fontWeight: '600', fontSize: fontSize.sm }}>
+                                  {y}
+                                </Text>
+                              </Pressable>
+                            );
+                          })}
+                        </View>
+                      </ScrollView>
+                    </View>
                   )}
 
                   {/* Weekday headers */}
@@ -1091,7 +1115,9 @@ export function DangerConfirmModal({
     if (visible) setTyped('');
   }, [visible]);
 
-  const armed = typed.trim().toUpperCase() === confirmWord.toUpperCase() && !busy;
+  // Spacing-insensitive: the word can be a typed-in name ("Asha  Rao").
+  const squash = (v: string) => v.trim().replace(/\s+/g, ' ').toUpperCase();
+  const armed = squash(typed) === squash(confirmWord) && !busy;
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>

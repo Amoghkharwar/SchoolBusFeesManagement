@@ -6,7 +6,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
-import { Card, ConfirmModal, EmptyState } from '@/src/components/ui';
+import { Button, Card, ConfirmModal, EmptyState } from '@/src/components/ui';
 import { formatINR, openWhatsApp, reminderMessage, formatDate } from '@/src/utils/format';
 
 interface Student {
@@ -14,6 +14,8 @@ interface Student {
   standard: string; school_name: string;
   yearly_fee: number; paid_amount: number; pending_amount: number;
   status: string; due_date: string;
+  /** Null once the fee is fully paid — there is nothing left to fall due. */
+  next_due_date?: string | null;
 }
 
 const TABS: { key: 'pending' | 'partial' | 'completed'; label: string }[] = [
@@ -29,11 +31,13 @@ export default function SchoolDetail() {
   const [students, setStudents] = useState<Student[]>([]);
   const [tab, setTab] = useState<'pending' | 'partial' | 'completed'>('pending');
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) return;
     try {
+      setLoadError('');
       const [sc, st] = await Promise.all([
         apiFetch(`/schools/${id}`),
         apiFetch<Student[]>(`/students?school_id=${id}`),
@@ -41,7 +45,8 @@ export default function SchoolDetail() {
       setSchool(sc);
       setStudents(st);
     } catch (e: any) {
-      // ignore
+      // Without this the page sat on its spinner forever when a request failed.
+      setLoadError(e?.message || 'Could not load this school.');
     } finally {
       setLoading(false);
     }
@@ -65,7 +70,26 @@ export default function SchoolDetail() {
     router.back();
   };
 
-  if (loading || !school) return <ActivityIndicator color={palette.brand} style={{ flex: 1, marginTop: 80 }} />;
+  if (loading) return <ActivityIndicator color={palette.brand} style={{ flex: 1, marginTop: 80 }} />;
+
+  if (!school) {
+    return (
+      <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
+          <Pressable onPress={() => router.back()} testID="school-back" style={{ padding: 6 }}>
+            <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
+          </Pressable>
+          <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>School</Text>
+        </View>
+        <View style={{ padding: spacing.lg }}>
+          <Card>
+            <EmptyState icon="cloud-offline-outline" title="Could not load this school" subtitle={loadError || 'Please try again.'} />
+            <Button title="Retry" onPress={() => { setLoading(true); load(); }} testID="school-retry" />
+          </Card>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
@@ -85,10 +109,27 @@ export default function SchoolDetail() {
       <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 80 }}>
         <Card>
           <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>{school.address || 'No address'}</Text>
+          {school.contact_person || school.contact_phone ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 6 }}>
+              <Ionicons name="call-outline" size={14} color={palette.muted} />
+              <Text style={{ color: palette.onSurfaceSecondary, fontSize: fontSize.sm, marginLeft: 6, flex: 1 }}>
+                {[school.contact_person, school.contact_phone].filter(Boolean).join(' · ')}
+              </Text>
+            </View>
+          ) : null}
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: spacing.md }}>
             <Mini label="Students" value={String(students.length)} />
             <Mini label="Collected" value={formatINR(totals.paid)} color={palette.success} />
             <Mini label="Pending" value={formatINR(totals.pending)} color={palette.warning} />
+          </View>
+          <View style={{ marginTop: spacing.md }}>
+            <Button
+              title="Add Student"
+              icon="person-add-outline"
+              variant="secondary"
+              onPress={() => router.push(`/student/add?school_id=${id}` as any)}
+              testID="school-add-student"
+            />
           </View>
         </Card>
 
@@ -110,7 +151,13 @@ export default function SchoolDetail() {
 
         <View style={{ marginTop: spacing.md }}>
           {filtered.length === 0 ? (
-            <Card><EmptyState icon="checkmark-done-outline" title="Nothing here" subtitle={`No ${tab} students.`} /></Card>
+            <Card>
+              <EmptyState
+                icon={students.length ? 'checkmark-done-outline' : 'people-outline'}
+                title={students.length ? 'Nothing here' : 'No students yet'}
+                subtitle={students.length ? `No ${TABS.find((t) => t.key === tab)?.label.toLowerCase()} students.` : 'Tap Add Student above to add the first one.'}
+              />
+            </Card>
           ) : filtered.map((s) => (
             <Card key={s.id} style={{ marginBottom: spacing.md }}>
               <Pressable onPress={() => router.push(`/student/${s.id}`)} testID={`detail-student-${s.id}`}>
@@ -118,7 +165,9 @@ export default function SchoolDetail() {
                   <View style={{ flex: 1 }}>
                     <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>{s.name}</Text>
                     <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>Class {s.standard} · {s.parent_mobile}</Text>
-                    <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>Due: {formatDate(s.due_date)}</Text>
+                    <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>
+                      {s.next_due_date ? `Due: ${formatDate(s.next_due_date)}` : 'Fully paid'}
+                    </Text>
                   </View>
                   <View style={{ alignItems: 'flex-end' }}>
                     <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: tab === 'completed' ? palette.success : palette.warning }}>

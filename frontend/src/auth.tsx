@@ -67,10 +67,25 @@ const AuthContext = createContext<AuthCtx>({
   logout: async () => { },
 });
 
+// Set by AuthProvider so apiFetch can sign the app out when the server says
+// the session is over. Clearing only the stored token wasn't enough: the
+// provider still held it in memory, so AuthGuard saw a signed-in user on the
+// login screen and sent them straight back to a page whose requests all
+// failed — an endless spinner instead of the login screen.
+let onSessionExpired: (() => void) | null = null;
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
   const [admin, setAdmin] = useState<AdminMe | null>(null);
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    onSessionExpired = () => {
+      setToken(null);
+      setAdmin(null);
+    };
+    return () => { onSessionExpired = null; };
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -143,8 +158,9 @@ export async function apiFetch<T = any>(path: string, opts: RequestInit = {}): P
   });
   if (res.status === 401) {
     await AsyncStorage.removeItem(TOKEN_KEY);
+    onSessionExpired?.();
     router.replace('/(auth)/login');
-    throw new Error('Unauthorized');
+    throw new Error('Your session has expired. Please log in again.');
   }
   const text = await res.text();
   const isJson = (res.headers.get('content-type') || '').includes('application/json');

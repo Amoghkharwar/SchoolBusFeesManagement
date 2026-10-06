@@ -7,6 +7,7 @@ import { apiFetch, API_BASE, TOKEN_STORAGE_KEY, useAuth } from '@/src/auth';
 import { useFY } from '@/src/fy';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { Button, Card, TextField } from '@/src/components/ui';
+import { plural } from '@/src/utils/format';
 
 interface School { id: string; name: string }
 
@@ -33,9 +34,9 @@ export default function Reports() {
       const res: any = await apiFetch(`/archive/${action}?fy=${encodeURIComponent(fy)}`, { method: 'POST' });
       const where = res.stored_in === 'firebase' ? 'Firebase Storage' : 'local MongoDB';
       if (action === 'backup') {
-        setArchiveMsg(`Backup saved to ${where}: ${res.counts.schools} schools, ${res.counts.students} students, ${res.counts.payments} payments.${res.warning ? ' (Firebase fallback — bucket not enabled)' : ''}`);
+        setArchiveMsg(`Backup saved to ${where}: ${plural(res.counts.schools, 'school')}, ${plural(res.counts.students, 'student')}, ${plural(res.counts.payments, 'payment')}.${res.warning ? ' (Firebase fallback — bucket not enabled)' : ''}`);
       } else {
-        setArchiveMsg(`Restore complete: ${res.restored.schools} schools, ${res.restored.students} students, ${res.restored.payments} payments.`);
+        setArchiveMsg(`Restore complete: ${plural(res.restored.schools, 'school')}, ${plural(res.restored.students, 'student')}, ${plural(res.restored.payments, 'payment')}.`);
       }
     } catch (e: any) {
       setArchiveMsg(`Error: ${e.message}`);

@@ -19,6 +19,30 @@ export function formatINR(n: number | string | undefined | null, withSymbol = tr
   return (withSymbol ? '₹' : '') + (neg ? '-' : '') + formatted;
 }
 
+/** Like formatINR, but keeps paise when there are any — for amounts that were
+ *  actually recorded with them (₹7,000.50), where rounding to ₹7,001 would
+ *  show a figure nobody paid. Whole amounts read exactly as formatINR. */
+export function formatINRExact(n: number | string | undefined | null): string {
+  const v = Math.round(Number(n || 0) * 100) / 100;
+  if (Number.isNaN(v) || Number.isInteger(v)) return formatINR(v);
+  const rupees = Math.trunc(v);
+  const paise = Math.round(Math.abs(v - rupees) * 100).toString().padStart(2, '0');
+  return `${formatINR(rupees)}.${paise}`;
+}
+
+/** "1 student", "2 students". */
+export function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+/** Fees and salaries are whole rupees. A typed "." is left in the field rather
+ *  than stripped — stripping merged the paise into the rupees (6000.75 became
+ *  600075) — and this names the problem under the field instead. */
+export function wholeRupeeError(text: string): string | undefined {
+  if (text.includes('.')) return 'Whole rupees only — remove the "." and the paise';
+  return undefined;
+}
+
 /** Build a wa.me URL with a sanitized phone number + text. */
 export function buildWhatsAppUrl(phone: string, text: string): string {
   const digits = (phone || '').replace(/\D+/g, '');

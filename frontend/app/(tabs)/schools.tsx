@@ -14,6 +14,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { apiFetch } from '@/src/auth';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { Card, EmptyState, FAB, TextField } from '@/src/components/ui';
+import { plural } from '@/src/utils/format';
 
 interface School {
   id: string;
@@ -82,7 +83,7 @@ export default function Schools() {
                   <View style={{ flex: 1, marginLeft: spacing.md }}>
                     <Text style={{ fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface }}>{item.name}</Text>
                     <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: 2 }}>
-                      {item.student_count ?? 0} students {item.address ? ` · ${item.address}` : ''}
+                      {plural(item.student_count ?? 0, 'student')}{item.address ? ` · ${item.address}` : ''}
                     </Text>
                   </View>
                   <Ionicons name="chevron-forward" size={20} color={palette.muted} />

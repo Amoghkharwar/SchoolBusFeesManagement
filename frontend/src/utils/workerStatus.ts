@@ -51,11 +51,3 @@ export function workerBadge(
       return { label: 'Cleared', color: palette.success };
   }
 }
-
-/** Salary fields take whole rupees. The "." is let through rather than
- *  silently dropped — dropping it turned 6000.75 into 600075 — and this names
- *  the problem under the field instead. */
-export function wholeRupeeError(text: string): string | undefined {
-  if (text.includes('.')) return 'Whole rupees only — remove the "." and the paise';
-  return undefined;
-}

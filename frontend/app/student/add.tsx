@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useLocalSearchParams } from 'expo-router';
+import { goBack } from '@/src/utils/nav';
 import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
@@ -43,6 +44,8 @@ function fieldForServerError(msg: string): FieldKey | null {
 export default function StudentForm() {
   const { id, school_id: presetSchool } = useLocalSearchParams<{ id?: string; school_id?: string }>();
   const editing = !!id && id !== 'add';
+  const back = () =>
+    goBack(editing ? `/student/${id}` : presetSchool ? `/school/${presetSchool}` : '/(tabs)/students');
   const { palette } = useTheme();
   const { meta: fyInfo } = useFY();
   const [schools, setSchools] = useState<School[]>([]);
@@ -162,7 +165,7 @@ export default function StudentForm() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-        <Pressable onPress={() => router.back()} style={{ padding: 6 }}><Ionicons name="chevron-back" size={24} color={palette.onSurface} /></Pressable>
+        <Pressable onPress={back} style={{ padding: 6 }} testID="student-form-back"><Ionicons name="chevron-back" size={24} color={palette.onSurface} /></Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>{editing ? 'Edit Student' : 'Add Student'}</Text>
       </View>
       {hydrating ? (
@@ -324,7 +327,7 @@ export default function StudentForm() {
         onClose={() => {
           setSuccessMsg('');
           // Added from a school's page → back to that school, where it now shows.
-          if (editing || presetSchool) router.back();
+          if (editing || presetSchool) back();
           else router.replace('/(tabs)/students');
         }}
         testID="student-form-success"

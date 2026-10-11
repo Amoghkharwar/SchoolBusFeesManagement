@@ -73,21 +73,6 @@ export async function enablePush(): Promise<PushState> {
   return 'granted';
 }
 
-/** Shows a notification without touching the network — isolates display problems. */
-export async function showLocalTest(): Promise<void> {
-  if (!pushSupported()) throw new Error('This browser does not support notifications');
-  if (Notification.permission !== 'granted') {
-    throw new Error(`Permission is "${Notification.permission}", not "granted"`);
-  }
-  const reg = await navigator.serviceWorker.getRegistration('/sw.js');
-  if (!reg) throw new Error('No service worker is registered on this page');
-  await reg.showNotification('Local test', {
-    body: 'Shown by this device directly — no server involved.',
-    icon: '/icon-192.png',
-    tag: 'local-test',
-  });
-}
-
 export async function disablePush(): Promise<void> {
   if (!pushSupported()) return;
   const reg = await navigator.serviceWorker.getRegistration('/sw.js');

@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -22,7 +23,7 @@ import { calendarDateToDisplay, calendarDateToLocalIso, isoToCalendarDate } from
 import { downloadFile } from '@/src/utils/download';
 import { AlertModal, Card, DangerConfirmModal, DateTimeField, EmptyState } from '@/src/components/ui';
 import type { PushState } from '@/src/push';
-import { enablePush, pushPermission, showLocalTest, syncPush } from '@/src/push';
+import { enablePush, pushPermission, syncPush } from '@/src/push';
 import { Skeleton, SkeletonCard, SkeletonKPI } from '@/src/components/Skeleton';
 
 interface Summary {
@@ -100,44 +101,28 @@ export default function Dashboard() {
 
   const [pushState, setPushState] = useState<PushState>('unsupported');
   const [pushMsg, setPushMsg] = useState('');
+  // Turning notifications on asks for permission and registers this device;
+  // the ref blocks a second tap while that runs — react-native-web only applies
+  // `disabled` after the repaint, too late for a quick double tap.
+  const [pushBusy, setPushBusy] = useState(false);
+  const pushBusyRef = useRef(false);
 
   useEffect(() => {
     setPushState(pushPermission());
     syncPush();
   }, []);
 
-  // Already on: run the two tests instead of switching off. A local notification
-  // tells us whether this device can display at all, and the server round-trip
-  // tells us whether delivery works — which is the pair that actually diagnoses
-  // "nothing appeared".
-  const runPushTests = async () => {
-    try {
-      await showLocalTest();
-    } catch (e: any) {
-      setPushMsg(`Local test failed: ${e?.message || e}. Notifications are blocked on this device.`);
-      return;
-    }
-    try {
-      const r = await apiFetch<{ sent: number; total: number; errors?: string[] }>(
-        '/push/test',
-        { method: 'POST' },
-      );
-      setPushMsg(
-        `Local test shown. Server sent to ${r.sent} of ${r.total} device(s).` +
-          (r.errors?.length ? ` Errors: ${r.errors.join('; ')}` : '') +
-          ' If you saw the first but not the second, delivery is the problem.',
-      );
-    } catch (e: any) {
-      setPushMsg(`Local test shown, but the server test failed: ${e?.message || e}`);
-    }
-  };
-
   const togglePush = async () => {
-    if (pushState === 'granted') {
-      await runPushTests();
-      return;
-    }
+    if (pushBusyRef.current) return;
+    pushBusyRef.current = true;
+    setPushBusy(true);
     try {
+      // Already on: say so. It used to fire a test push at every registered
+      // device and show a delivery diagnostic instead.
+      if (pushState === 'granted') {
+        setPushMsg('Notifications are on for this device. You will be alerted when a student or school is added.');
+        return;
+      }
       const next = await enablePush();
       setPushState(next);
       setPushMsg(
@@ -149,6 +134,9 @@ export default function Dashboard() {
       );
     } catch (e: any) {
       setPushMsg(e?.message || 'Could not enable notifications.');
+    } finally {
+      pushBusyRef.current = false;
+      setPushBusy(false);
     }
   };
 
@@ -390,13 +378,19 @@ export default function Dashboard() {
         </View>
         <View style={{ flexDirection: 'row', gap: spacing.sm }}>
           {pushState !== 'unsupported' && (
-            <Pressable onPress={togglePush} testID="push-toggle"
+            <Pressable onPress={togglePush} disabled={pushBusy} testID="push-toggle"
+              accessibilityLabel={pushBusy ? 'Sending test notification…' : 'Notifications'}
+              accessibilityState={{ busy: pushBusy, disabled: pushBusy }}
               style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: palette.surfaceTertiary, alignItems: 'center', justifyContent: 'center' }}>
-              <Ionicons
-                name={pushState === 'granted' ? 'notifications' : 'notifications-off-outline'}
-                size={18}
-                color={pushState === 'granted' ? palette.brand : palette.onSurface}
-              />
+              {pushBusy ? (
+                <ActivityIndicator size="small" color={palette.brand} testID="push-sending" />
+              ) : (
+                <Ionicons
+                  name={pushState === 'granted' ? 'notifications' : 'notifications-off-outline'}
+                  size={18}
+                  color={pushState === 'granted' ? palette.brand : palette.onSurface}
+                />
+              )}
             </Pressable>
           )}
           <Pressable onPress={cycleTheme} testID="theme-toggle"

@@ -11,6 +11,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
+import { goBack } from '@/src/utils/nav';
 import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch, useAuth } from '@/src/auth';
@@ -178,7 +179,7 @@ export default function StudentDetail() {
     try {
       await apiFetch(`/students/${id}`, { method: 'DELETE' });
       setShowDeleteConfirm(false);
-      router.back();
+      goBack('/(tabs)/students');
     } catch (e: any) {
       setShowDeleteConfirm(false);
       setModalErr(e.message);
@@ -230,7 +231,7 @@ export default function StudentDetail() {
     return (
       <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
         <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-          <Pressable onPress={() => router.back()} style={{ padding: 6 }} testID="student-back">
+          <Pressable onPress={() => goBack('/(tabs)/students')} style={{ padding: 6 }} testID="student-back">
             <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
           </Pressable>
           <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>Student</Text>
@@ -252,7 +253,7 @@ export default function StudentDetail() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-        <Pressable onPress={() => router.back()} style={{ padding: 6 }} testID="student-back">
+        <Pressable onPress={() => goBack('/(tabs)/students')} style={{ padding: 6 }} testID="student-back">
           <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
         </Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>Student</Text>

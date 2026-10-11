@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Pressable, ScrollView, Text, View, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
+import { goBack } from '@/src/utils/nav';
 import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
@@ -67,7 +68,7 @@ export default function SchoolDetail() {
 
   const remove = async () => {
     await apiFetch(`/schools/${id}`, { method: 'DELETE' });
-    router.back();
+    goBack('/(tabs)/schools');
   };
 
   if (loading) return <ActivityIndicator color={palette.brand} style={{ flex: 1, marginTop: 80 }} />;
@@ -76,7 +77,7 @@ export default function SchoolDetail() {
     return (
       <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
         <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-          <Pressable onPress={() => router.back()} testID="school-back" style={{ padding: 6 }}>
+          <Pressable onPress={() => goBack('/(tabs)/schools')} testID="school-back" style={{ padding: 6 }}>
             <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
           </Pressable>
           <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>School</Text>
@@ -94,7 +95,7 @@ export default function SchoolDetail() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-        <Pressable onPress={() => router.back()} testID="school-back" style={{ padding: 6 }}>
+        <Pressable onPress={() => goBack('/(tabs)/schools')} testID="school-back" style={{ padding: 6 }}>
           <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
         </Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>{school.name}</Text>

@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import bcrypt
 import jwt
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -38,6 +38,9 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "12345678")
 
 FIREBASE_CREDENTIALS_PATH = os.environ.get("FIREBASE_CREDENTIALS_PATH", "")
 FIREBASE_BUCKET = os.environ.get("FIREBASE_BUCKET", "")
+
+# Shared secret for POST /api/cron/overdue-alerts; the endpoint is off when unset.
+CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
 
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
 VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
@@ -682,6 +685,8 @@ async def startup() -> None:
     await db.salary_payments.create_index("worker_id")
     await db.worker_absences.create_index("id", unique=True)
     await db.worker_absences.create_index("worker_id")
+    # One overdue alert per student per due date — also the send lock.
+    await db.overdue_alerts.create_index([("student_id", 1), ("due_date", 1)], unique=True)
 
     # Migrate old admins → users
     async for old in db.admins.find({}):
@@ -754,9 +759,15 @@ async def startup() -> None:
         await db.schools.insert_many([dict(s) for s in sample_schools])
         logger.info("Seeded sample schools")
 
+    global _alert_task
+    import asyncio
+    _alert_task = asyncio.create_task(_overdue_alert_loop())
+
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    if _alert_task:
+        _alert_task.cancel()
     client.close()
 
 
@@ -1131,16 +1142,6 @@ async def push_unsubscribe(body: Dict[str, str], admin=Depends(get_current_admin
     if endpoint:
         await db.push_subscriptions.delete_one({"endpoint": endpoint})
     return {"ok": True}
-
-
-@api.post("/push/test")
-async def push_test(admin=Depends(get_current_admin)):
-    report = await push_report(
-        "Test notification",
-        f"Push is working — sent by {admin.get('full_name') or admin.get('email')}.",
-        "/",
-    )
-    return {"ok": True, **report}
 
 
 # ---------- Payments ----------
@@ -2591,6 +2592,103 @@ async def pending_fees(fy: Optional[str] = None, admin=Depends(get_current_admin
         out.append(full)
     out.sort(key=lambda s: -s["overdue_days"])
     return out
+
+
+# ---------- Overdue alerts ----------
+_OVERDUE_ALERT_DAYS = 15
+# Daytime only. The overdue count ticks over at midnight, and a push at 00:01
+# for something that can wait until morning just wakes everyone up.
+_ALERT_HOURS_IST = range(9, 21)
+_ALERT_EVERY_SECONDS = 3600
+_alert_task: Any = None
+
+
+async def run_overdue_alerts() -> Dict[str, Any]:
+    """Pushes a reminder for each active student whose fee has gone 15 or more
+    days past its due date, once per due date. Students who cross the line
+    together share one notification so six devices don't buzz six times.
+
+    Each alert is claimed in `overdue_alerts` before it is sent — the unique
+    (student_id, due_date) index is the lock, so the hourly loop on two
+    instances can't both send it. A new next due date (after a part-payment)
+    is a new due date, and alerts again if that one runs 15 days late too.
+    """
+    from pymongo.errors import DuplicateKeyError
+
+    if _now_ist().hour not in _ALERT_HOURS_IST:
+        return {"alerted": 0, "reason": "outside 09:00–21:00 IST"}
+    fy_doc = await db.financial_years.find_one({}, {"_id": 0, "label": 1})
+    fy = fy_doc["label"] if fy_doc else None
+
+    claimed: List[Tuple[Dict[str, Any], str]] = []
+    for d in await db.students.find({"active": {"$ne": False}}, {"_id": 0}).to_list(10000):
+        s = await student_to_out(d, fy=fy)
+        due_day = _local_day(s.get("next_due_date"))
+        if s["status"] == "completed" or not due_day or s["overdue_days"] < _OVERDUE_ALERT_DAYS:
+            continue
+        try:
+            await db.overdue_alerts.insert_one({
+                "student_id": s["id"],
+                "due_date": due_day.isoformat(),
+                "overdue_days": s["overdue_days"],
+                "pending_amount": s["pending_amount"],
+                "created_at": now_iso(),
+            })
+        except DuplicateKeyError:
+            continue  # already alerted for this due date
+        claimed.append((s, due_day.isoformat()))
+    if not claimed:
+        return {"alerted": 0}
+
+    students = sorted((s for s, _ in claimed), key=lambda s: -s["overdue_days"])
+    if len(students) == 1:
+        s = students[0]
+        title = f"Fee overdue {_plural(s['overdue_days'], 'day')}"
+        body = (
+            f"{s['name']} ({s['school_name']}) owes {_inr(s['pending_amount'])}, "
+            f"due {_dmy(_local_day(s.get('next_due_date')))}."
+        )
+        url = f"/student/{s['id']}"
+    else:
+        names = ", ".join(s["name"] for s in students[:4])
+        if len(students) > 4:
+            names += f" and {len(students) - 4} more"
+        title = f"{len(students)} fees overdue {_OVERDUE_ALERT_DAYS}+ days"
+        body = f"{names} — {_inr(sum(s['pending_amount'] for s in students))} pending in all."
+        url = "/pending"
+
+    report = await push_report(title, body, url)
+    if report.get("total") and not report.get("sent"):
+        # Every device failed (push service down, say) — release the claims so
+        # the next hourly run tries again instead of the alert being lost.
+        for s, day in claimed:
+            await db.overdue_alerts.delete_one({"student_id": s["id"], "due_date": day})
+    return {"alerted": len(students), **report}
+
+
+async def _overdue_alert_loop() -> None:
+    import asyncio
+
+    while True:
+        try:
+            result = await run_overdue_alerts()
+            if result.get("alerted"):
+                logger.info("Overdue alerts: %s", result)
+        except Exception as e:  # a failed check must never take the loop down
+            logger.warning("Overdue alert check failed: %s", e)
+        await asyncio.sleep(_ALERT_EVERY_SECONDS)
+
+
+@api.post("/cron/overdue-alerts")
+async def cron_overdue_alerts(x_cron_secret: Optional[str] = Header(None)):
+    """Runs the overdue check on demand, for an outside scheduler. A host that
+    sleeps between requests (Render's free plan) stops the hourly loop with it,
+    so a daily ping here keeps alerts going. Off unless CRON_SECRET is set."""
+    import hmac
+
+    if not CRON_SECRET or not hmac.compare_digest(x_cron_secret or "", CRON_SECRET):
+        raise HTTPException(404, "Not Found")
+    return await run_overdue_alerts()
 
 
 # ---------- Dashboard ----------

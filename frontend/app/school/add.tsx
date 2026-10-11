@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useLocalSearchParams } from 'expo-router';
+import { goBack } from '@/src/utils/nav';
 import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch } from '@/src/auth';
@@ -23,6 +24,7 @@ function phoneError(phone: string): string | undefined {
 export default function SchoolForm() {
   const { id } = useLocalSearchParams<{ id?: string }>();
   const editing = !!id && id !== 'add';
+  const back = () => goBack(editing ? `/school/${id}` : '/(tabs)/schools');
   const { palette } = useTheme();
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
@@ -78,7 +80,7 @@ export default function SchoolForm() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: palette.surface }} edges={['top']}>
       <View style={{ flexDirection: 'row', alignItems: 'center', padding: spacing.md, borderBottomWidth: 1, borderBottomColor: palette.border }}>
-        <Pressable onPress={() => router.back()} style={{ padding: 6 }}><Ionicons name="chevron-back" size={24} color={palette.onSurface} /></Pressable>
+        <Pressable onPress={back} style={{ padding: 6 }} testID="school-form-back"><Ionicons name="chevron-back" size={24} color={palette.onSurface} /></Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>{editing ? 'Edit School' : 'Add School'}</Text>
       </View>
       {hydrating ? (
@@ -127,7 +129,7 @@ export default function SchoolForm() {
           setSuccessMsg('');
           // A new school opens on its own page, where its first students get added.
           if (createdId) router.replace(`/school/${createdId}` as any);
-          else router.back();
+          else back();
         }}
         testID="school-form-success"
       />

@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   KeyboardAvoidingView,
-  Linking,
   Modal,
   Platform,
   Pressable,
@@ -14,14 +13,13 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-
-import { apiFetch, useAuth, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
+import { apiFetch, useAuth } from '@/src/auth';
 import type { FYMeta } from '@/src/fy';
 import { useFY } from '@/src/fy';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { formatINR, plural } from '@/src/utils/format';
 import { calendarDateToDisplay, calendarDateToLocalIso, isoToCalendarDate } from '@/src/utils/datetime';
+import { downloadFile } from '@/src/utils/download';
 import { AlertModal, Card, DangerConfirmModal, DateTimeField, EmptyState } from '@/src/components/ui';
 import type { PushState } from '@/src/push';
 import { enablePush, pushPermission, showLocalTest, syncPush } from '@/src/push';
@@ -46,6 +44,14 @@ interface InactiveStudent {
   paid_amount: number;
 }
 
+/** The salary side of the business, from /work/summary. */
+interface WorkSummary {
+  total_workers: number;
+  total_paid: number;
+  /** Salary for months that have already ended and is still unpaid. */
+  matured_pending: number;
+}
+
 interface SchoolStat {
   school_id: string;
   school_name: string;
@@ -64,6 +70,7 @@ export default function Dashboard() {
   const { current: fy, years, fyMeta, meta: fyInfo, needsSetup, refresh: refreshFY, closeFY, deleteYear, resetData, createFY, updateFY, previewLabel } = useFY();
   const [summary, setSummary] = useState<Summary | null>(null);
   const [schools, setSchools] = useState<SchoolStat[]>([]);
+  const [work, setWork] = useState<WorkSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -146,11 +153,17 @@ export default function Dashboard() {
   };
 
   const isAdmin = admin?.role === 'admin';
+  // Salary figures only for people who can open Work Management — the same
+  // default the tab bar uses when no page list is set.
+  const canSeeWork = (admin?.page_permissions ?? ['work']).includes('work');
 
   // Find any older financial year that is still open (e.g. 2025-2026 when active year is 2026-2027)
   // A year expires when today passes its end date. That is a prompt to export
   // and roll over — nothing closes or deletes itself.
   const expiredFY = fyInfo?.expired ? fyInfo : null;
+  // Deleting a student takes their payments out of the year's totals, so it
+  // only opens once the year has ended (or when no year is set up at all).
+  const canDeleteStudents = isAdmin && (!fyInfo || !!fyInfo.expired);
 
   const openFyModal = (edit?: FYMeta) => {
     setFyError('');
@@ -256,21 +269,16 @@ export default function Dashboard() {
 
   // ── Download ──────────────────────────────────────────────
   const handleDownloadReport = async (format: 'pdf' | 'excel') => {
-    if (!actionFY) return;
+    if (!actionFY || actionBusy) return;
     setActionBusy(format);
     setActionMsg('');
     try {
-      const token = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
-      const params = new URLSearchParams();
-      params.set('fy', actionFY.label);
-      if (token) params.set('token', token);
-      const url = `${API_BASE}/reports/${format}?${params.toString()}`;
-      await Linking.openURL(url);
-      setActionMsg(
-        format === 'pdf'
-          ? '✓ PDF opened — use Share → Save to keep it.'
-          : '✓ Excel download started — check your Downloads folder.',
+      const ext = format === 'pdf' ? 'pdf' : 'xlsx';
+      const name = await downloadFile(
+        `/reports/${format}?fy=${encodeURIComponent(actionFY.label)}`,
+        `bus-fee-report-${actionFY.label}.${ext}`,
       );
+      setActionMsg(`✓ Downloaded ${name}`);
     } catch (e: any) {
       setActionMsg(`Error: ${e.message || 'Failed to open report'}`);
     } finally {
@@ -323,19 +331,22 @@ export default function Dashboard() {
   const load = useCallback(async () => {
     try {
       const q = fy ? `?fy=${fy}` : '';
-      const [s, by, gone] = await Promise.all([
+      const [s, by, gone, w] = await Promise.all([
         apiFetch<Summary>(`/dashboard/summary${q}`),
         apiFetch<SchoolStat[]>(`/dashboard/by-school${q}`),
         apiFetch<InactiveStudent[]>('/students?active=false'),
+        // Optional: a failure here must not blank the fee figures.
+        canSeeWork ? apiFetch<WorkSummary>('/work/summary').catch(() => null) : Promise.resolve(null),
       ]);
       setSummary(s);
       setSchools(by);
+      setWork(w);
       setInactiveStudents([...gone].sort((a, b) => a.name.localeCompare(b.name)));
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [fy]);
+  }, [fy, canSeeWork]);
 
   useFocusEffect(useCallback(() => {
     setLoading(true);
@@ -490,11 +501,22 @@ export default function Dashboard() {
               <KPI icon="people" label="Students" value={String(summary?.total_students ?? 0)} />
               <KPI icon="cash" label="Collected" value={formatINR(summary?.total_collected)} accent="success" />
               <KPI icon="alert-circle" label="Pending" value={formatINR(summary?.total_pending)} accent="warning" />
+              {work && work.total_workers > 0 ? (
+                <>
+                  <KPI icon="wallet" label="Salary paid" value={formatINR(work.total_paid)} accent="success" />
+                  <KPI icon="time" label="Salary due" value={formatINR(work.matured_pending)} accent="warning" />
+                </>
+              ) : null}
             </View>
 
             <Text style={[styles.sectionTitle, { color: palette.onSurface }]}>
               Inactive students · {summary?.inactive_students ?? inactiveStudents.length}
             </Text>
+            {isAdmin && inactiveStudents.length > 0 && !canDeleteStudents ? (
+              <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -spacing.sm, marginBottom: spacing.sm }}>
+                {`They can be deleted permanently after FY ${fyInfo?.label} ends${fyInfo?.end_date ? ` on ${calendarDateToDisplay(fyInfo.end_date)}` : ''} — until then their payments count in this year's totals.`}
+              </Text>
+            ) : null}
             {inactiveStudents.length === 0 ? (
               <Card style={{ marginBottom: spacing.lg }}>
                 <Text style={{ color: palette.muted, fontSize: fontSize.sm }}>
@@ -517,7 +539,7 @@ export default function Dashboard() {
                         {st.school_name} · Class {st.standard} · {formatINR(st.paid_amount)} paid
                       </Text>
                     </Pressable>
-                    {isAdmin ? (
+                    {canDeleteStudents ? (
                       <Pressable
                         onPress={() => setDeleteTarget(st)}
                         testID={`delete-inactive-${st.id}`}
@@ -947,7 +969,7 @@ function KPI({ icon, label, value, accent }: { icon: any; label: string; value: 
   const { palette } = useTheme();
   const color = accent === 'success' ? palette.success : accent === 'warning' ? palette.warning : palette.brand;
   return (
-    <View testID={`kpi-${label.toLowerCase()}`} style={{
+    <View testID={`kpi-${label.toLowerCase().replace(/\s+/g, '-')}`} style={{
       flex: 1, minWidth: '46%',
       backgroundColor: palette.surfaceSecondary,
       padding: spacing.md, borderRadius: radii.lg,

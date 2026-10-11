@@ -1,7 +1,6 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  Linking,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -10,12 +9,12 @@ import {
   Text,
   View,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
-import { apiFetch, useAuth, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
+import { apiFetch, useAuth } from '@/src/auth';
+import { downloadFile } from '@/src/utils/download';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { AlertModal, Button, Card, ConfirmModal, DangerConfirmModal, EmptyState, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR, plural, wholeRupeeError } from '@/src/utils/format';
@@ -722,14 +721,12 @@ export default function WorkerDetail() {
     }
   };
 
-  // Downloads stream the file, so they go through the URL with the token as a
-  // query param rather than apiFetch — same route the fee reports take.
   const downloadPdf = async () => {
+    if (downloading) return;
     setDownloading(true);
     try {
-      const token = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
-      const qs = token ? `?token=${encodeURIComponent(token)}` : '';
-      await Linking.openURL(`${API_BASE}/workers/${id}/report/pdf${qs}`);
+      const name = await downloadFile(`/workers/${id}/report/pdf`, 'salary-record.pdf');
+      setSuccessMsg(`Downloaded ${name}`);
     } catch (e: any) {
       setModalErr(e?.message || 'Could not open the PDF.');
     } finally {
@@ -1076,7 +1073,7 @@ export default function WorkerDetail() {
             >
               <Ionicons name="download-outline" size={16} color="#fff" />
               <Text style={{ color: '#fff', fontWeight: '700', fontSize: fontSize.sm, marginLeft: 6 }}>
-                {downloading ? 'Opening PDF…' : 'Download record as PDF'}
+                {downloading ? 'Preparing PDF…' : 'Download record as PDF'}
               </Text>
             </Pressable>
 
@@ -1461,7 +1458,7 @@ export default function WorkerDetail() {
         }
         busy={purging}
         note="Download the record first — this is the only copy, and it cannot be recovered afterwards."
-        actionLabel={downloading ? 'Opening PDF…' : 'Download record as PDF'}
+        actionLabel={downloading ? 'Preparing PDF…' : 'Download record as PDF'}
         onAction={downloadPdf}
         onCancel={() => setPurgeScope(null)}
         onConfirm={runPurge}

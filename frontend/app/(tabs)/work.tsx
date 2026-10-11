@@ -1,8 +1,6 @@
 import React, { useCallback, useMemo, useRef, useState } from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ActivityIndicator,
-  Linking,
   FlatList,
   Pressable,
   RefreshControl,
@@ -14,10 +12,11 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { router, useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
-import { apiFetch, useAuth, API_BASE, TOKEN_STORAGE_KEY } from '@/src/auth';
+import { apiFetch, useAuth } from '@/src/auth';
 import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { AlertModal, Card, DangerConfirmModal, EmptyState, FAB, TextField } from '@/src/components/ui';
 import { formatINR } from '@/src/utils/format';
+import { downloadFile } from '@/src/utils/download';
 import { owed, workerBadge, workerBadgeKind } from '@/src/utils/workerStatus';
 
 export interface WorkerRow {
@@ -94,6 +93,7 @@ export default function Work() {
   const [purging, setPurging] = useState(false);
   const [notice, setNotice] = useState('');
   const [downloading, setDownloading] = useState(false);
+  const [downloaded, setDownloaded] = useState('');
   // Every focus fires a load, and an older one can come back after a newer one —
   // only the latest request is allowed to paint, so the list never steps back
   // to what it looked like before an edit.
@@ -127,14 +127,11 @@ export default function Work() {
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
-  // Streams the file, so it goes through the URL with the token as a query param
-  // rather than apiFetch — the same route the fee reports take.
   const downloadAll = async () => {
+    if (downloading) return;
     setDownloading(true);
     try {
-      const token = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
-      const qs = token ? `?token=${encodeURIComponent(token)}` : '';
-      await Linking.openURL(`${API_BASE}/work/report/pdf${qs}`);
+      setDownloaded(await downloadFile('/work/report/pdf', 'work-management.pdf'));
     } catch (e: any) {
       setError(e?.message || 'Could not open the PDF.');
     } finally {
@@ -318,7 +315,7 @@ export default function Work() {
         }
         busy={purging}
         note="Download the full record first — this is the only copy, and it cannot be recovered afterwards."
-        actionLabel={downloading ? 'Opening PDF…' : 'Download all data as PDF'}
+        actionLabel={downloading ? 'Preparing PDF…' : 'Download all data as PDF'}
         onAction={downloadAll}
         onCancel={() => setShowPurge(false)}
         onConfirm={purgeAll}
@@ -332,6 +329,15 @@ export default function Work() {
         message={notice}
         onClose={() => setNotice('')}
         testID="work-purge-done"
+      />
+
+      <AlertModal
+        visible={!!downloaded}
+        variant="success"
+        title="PDF downloaded"
+        message={`Saved as ${downloaded}.`}
+        onClose={() => setDownloaded('')}
+        testID="work-download-done"
       />
     </SafeAreaView>
   );

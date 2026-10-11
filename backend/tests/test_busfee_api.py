@@ -313,10 +313,15 @@ class TestReports:
         assert r.headers.get("content-type", "").startswith("application/pdf")
         assert r.content[:4] == b"%PDF", f"Not a PDF: {r.content[:10]!r}"
 
-    def test_pdf_token_query(self, admin_token):
+    def test_pdf_token_query_refused(self, admin_token):
+        # A token in the URL leaks through history and logs — header only.
         r = requests.get(f"{BASE_URL}/api/reports/pdf?token={admin_token}", timeout=30)
-        assert r.status_code == 200
-        assert r.content[:4] == b"%PDF"
+        assert r.status_code == 401
+
+    def test_pdf_invalid_date_refused(self, auth_headers):
+        r = requests.get(f"{BASE_URL}/api/reports/pdf?start=99/99/2026", headers=auth_headers, timeout=30)
+        assert r.status_code == 400
+        assert "not a valid date" in r.json()["detail"]
 
     def test_pdf_no_auth(self):
         r = requests.get(f"{BASE_URL}/api/reports/pdf", timeout=15)
@@ -329,10 +334,9 @@ class TestReports:
         assert "spreadsheetml" in ct, f"Wrong CT: {ct}"
         assert r.content[:2] == b"PK", "xlsx must start with PK zip magic"
 
-    def test_excel_token_query(self, admin_token):
+    def test_excel_token_query_refused(self, admin_token):
         r = requests.get(f"{BASE_URL}/api/reports/excel?token={admin_token}", timeout=30)
-        assert r.status_code == 200
-        assert r.content[:2] == b"PK"
+        assert r.status_code == 401
 
     def test_pdf_with_filters(self, auth_headers):
         r = requests.get(f"{BASE_URL}/api/reports/pdf?status=pending&fy=2026-2027",

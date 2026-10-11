@@ -14,6 +14,7 @@ import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
 import { apiFetch, useAuth } from '@/src/auth';
+import { useFY } from '@/src/fy';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
 import { AlertModal, Button, Card, ConfirmModal, DangerConfirmModal, EmptyState, StatusBadge, TextField, DateTimeField } from '@/src/components/ui';
 import { formatINR, formatINRExact, openWhatsApp, plural, reminderMessage, wholeRupeeError } from '@/src/utils/format';
@@ -93,6 +94,11 @@ export default function StudentDetail() {
   // the server refuses it for everyone else, so don't offer the button.
   const { admin } = useAuth();
   const canDelete = !!(admin?.capabilities?.delete ?? admin?.role === 'admin');
+  // A student's payments are part of the running year's totals, so deleting
+  // the student (which deletes them too) waits until that year has ended.
+  const { meta: fyInfo } = useFY();
+  const fyRunning = !!fyInfo && !fyInfo.expired;
+  const [deleteBlocked, setDeleteBlocked] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) return null;
@@ -254,7 +260,11 @@ export default function StudentDetail() {
           <Ionicons name="create-outline" size={22} color={palette.onSurface} />
         </Pressable>
         {canDelete ? (
-          <Pressable onPress={() => setShowDeleteConfirm(true)} testID="student-delete" style={{ padding: 6, marginLeft: 4 }}>
+          <Pressable
+            onPress={() => (fyRunning ? setDeleteBlocked(true) : setShowDeleteConfirm(true))}
+            testID="student-delete"
+            style={{ padding: 6, marginLeft: 4 }}
+          >
             <Ionicons name="trash-outline" size={22} color={palette.error} />
           </Pressable>
         ) : null}
@@ -496,6 +506,23 @@ export default function StudentDetail() {
         onCancel={() => setShowDeleteConfirm(false)}
         onConfirm={remove}
         testID="student-delete-confirm"
+      />
+
+      <AlertModal
+        visible={deleteBlocked}
+        title="Can't delete yet"
+        message={
+          `${student.name} can be deleted permanently only after FY ${fyInfo?.label} ends` +
+          `${fyInfo?.end_date ? ` on ${calendarDateToDisplay(fyInfo.end_date)}` : ''}` +
+          ` — until then their payments count in this year's totals.` +
+          (inactive
+            ? ''
+            : fullyPaid
+            ? ' If they have left, mark them inactive from the edit screen.'
+            : ` If they are leaving, collect the remaining ${formatINR(pendingNow)} first, then mark them inactive.`)
+        }
+        onClose={() => setDeleteBlocked(false)}
+        testID="student-delete-blocked"
       />
 
       <ConfirmModal

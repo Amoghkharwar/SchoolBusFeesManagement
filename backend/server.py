@@ -159,13 +159,14 @@ async def _admin_from_token(token: str) -> Dict[str, Any]:
 
 async def get_current_admin(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    token: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
-    """Accept token from Authorization header OR ?token=... query param (for downloads)."""
-    raw = creds.credentials if creds else token
-    if not raw:
+    """Token from the Authorization header only. Downloads used to pass it as
+    ?token=…, which left a working login in browser history, server logs and
+    any report link that got shared — the client now fetches files with the
+    header like every other request."""
+    if not creds:
         raise HTTPException(401, "Missing token")
-    return await _admin_from_token(raw)
+    return await _admin_from_token(creds.credentials)
 
 
 def require_role(*roles: str):
@@ -350,10 +351,12 @@ async def _fy_window(label: Optional[str]) -> Optional[Tuple[date, date]]:
 
 
 def _in_window(value: Optional[str], window: Optional[Tuple[date, date]]) -> bool:
-    """Both ends inclusive — a payment made on the last day of the year is in it."""
+    """Both ends inclusive — a payment made on the last day of the year is in it.
+    Read as the Indian calendar day: a payment taken at 02:00 IST on 1 June is
+    stored as 31 May in UTC, and counting that day put it in the wrong year."""
     if not window:
         return True
-    d = _period_day(value)
+    d = _local_day(value)
     return bool(d and window[0] <= d <= window[1])
 
 
@@ -363,7 +366,7 @@ async def _fy_entry_error(value: Optional[str], action: str) -> Optional[str]:
     A record has to land inside the running year's own window. That is the whole
     rule now — there is only ever one registered year, and its dates decide.
     """
-    dt = _period_day(value)
+    dt = _local_day(value)
     if not dt:
         return None
 
@@ -1059,8 +1062,32 @@ async def update_student(student_id: str, body: StudentIn, admin=Depends(get_cur
     return await student_to_out(doc)
 
 
+async def _running_fy_end() -> Optional[Tuple[str, date]]:
+    """(label, last day) of the financial year while it is still running, else
+    None — when it has ended, or none is set up. Only the end date counts:
+    closing a year early stops new payments but doesn't end it."""
+    doc = await db.financial_years.find_one({}, {"_id": 0, "label": 1})
+    if not doc:
+        return None
+    window = await _fy_window(doc["label"])
+    if window and _today() <= window[1]:
+        return doc["label"], window[1]
+    return None
+
+
 @api.delete("/students/{student_id}")
 async def delete_student(student_id: str, _=Depends(require_cap("delete"))):
+    # Deleting takes the student's payments with it. While the year is running
+    # those payments are part of its totals — Collected would drop by whatever
+    # they paid — so a student can only be deleted once the year has ended.
+    running = await _running_fy_end()
+    if running:
+        label, end = running
+        raise HTTPException(
+            400,
+            f"Students can be deleted only after Financial Year {label} ends on {_dmy(end)} — "
+            "until then their payments count in that year's totals. Mark them inactive if they have left.",
+        )
     await db.payments.delete_many({"student_id": student_id})
     await db.students.delete_one({"id": student_id})
     return {"ok": True}
@@ -1246,6 +1273,12 @@ def _today() -> date:
     return datetime.now(_IST).date()
 
 
+def _now_ist() -> datetime:
+    """The wall clock in India — for "Generated" stamps and file names, which
+    printed 5:30 behind on a server that runs in UTC."""
+    return datetime.now(_IST)
+
+
 def _local_day(value: Optional[str]) -> Optional[date]:
     """The calendar day an ISO instant falls on in India — what the user picked
     in the date picker, rather than the UTC day it was serialised as."""
@@ -1269,7 +1302,7 @@ def _dmy(d: Optional[date]) -> str:
 def _inr(n: float) -> str:
     """Rupee amount for a message the app shows — the same "₹4,899" the screen
     uses, so an error never quotes "Rs. 4899.0" next to it."""
-    return _format_inr(n).replace("Rs. ", "₹")
+    return "₹" + _group_inr(n)
 
 
 def _plural(n: float, word: str) -> str:
@@ -1998,40 +2031,86 @@ def _fmt_day(value: Optional[str]) -> str:
     return d.strftime("%d/%m/%Y") if d else "—"
 
 
+# Helvetica, reportlab's built-in font, has no ₹ glyph, so PDFs printed "Rs."
+# while the app showed "₹". DejaVu Sans (bundled under backend/fonts) has it.
+_FONT_DIR = ROOT_DIR / "fonts"
+_PDF_FONT_FILES = {"BusFee": "DejaVuSans.ttf", "BusFee-Bold": "DejaVuSans-Bold.ttf"}
+_HAS_RUPEE_FONT = all((_FONT_DIR / f).exists() for f in _PDF_FONT_FILES.values())
+_pdf_fonts_ready = False
+
+
+def _pdf_fonts() -> Tuple[str, str]:
+    """(regular, bold) font names for PDFs, registering the bundled pair once.
+    Falls back to Helvetica — and money to "Rs." — if the files are missing."""
+    global _HAS_RUPEE_FONT, _pdf_fonts_ready
+    if _HAS_RUPEE_FONT and not _pdf_fonts_ready:
+        try:
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+            for name, file in _PDF_FONT_FILES.items():
+                pdfmetrics.registerFont(TTFont(name, str(_FONT_DIR / file)))
+            pdfmetrics.registerFontFamily(
+                "BusFee", normal="BusFee", bold="BusFee-Bold", italic="BusFee", boldItalic="BusFee-Bold",
+            )
+            _pdf_fonts_ready = True
+        except Exception as e:
+            logger.error(f"PDF font registration failed, using Helvetica: {e}")
+            _HAS_RUPEE_FONT = False
+    if not _HAS_RUPEE_FONT:
+        return "Helvetica", "Helvetica-Bold"
+    return "BusFee", "BusFee-Bold"
+
+
 def _pdf_kit():
     """reportlab pieces plus this report's shared styling. Imported lazily so the
-    module keeps loading fast for every request that never renders a PDF."""
+    module keeps loading fast for every request that never renders a PDF.
+    Build the kit before formatting any money: it settles which rupee sign the
+    font can draw."""
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.platypus import (
         PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
     )
 
+    font, bold = _pdf_fonts()
     base = getSampleStyleSheet()
     brand = colors.HexColor("#2B4C3E")
     return SimpleNamespace(
-        colors=colors, A4=A4, mm=mm, brand=brand,
+        colors=colors, A4=A4, landscape=landscape, mm=mm, brand=brand, font=font, bold=bold,
         PageBreak=PageBreak, Paragraph=Paragraph, SimpleDocTemplate=SimpleDocTemplate,
         Spacer=Spacer, Table=Table, TableStyle=TableStyle,
-        title=ParagraphStyle("T", parent=base["Title"], fontSize=18, textColor=brand, alignment=0),
-        sub=ParagraphStyle("S", parent=base["Normal"], fontSize=9, textColor=colors.HexColor("#6B7280")),
-        h2=ParagraphStyle("H2", parent=base["Heading2"], fontSize=13, textColor=brand,
+        title=ParagraphStyle("T", parent=base["Title"], fontName=bold, fontSize=18, textColor=brand, alignment=0),
+        sub=ParagraphStyle("S", parent=base["Normal"], fontName=font, fontSize=9,
+                           textColor=colors.HexColor("#6B7280")),
+        h2=ParagraphStyle("H2", parent=base["Heading2"], fontName=bold, fontSize=13, textColor=brand,
                           spaceBefore=14, spaceAfter=4),
-        h3=ParagraphStyle("H3", parent=base["Heading3"], fontSize=10.5, textColor=colors.HexColor("#374151"),
-                          spaceBefore=10, spaceAfter=3),
-        warn=ParagraphStyle("W", parent=base["Normal"], fontSize=9, textColor=colors.HexColor("#DC2626")),
+        h3=ParagraphStyle("H3", parent=base["Heading3"], fontName=bold, fontSize=10.5,
+                          textColor=colors.HexColor("#374151"), spaceBefore=10, spaceAfter=3),
+        warn=ParagraphStyle("W", parent=base["Normal"], fontName=font, fontSize=9,
+                            textColor=colors.HexColor("#DC2626")),
+        # Table cells that hold free text (names, reasons, notes) wrap inside
+        # their column instead of running over the next one.
+        cell=ParagraphStyle("C", parent=base["Normal"], fontName=font, fontSize=7.8, leading=9.6),
     )
+
+
+def _pdf_cell(kit, text: Any):
+    """A wrapping table cell. Escapes the text, so a note with "<" or "&" in it
+    can't break the PDF; line breaks in the text are kept."""
+    from xml.sax.saxutils import escape
+    return kit.Paragraph(escape(str(text if text not in (None, "") else "-")).replace("\n", "<br/>"), kit.cell)
 
 
 def _pdf_table(kit, rows: List[List[Any]], widths: List[float],
                money_from: int, money_to: int, has_total_row: bool):
     t = kit.Table(rows, repeatRows=1, colWidths=widths)
     style = [
+        ("FONTNAME", (0, 0), (-1, -1), kit.font),
         ("BACKGROUND", (0, 0), (-1, 0), kit.brand),
         ("TEXTCOLOR", (0, 0), (-1, 0), kit.colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 0), (-1, 0), kit.bold),
         ("FONTSIZE", (0, 0), (-1, 0), 8.5),
         ("FONTSIZE", (0, 1), (-1, -1), 7.8),
         ("ALIGN", (money_from, 1), (money_to, -1), "RIGHT"),
@@ -2045,7 +2124,7 @@ def _pdf_table(kit, rows: List[List[Any]], widths: List[float],
     if has_total_row:
         style += [
             ("BACKGROUND", (0, -1), (-1, -1), kit.colors.HexColor("#F2F5F3")),
-            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("FONTNAME", (0, -1), (-1, -1), kit.bold),
             ("LINEABOVE", (0, -1), (-1, -1), 0.8, kit.brand),
         ]
     t.setStyle(kit.TableStyle(style))
@@ -2097,10 +2176,11 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
         colWidths=[16 * mm, 28 * mm, 25 * mm, 27 * mm, 25 * mm, 25 * mm, 26 * mm],
     )
     st.setStyle(kit.TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), kit.font),
         ("BACKGROUND", (0, 0), (-1, 0), kit.colors.HexColor("#F2F5F3")),
         ("TEXTCOLOR", (0, 0), (-1, 0), kit.colors.HexColor("#6B7280")),
         ("FONTSIZE", (0, 0), (-1, 0), 7.5),
-        ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, 1), kit.bold),
         ("FONTSIZE", (0, 1), (-1, 1), 9.5),
         ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
         ("GRID", (0, 0), (-1, -1), 0.4, kit.colors.HexColor("#E5E7EB")),
@@ -2114,6 +2194,21 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
         out.append(kit.Spacer(1, 5))
         overdue = f" · most overdue by {worker['max_overdue_days']} days" if worker["max_overdue_days"] else ""
         out.append(kit.Paragraph(f"Unpaid: {', '.join(worker['pending_months'])}{overdue}", kit.warn))
+
+    # New months can't start before joining any more, but ones saved before that
+    # check existed still do — name them so they get corrected, not filed.
+    joined = _local_day(worker.get("join_date"))
+    early = [
+        p["label"] for p in reversed(periods)
+        if joined and _period_day(p.get("start_date")) and _period_day(p["start_date"]) < joined
+    ]
+    if early:
+        out.append(kit.Spacer(1, 5))
+        out.append(kit.Paragraph(
+            f"Recorded before joining on {_dmy(joined)}: {', '.join(early)}. "
+            "Edit or delete these months in the app.",
+            kit.warn,
+        ))
 
     out.append(kit.Paragraph("Salary Months", kit.h3))
     if not periods:
@@ -2170,8 +2265,12 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
                 cost = _format_inr(round(float(host["per_day_wage"]) * days, 2))
             else:
                 cost = "No salary month yet"
+            # A multi-day absence prints its whole span — the first day alone
+            # read as a one-day absence next to a "3" in the Days column.
+            first, last = _absence_span(a)
+            when = _dmy(first) if not last or last == first else f"{_dmy(first)}\nto {_dmy(last)}"
             rows.append([
-                _fmt_day(a.get("date")), _trim_days(days), a.get("reason") or "-",
+                when, _trim_days(days), _pdf_cell(kit, a.get("reason")),
                 host["label"] if host else "-",
                 _format_inr(host["per_day_wage"]) if host else "-", cost,
             ])
@@ -2193,7 +2292,7 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
             ) or "—"
             rows.append([
                 _fmt_dt(pay.get("payment_date")), _format_inr(pay.get("amount", 0)),
-                str(pay.get("mode", "")).upper(), applied, pay.get("note") or "",
+                str(pay.get("mode", "")).upper(), _pdf_cell(kit, applied), _pdf_cell(kit, pay.get("note")),
             ])
         rows.append(["TOTAL", _format_inr(worker["total_paid"]), "", "", ""])
         out.append(_pdf_table(kit, rows, [26*mm, 24*mm, 15*mm, 64*mm, 49*mm], 1, 1, True))
@@ -2201,14 +2300,23 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
     return out
 
 
-def _pdf_response(buf: io.BytesIO, name: str):
+def _download_response(content: bytes, name: str, ext: str, media_type: str):
+    """A file to save, named after what it is and when (IST) it was made."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "report"
-    fname = f"{safe}-{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
+    fname = f"{safe}-{_now_ist().strftime('%Y%m%d-%H%M')}.{ext}"
     return Response(
-        content=buf.getvalue(),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{fname}"'},
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+def _pdf_response(buf: io.BytesIO, name: str):
+    return _download_response(buf.getvalue(), name, "pdf", "application/pdf")
+
+
+def _generated_stamp() -> str:
+    return f"Generated {_now_ist().strftime('%d/%m/%Y %H:%M')} IST"
 
 
 @api.get("/workers/{worker_id}/report/pdf")
@@ -2228,7 +2336,7 @@ async def worker_report_pdf(worker_id: str, admin=Depends(get_current_admin)):
     )
     story: List[Any] = [
         kit.Paragraph("Salary Record", kit.title),
-        kit.Paragraph(f"Generated {datetime.now().strftime('%d/%m/%Y %H:%M')}", kit.sub),
+        kit.Paragraph(_generated_stamp(), kit.sub),
     ]
     story += await _worker_flowables(kit, doc_worker, with_heading=True)
     story.append(kit.Spacer(1, 14))
@@ -2257,11 +2365,7 @@ async def work_report_pdf(admin=Depends(get_current_admin)):
 
     story: List[Any] = [
         kit.Paragraph("Work Management Record", kit.title),
-        kit.Paragraph(
-            f"All workers and their complete salary history · "
-            f"Generated {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-            kit.sub,
-        ),
+        kit.Paragraph(f"All workers and their complete salary history · {_generated_stamp()}", kit.sub),
     ]
 
     if not docs:
@@ -2273,24 +2377,31 @@ async def work_report_pdf(admin=Depends(get_current_admin)):
 
     # An overview table first, so the totals are readable without paging through.
     workers = [await worker_to_out(d) for d in docs]
-    overview: List[List[Any]] = [["Worker", "Role", "Months", "Total", "Paid", "Pending", "Due now"]]
+    # Deducted sits between Total and Paid so each row reads Total − Deducted −
+    # Paid = Pending; without it a fully paid worker with absences looked short.
+    overview: List[List[Any]] = [["Worker", "Role", "Months", "Total", "Deducted", "Paid", "Pending", "Due now"]]
     for w in workers:
         overview.append([
-            w["name"] + ("" if w.get("active", True) else " (inactive)"),
-            w.get("designation") or "—",
+            _pdf_cell(kit, w["name"] + ("" if w.get("active", True) else " (inactive)")),
+            _pdf_cell(kit, w.get("designation") or "—"),
             str(w["period_count"]),
-            _format_inr(w["total_salary"]), _format_inr(w["total_paid"]),
+            _format_inr(w["total_salary"]),
+            _format_inr(w["total_deduction"]) if w["total_deduction"] else "-",
+            _format_inr(w["total_paid"]),
             _format_inr(w["total_pending"]), _format_inr(w["matured_pending"]),
         ])
     overview.append([
         "TOTAL", "", str(sum(w["period_count"] for w in workers)),
         _format_inr(sum(w["total_salary"] for w in workers)),
+        _format_inr(sum(w["total_deduction"] for w in workers)),
         _format_inr(sum(w["total_paid"] for w in workers)),
         _format_inr(sum(w["total_pending"] for w in workers)),
         _format_inr(sum(w["matured_pending"] for w in workers)),
     ])
     story.append(kit.Paragraph("Overview", kit.h2))
-    story.append(_pdf_table(kit, overview, [38*mm, 26*mm, 16*mm, 25*mm, 25*mm, 25*mm, 25*mm], 3, 6, True))
+    story.append(_pdf_table(
+        kit, overview, [32*mm, 24*mm, 16*mm, 22*mm, 21*mm, 22*mm, 22*mm, 22*mm], 3, 7, True,
+    ))
 
     owed = [w for w in workers if w["matured_pending"] > 0]
     if owed:
@@ -2455,7 +2566,10 @@ async def dashboard_summary(fy: Optional[str] = None, admin=Depends(get_current_
     for p in payments:
         by_student[p["student_id"]] = by_student.get(p["student_id"], 0.0) + float(p["amount"])
     completed_total = sum(float(d["yearly_fee"]) for d in docs if by_student.get(d["id"], 0.0) + 0.0001 >= float(d["yearly_fee"]))
-    pending_total = max(total_yearly - total_collected, 0)
+    # What each student still owes, added up. Yearly − Collected let one
+    # student's overpayment cancel another's dues: ₹2,000 paid over the fee by
+    # one student hid ₹2,000 of the ₹6,000 another still owed.
+    pending_total = _total_fee_pending(docs, by_student)
     return {
         "total_schools": total_schools,
         "total_students": total_students,
@@ -2476,19 +2590,28 @@ async def dashboard_by_school(fy: Optional[str] = None, admin=Depends(get_curren
         students = await db.students.find({"school_id": s["id"]}, {"_id": 0}).to_list(5000)
         sids = [st["id"] for st in students]
         yearly = sum(float(st["yearly_fee"]) for st in students)
-        collected = 0.0
+        by_student: Dict[str, float] = {}
         if sids:
             pq = await db.payments.find({"student_id": {"$in": sids}}, {"_id": 0}).to_list(50000)
             if fy:
                 window = await _fy_window(fy)
                 pq = [p for p in pq if _in_window(p.get("payment_date"), window)]
-            collected = sum(float(p["amount"]) for p in pq)
+            for p in pq:
+                by_student[p["student_id"]] = by_student.get(p["student_id"], 0.0) + float(p["amount"])
         out.append({
             "school_id": s["id"], "school_name": s["name"], "student_count": len(students),
-            "yearly_total": round(yearly, 2), "collected": round(collected, 2),
-            "pending": round(max(yearly - collected, 0), 2),
+            "yearly_total": round(yearly, 2), "collected": round(sum(by_student.values()), 2),
+            "pending": round(_total_fee_pending(students, by_student), 2),
         })
     return out
+
+
+def _total_fee_pending(students: List[Dict[str, Any]], paid_by_student: Dict[str, float]) -> float:
+    """Σ of what each student still owes — the same per-student figure the
+    student screens and report rows show, so the total always matches them."""
+    return sum(
+        _fee_pending(float(st["yearly_fee"]), paid_by_student.get(st["id"], 0.0)) for st in students
+    )
 
 
 # ---------- Financial Years ----------
@@ -2505,7 +2628,7 @@ async def financial_years(admin=Depends(get_current_admin)):
         return {"current": "", "years": [], "meta": [], "needs_setup": True}
 
     window = await _fy_window(doc["label"])
-    today = datetime.now(timezone.utc).date()
+    today = _today()
     expired = bool(window and today > window[1])
     days_left = (window[1] - today).days if window and not expired else 0
 
@@ -2831,54 +2954,183 @@ async def reset_fy_data(
 
 
 # ---------- Reports: real PDF + real Excel ----------
-def _format_inr(n: float) -> str:
-    s = f"{int(round(n)):,}"
-    parts = s.split(",")
-    if len(parts) > 1:
-        first, rest = parts[0], "".join(parts[1:])
-        groups = []
-        while len(rest) > 3:
-            groups.insert(0, rest[-3:]); rest = rest[:-3]
-        groups.insert(0, rest)
-        head: List[str] = []
-        while len(first) > 2:
-            head.insert(0, first[-2:]); first = first[:-2]
-        if first:
-            head.insert(0, first)
-        return "Rs. " + ",".join(head + groups)
-    return "Rs. " + s
+def _group_inr(n: float, paise: bool = False) -> str:
+    """Indian digit grouping (3,25,000), rounded half-up the way the app rounds.
+    Python's round() goes to even, so ₹12,000.50 printed as ₹12,000 while the
+    app showed ₹12,001. With `paise`, an amount that has them keeps both digits."""
+    value = float(n or 0)
+    neg = value < 0
+    rupees, p = divmod(int(math.floor(abs(value) * 100 + 0.5)), 100)
+    tail = ""
+    if paise and p:
+        tail = f".{p:02d}"
+    else:
+        rupees = int(math.floor(abs(value) + 0.5))
+    s = str(rupees)
+    if len(s) > 3:
+        s = re.sub(r"(\d)(?=(\d{2})+$)", r"\1,", s[:-3]) + "," + s[-3:]
+    return ("-" if neg and (rupees or tail) else "") + s + tail
+
+
+def _format_inr(n: float, paise: bool = False) -> str:
+    """Rupee amount for PDFs and exports — "₹" whenever the PDF font can draw it."""
+    return ("₹" if _HAS_RUPEE_FONT else "Rs. ") + _group_inr(n, paise)
 
 
 def _fmt_dt(s: Optional[str]) -> str:
+    """Date and time as it reads in India. Instants are stored in UTC, and
+    printing them as stored put every time 5:30 behind the app."""
     if not s:
         return "—"
-    dt = _parse_dt(s)
+    text = s.strip()
+    if len(text) == 10:  # a bare calendar date has no clock time to convert
+        d = _period_day(text)
+        return _dmy(d) if d else s
+    dt = _parse_dt(text)
     if not dt:
         return s
-    return dt.strftime("%d/%m/%Y %H:%M")
+    return dt.astimezone(_IST).strftime("%d/%m/%Y %H:%M")
 
 
-async def _gather_report_rows(
-    school_id: Optional[str], status_filter: Optional[str], start: Optional[str], end: Optional[str], fy: Optional[str]
-):
+_REPORT_STATUSES = ("pending", "partial", "completed")
+_PAY_MODES = {"cash": "Cash", "upi": "UPI", "bank": "Bank"}
+
+
+def _report_day(value: Optional[str], what: str) -> Optional[date]:
+    """A report's date filter: "YYYY-MM-DD" from the picker, an ISO instant, or
+    DD/MM/YYYY [HH:mm] typed by hand. An unreadable date is refused — it used to
+    be dropped silently and the report ran as if no range had been asked for."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:\s+(\d{1,2}):(\d{2}))?", text)
+    if m:
+        dd, mo, yyyy, hh, mi = m.groups()
+        if hh is None or (int(hh) < 24 and int(mi) < 60):
+            try:
+                return date(int(yyyy), int(mo), int(dd))
+            except ValueError:
+                pass
+    elif re.fullmatch(r"\d{4}-\d{2}-\d{2}([T ].*)?", text):
+        d = _local_day(text)
+        if d:
+            return d
+    raise HTTPException(400, f'{what} "{text}" is not a valid date — use DD/MM/YYYY')
+
+
+async def _gather_report(
+    school_id: Optional[str], status_filter: Optional[str],
+    start: Optional[str], end: Optional[str], fy: Optional[str],
+) -> Dict[str, Any]:
+    """Everything a fee report shows, filtered once so PDF, Excel and CSV agree.
+
+    Students are picked by school and fee status, and their figures cover the
+    whole financial year. The date range picks *payments* by the day they were
+    taken — it limits the payment list, never a student's paid or pending.
+    """
+    status_ = (status_filter or "").strip().lower()
+    if status_ == "all":
+        status_ = ""
+    if status_ and status_ not in _REPORT_STATUSES:
+        raise HTTPException(400, "Status must be pending, partial or completed")
+    start_day = _report_day(start, "Start date")
+    end_day = _report_day(end, "End date")
+    if start_day and end_day and start_day > end_day:
+        raise HTTPException(400, f"Start date {_dmy(start_day)} is after end date {_dmy(end_day)}")
+
     query: Dict[str, Any] = {}
+    school_name: Optional[str] = None
     if school_id:
+        school = await db.schools.find_one({"id": school_id}, {"_id": 0, "name": 1})
+        if not school:
+            raise HTTPException(404, "School not found")
+        school_name = school["name"]
         query["school_id"] = school_id
-    docs = await db.students.find(query, {"_id": 0}).to_list(10000)
-    out = []
-    s_dt = _parse_dt(start)
-    e_dt = _parse_dt(end)
-    for d in docs:
+    window = await _fy_window(fy) if fy else None
+
+    rows: List[Dict[str, Any]] = []
+    for d in await db.students.find(query, {"_id": 0}).to_list(10000):
         s = await student_to_out(d, fy=fy)
-        if status_filter and s["status"] != status_filter:
+        if status_ and s["status"] != status_:
             continue
-        nd = _parse_dt(s.get("next_due_date") or s.get("due_date"))
-        if s_dt and nd and nd < s_dt:
-            continue
-        if e_dt and nd and nd > e_dt:
-            continue
-        out.append(s)
-    return out
+        # Money taken beyond the fee — possible only from before a fee was
+        # stopped from dropping below what had been paid. Pending ignores it,
+        # so it is shown on its own instead of quietly netting off other dues.
+        over = float(s["paid_amount"]) - float(s["yearly_fee"])
+        s["extra_paid"] = round(over, 2) if over >= 0.01 else 0.0
+        rows.append(s)
+    rows.sort(key=lambda s: (str(s.get("school_name", "")).lower(), str(s.get("name", "")).lower()))
+
+    today = _today()
+    by_id = {s["id"]: s for s in rows}
+    payments: List[Dict[str, Any]] = []
+    if by_id:
+        raw = await db.payments.find({"student_id": {"$in": list(by_id)}}, {"_id": 0}).to_list(50000)
+        for p in raw:
+            day = _local_day(p.get("payment_date"))
+            if window and not (day and window[0] <= day <= window[1]):
+                continue
+            if (start_day or end_day) and not day:
+                continue
+            if (start_day and day < start_day) or (end_day and day > end_day):
+                continue
+            st = by_id[p["student_id"]]
+            payments.append({
+                **p,
+                "day": day,
+                "student_name": st["name"],
+                "school_name": st["school_name"],
+                "standard": st.get("standard", ""),
+                "future": bool(day and day > today),
+            })
+    payments.sort(
+        key=lambda p: _parse_dt(p.get("payment_date")) or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+    return {
+        "rows": rows,
+        "payments": payments,
+        "fy": fy,
+        "window": window,
+        "school_name": school_name,
+        "status": status_,
+        "start": start_day,
+        "end": end_day,
+        "today": today,
+        "total_yearly": sum(float(s["yearly_fee"]) for s in rows),
+        "total_paid": sum(float(s["paid_amount"]) for s in rows),
+        # The rows' own pending figures added up — never Yearly − Paid, which let
+        # one student's overpayment cancel another student's dues.
+        "total_pending": sum(float(s["pending_amount"]) for s in rows),
+        "total_extra": sum(float(s["extra_paid"]) for s in rows),
+        "total_collected": sum(float(p.get("amount", 0)) for p in payments),
+    }
+
+
+def _report_heading(rep: Dict[str, Any]) -> List[str]:
+    """When the report was made and what it was run with, in words — printed at
+    the top of every export so a filtered report can't pass for a full one."""
+    w = rep["window"]
+    when = _generated_stamp()
+    if rep["fy"]:
+        when += f" · FY {rep['fy']}" + (f" ({_dmy(w[0])} – {_dmy(w[1])})" if w else "")
+    if rep["start"] or rep["end"]:
+        frm = _dmy(rep["start"]) if rep["start"] else (_dmy(w[0]) if w else "the first payment")
+        to = _dmy(rep["end"]) if rep["end"] else (_dmy(w[1]) if w else "today")
+        dates = f"{frm} – {to}"
+    else:
+        dates = "whole financial year" if w else "all dates"
+    filters = " · ".join([
+        f"School: {rep['school_name'] or 'All schools'}",
+        f"Status: {rep['status'].title() if rep['status'] else 'All'}",
+        f"Payments: {dates}",
+    ])
+    return [when, filters]
+
+
+def _pay_mode(mode: Any) -> str:
+    text = str(mode or "").strip()
+    return _PAY_MODES.get(text.lower(), text.title() or "-")
 
 
 @api.get("/reports/excel")
@@ -2891,69 +3143,103 @@ async def report_excel(
     admin=Depends(get_current_admin),
 ):
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
 
-    rows = await _gather_report_rows(school_id, status_filter, start, end, fy)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Bus Fee Report"
-
-    title_font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+    rep = await _gather_report(school_id, status_filter, start, end, fy)
+    heading = _report_heading(rep)
     head_fill = PatternFill("solid", fgColor="2B4C3E")
     head_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    money = Font(name="Calibri", size=10)
+    muted = Font(name="Calibri", size=10, color="6B7280")
+    bold = Font(bold=True)
+    inr = '"₹"#,##0'
 
-    ws.merge_cells("A1:J1")
-    cell = ws["A1"]
-    cell.value = f"Bus Fee Report — Generated {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-    cell.font = title_font
-    cell.fill = head_fill
-    cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 26
-
-    headers = ["Student", "School", "Class", "Parent", "Mobile", "Yearly Fee", "Paid", "Pending", "Status", "Next Due"]
-    for i, h in enumerate(headers, start=1):
-        c = ws.cell(row=3, column=i, value=h)
-        c.font = head_font
+    def frame(ws, title: str, headers: List[str], widths: List[int]) -> None:
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+        c = ws.cell(row=1, column=1, value=title)
+        c.font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
         c.fill = head_fill
-        c.alignment = Alignment(horizontal="center")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 26
+        ws.cell(row=2, column=1, value=heading[0]).font = muted
+        ws.cell(row=3, column=1, value=heading[1]).font = muted
+        for i, h in enumerate(headers, start=1):
+            hc = ws.cell(row=5, column=i, value=h)
+            hc.font = head_font
+            hc.fill = head_fill
+            hc.alignment = Alignment(horizontal="center")
+            ws.column_dimensions[get_column_letter(i)].width = widths[i - 1]
+        ws.freeze_panes = "A6"
 
-    total_y = total_p = total_pend = 0.0
-    for idx, s in enumerate(rows, start=4):
-        ws.cell(row=idx, column=1, value=s["name"])
-        ws.cell(row=idx, column=2, value=s["school_name"])
-        ws.cell(row=idx, column=3, value=s["standard"])
-        ws.cell(row=idx, column=4, value=s["parent_name"])
-        ws.cell(row=idx, column=5, value=s["parent_mobile"])
-        ws.cell(row=idx, column=6, value=float(s["yearly_fee"])).number_format = '"₹"#,##0'
-        ws.cell(row=idx, column=7, value=float(s["paid_amount"])).number_format = '"₹"#,##0'
-        ws.cell(row=idx, column=8, value=float(s["pending_amount"])).number_format = '"₹"#,##0'
-        ws.cell(row=idx, column=9, value=s["status"].title())
-        ws.cell(row=idx, column=10, value=_fmt_dt(s.get("next_due_date")))
-        total_y += s["yearly_fee"]
-        total_p += s["paid_amount"]
-        total_pend += s["pending_amount"]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Fee Summary"
+    frame(ws, "Bus Fee Report — Fee Summary", [
+        "Student", "School", "Class", "Parent", "Mobile", "Pickup", "Admission",
+        "Yearly Fee", "Paid", "Pending", "Extra Paid", "Status", "Next Due", "Overdue Days",
+    ], [22, 22, 8, 22, 14, 20, 12, 13, 13, 13, 12, 12, 12, 13])
+    r = 6
+    if not rep["rows"]:
+        ws.cell(row=r, column=1, value="No students match these filters.").font = muted
+    for s in rep["rows"]:
+        values = [
+            s["name"], s["school_name"], s.get("standard", ""), s.get("parent_name", ""),
+            s.get("parent_mobile", ""), s.get("pickup_location") or "",
+            _dmy(_local_day(s.get("admission_date"))),
+            float(s["yearly_fee"]), float(s["paid_amount"]), float(s["pending_amount"]),
+            float(s["extra_paid"]), s["status"].title(),
+            _dmy(_local_day(s.get("next_due_date"))), int(s.get("overdue_days") or 0),
+        ]
+        for col, v in enumerate(values, start=1):
+            cell = ws.cell(row=r, column=col, value=v)
+            if 8 <= col <= 11:
+                cell.number_format = inr
+        r += 1
+    if rep["rows"]:
+        r += 1
+        ws.cell(row=r, column=7, value="TOTAL").font = bold
+        for col, v in zip(range(8, 12), (rep["total_yearly"], rep["total_paid"],
+                                         rep["total_pending"], rep["total_extra"])):
+            cell = ws.cell(row=r, column=col, value=v)
+            cell.number_format = inr
+            cell.font = bold
+        if rep["total_extra"]:
+            ws.cell(row=r + 1, column=1, value=(
+                f"Paid includes ₹{_group_inr(rep['total_extra'], paise=True)} taken above the yearly fee. "
+                "Pending counts only what each student still owes."
+            )).font = muted
 
-    tot_row = len(rows) + 5
-    ws.cell(row=tot_row, column=5, value="TOTAL").font = Font(bold=True)
-    ws.cell(row=tot_row, column=6, value=total_y).number_format = '"₹"#,##0'
-    ws.cell(row=tot_row, column=7, value=total_p).number_format = '"₹"#,##0'
-    ws.cell(row=tot_row, column=8, value=max(total_y - total_p, 0)).number_format = '"₹"#,##0'
-    for col in range(5, 9):
-        ws.cell(row=tot_row, column=col).font = Font(bold=True)
-
-    widths = [22, 22, 8, 22, 14, 14, 14, 14, 12, 18]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + i)].width = w
+    wp = wb.create_sheet("Payments")
+    frame(wp, "Bus Fee Report — Payments", [
+        "Date & Time (IST)", "Student", "School", "Class", "Mode", "Amount", "Next Due Set", "Note", "Check",
+    ], [18, 22, 22, 8, 10, 13, 14, 36, 22])
+    r = 6
+    if not rep["payments"]:
+        wp.cell(row=r, column=1, value="No payments in this period.").font = muted
+    for p in rep["payments"]:
+        values = [
+            _fmt_dt(p.get("payment_date")), p["student_name"], p["school_name"], p.get("standard", ""),
+            _pay_mode(p.get("mode")), float(p.get("amount", 0)),
+            _dmy(_local_day(p.get("next_due_date"))), p.get("note") or "",
+            "Dated after today" if p["future"] else "",
+        ]
+        for col, v in enumerate(values, start=1):
+            cell = wp.cell(row=r, column=col, value=v)
+            if col == 6:
+                cell.number_format = inr
+        r += 1
+    if rep["payments"]:
+        r += 1
+        wp.cell(row=r, column=5, value="TOTAL").font = bold
+        cell = wp.cell(row=r, column=6, value=rep["total_collected"])
+        cell.number_format = inr
+        cell.font = bold
 
     buf = io.BytesIO()
     wb.save(buf)
-    buf.seek(0)
-    fname = f"bus-fee-report-{datetime.now().strftime('%Y%m%d-%H%M')}.xlsx"
-    return Response(
-        content=buf.getvalue(),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    return _download_response(
+        buf.getvalue(), f"bus-fee-report{'-' + fy if fy else ''}", "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 
@@ -2966,70 +3252,126 @@ async def report_pdf(
     fy: Optional[str] = None,
     admin=Depends(get_current_admin),
 ):
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import mm
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    )
+    """The fee summary for every student the filters pick, then every payment
+    behind it — date, time, mode and note — so the PDF is the full record the
+    year's export promises, not just the totals."""
+    kit = _pdf_kit()  # first: it decides which rupee sign the money is printed with
+    mm = kit.mm
+    rep = await _gather_report(school_id, status_filter, start, end, fy)
 
-    rows = await _gather_report_rows(school_id, status_filter, start, end, fy)
+    def money(n: float) -> str:
+        # Exact to the paisa: a record should show the ₹12,000.50 actually paid.
+        return _format_inr(n, paise=True)
+
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm, topMargin=14 * mm, bottomMargin=14 * mm)
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("Title", parent=styles["Title"], fontSize=18, textColor=colors.HexColor("#2B4C3E"))
-    sub_style = ParagraphStyle("Sub", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#6B7280"))
-
-    story: List[Any] = []
-    story.append(Paragraph("Bus Fee Management Report", title_style))
-    story.append(Paragraph(
-        f"Generated: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-        f"{' · FY: ' + fy if fy else ''}"
-        f"{' · Status: ' + status_filter.title() if status_filter else ''}",
-        sub_style,
-    ))
-    story.append(Spacer(1, 10))
-
-    headers = ["Student", "School", "Class", "Parent", "Mobile", "Yearly", "Paid", "Pending", "Status", "Next Due"]
-    data: List[List[Any]] = [headers]
-    total_y = total_p = total_pend = 0.0
-    for s in rows:
-        data.append([
-            s["name"], s["school_name"], s["standard"], s["parent_name"], s["parent_mobile"],
-            _format_inr(s["yearly_fee"]), _format_inr(s["paid_amount"]), _format_inr(s["pending_amount"]),
-            s["status"].title(), _fmt_dt(s.get("next_due_date")),
-        ])
-        total_y += s["yearly_fee"]
-        total_p += s["paid_amount"]
-        total_pend += s["pending_amount"]
-    data.append(["", "", "", "", "TOTAL", _format_inr(total_y), _format_inr(total_p), _format_inr(max(total_y - total_p, 0)), "", ""])
-
-    tbl = Table(data, repeatRows=1, colWidths=[28*mm, 28*mm, 14*mm, 28*mm, 24*mm, 22*mm, 22*mm, 22*mm, 18*mm, 26*mm])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2B4C3E")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 9),
-        ("FONTSIZE", (0, 1), (-1, -1), 8),
-        ("ALIGN", (5, 0), (7, -1), "RIGHT"),
-        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-        ("TOPPADDING", (0, 0), (-1, 0), 8),
-        ("GRID", (0, 0), (-1, -2), 0.4, colors.HexColor("#E5E7EB")),
-        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#F2F5F3")),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.HexColor("#2B4C3E")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, colors.HexColor("#F9FAFB")]),
-    ]))
-    story.append(tbl)
-    doc.build(story)
-    buf.seek(0)
-    fname = f"bus-fee-report-{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
-    return Response(
-        content=buf.getvalue(),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{fname}"'},
+    pdf = kit.SimpleDocTemplate(
+        buf, pagesize=kit.landscape(kit.A4), leftMargin=12 * mm, rightMargin=12 * mm,
+        topMargin=14 * mm, bottomMargin=14 * mm, title="Bus Fee Report",
     )
+    story: List[Any] = [kit.Paragraph("Bus Fee Report", kit.title)]
+    story += [kit.Paragraph(line, kit.sub) for line in _report_heading(rep)]
+    # Tighter cell padding than the worker record: twelve columns on one page,
+    # and money keeps its paise here.
+    tight = kit.TableStyle([
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+    ])
+
+    rows = rep["rows"]
+    story.append(kit.Paragraph("Fee Summary", kit.h2))
+    story.append(kit.Paragraph(
+        f"Each student's fee for the financial year as of {_dmy(rep['today'])}. "
+        "Pending is what each student still owes, and the total adds those up.",
+        kit.sub,
+    ))
+    story.append(kit.Spacer(1, 4))
+    if not rows:
+        story.append(kit.Paragraph("No students match these filters.", kit.sub))
+    else:
+        data: List[List[Any]] = [[
+            "Student", "School", "Class", "Parent / Mobile", "Pickup", "Admission",
+            "Yearly", "Paid", "Pending", "Status", "Next Due", "Overdue",
+        ]]
+        for s in rows:
+            status_txt = s["status"].title()
+            if s["extra_paid"]:
+                status_txt += f"\n+{money(s['extra_paid'])} extra"
+            data.append([
+                _pdf_cell(kit, s["name"]),
+                _pdf_cell(kit, s["school_name"]),
+                _pdf_cell(kit, s.get("standard")),
+                _pdf_cell(kit, "\n".join(x for x in (s.get("parent_name"), s.get("parent_mobile")) if x)),
+                _pdf_cell(kit, s.get("pickup_location")),
+                _dmy(_local_day(s.get("admission_date"))),
+                money(s["yearly_fee"]), money(s["paid_amount"]), money(s["pending_amount"]),
+                _pdf_cell(kit, status_txt),
+                _dmy(_local_day(s.get("next_due_date"))),
+                _plural(s["overdue_days"], "day") if s.get("overdue_days") else "-",
+            ])
+        data.append([
+            f"TOTAL · {_plural(len(rows), 'student')}", "", "", "", "", "",
+            money(rep["total_yearly"]), money(rep["total_paid"]), money(rep["total_pending"]), "", "", "",
+        ])
+        tbl = _pdf_table(
+            kit, data,
+            [30*mm, 28*mm, 13*mm, 30*mm, 26*mm, 19*mm, 23*mm, 24*mm, 23*mm, 22*mm, 19*mm, 16*mm],
+            6, 8, True,
+        )
+        tbl.setStyle(tight)
+        story.append(tbl)
+        if rep["total_extra"]:
+            over = [s for s in rows if s["extra_paid"]]
+            story.append(kit.Spacer(1, 5))
+            story.append(kit.Paragraph(
+                f"Paid includes {money(rep['total_extra'])} taken above the yearly fee from "
+                + ", ".join(f"{s['name']} ({money(s['extra_paid'])})" for s in over)
+                + ". It is not set against anyone else's pending fee.",
+                kit.warn,
+            ))
+
+    pays = rep["payments"]
+    story.append(kit.Paragraph("Payments", kit.h2))
+    story.append(kit.Paragraph(
+        f"{_plural(len(pays), 'payment')} · {money(rep['total_collected'])} collected"
+        + (" · from the students listed above" if rep["school_name"] or rep["status"] else ""),
+        kit.sub,
+    ))
+    story.append(kit.Spacer(1, 4))
+    if not pays:
+        story.append(kit.Paragraph("No payments in this period.", kit.sub))
+    else:
+        data = [["Date & time", "Student", "School", "Class", "Mode", "Amount", "Next due set", "Note"]]
+        for p in pays:
+            data.append([
+                _pdf_cell(kit, _fmt_dt(p.get("payment_date")) + ("\nfuture date" if p["future"] else "")),
+                _pdf_cell(kit, p["student_name"]),
+                _pdf_cell(kit, p["school_name"]),
+                _pdf_cell(kit, p.get("standard")),
+                _pay_mode(p.get("mode")),
+                money(p.get("amount", 0)),
+                _dmy(_local_day(p.get("next_due_date"))),
+                _pdf_cell(kit, p.get("note")),
+            ])
+        data.append(["TOTAL", "", "", "", "", money(rep["total_collected"]), "", ""])
+        tbl = _pdf_table(kit, data, [30*mm, 40*mm, 34*mm, 13*mm, 16*mm, 24*mm, 24*mm, 92*mm], 5, 5, True)
+        tbl.setStyle(tight)
+        story.append(tbl)
+        future = [p for p in pays if p["future"]]
+        if future:
+            story.append(kit.Spacer(1, 5))
+            story.append(kit.Paragraph(
+                f"{_plural(len(future), 'payment')} dated after today ({_dmy(rep['today'])}): "
+                + ", ".join(f"{p['student_name']} on {_dmy(p['day'])} ({money(p.get('amount', 0))})" for p in future)
+                + ". Check the date was entered correctly.",
+                kit.warn,
+            ))
+
+    story.append(kit.Spacer(1, 14))
+    story.append(kit.Paragraph(
+        "This document is a point-in-time record produced by Bus Fee Management.", kit.sub))
+    pdf.build(story)
+    buf.seek(0)
+    return _pdf_response(buf, f"bus-fee-report{'-' + fy if fy else ''}")
 
 
 # Keep legacy endpoints
@@ -3042,13 +3384,13 @@ async def report_csv(
     fy: Optional[str] = None,
     admin=Depends(get_current_admin),
 ):
-    rows = await _gather_report_rows(school_id, status_filter, start, end, fy)
+    rep = await _gather_report(school_id, status_filter, start, end, fy)
     out = ["Student,School,Class,Parent,Mobile,Yearly Fee,Paid,Pending,Status,Next Due"]
-    for s in rows:
+    for s in rep["rows"]:
         out.append(
             f'"{s["name"]}","{s["school_name"]}","{s["standard"]}","{s["parent_name"]}",'
             f'"{s["parent_mobile"]}",{s["yearly_fee"]},{s["paid_amount"]},{s["pending_amount"]},'
-            f'{s["status"]},"{_fmt_dt(s.get("next_due_date"))}"'
+            f'{s["status"]},"{_dmy(_local_day(s.get("next_due_date")))}"'
         )
     return "\n".join(out)
 
@@ -3062,25 +3404,25 @@ async def report_html(
     fy: Optional[str] = None,
     admin=Depends(get_current_admin),
 ):
-    rows = await _gather_report_rows(school_id, status_filter, start, end, fy)
+    from html import escape
+
+    rep = await _gather_report(school_id, status_filter, start, end, fy)
     body_rows: List[str] = []
-    total_y = total_p = total_pend = 0.0
-    for s in rows:
+    for s in rep["rows"]:
         body_rows.append(
-            f"<tr><td>{s['name']}</td><td>{s['school_name']}</td><td>{s['standard']}</td>"
-            f"<td>{_format_inr(s['yearly_fee'])}</td><td>{_format_inr(s['paid_amount'])}</td>"
-            f"<td>{_format_inr(s['pending_amount'])}</td><td>{s['status']}</td>"
-            f"<td>{_fmt_dt(s.get('next_due_date'))}</td></tr>"
+            f"<tr><td>{escape(s['name'])}</td><td>{escape(s['school_name'])}</td><td>{escape(str(s['standard']))}</td>"
+            f"<td>{_inr(s['yearly_fee'])}</td><td>{_inr(s['paid_amount'])}</td>"
+            f"<td>{_inr(s['pending_amount'])}</td><td>{s['status']}</td>"
+            f"<td>{_dmy(_local_day(s.get('next_due_date')))}</td></tr>"
         )
-        total_y += s["yearly_fee"]; total_p += s["paid_amount"]; total_pend += s["pending_amount"]
     return f"""<html><head><meta charset='utf-8'><title>Bus Fee Report</title>
     <style>body{{font-family:system-ui;padding:24px;color:#111}}h1{{color:#2B4C3E}}
     table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #E5E7EB;text-align:left;font-size:13px}}
     th{{background:#F3F4F6}}.tot{{margin-top:16px;background:#F2F5F3;padding:12px;border-radius:8px}}</style></head>
-    <body><h1>Bus Fee Report</h1><p>Generated: {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+    <body><h1>Bus Fee Report</h1>{''.join(f'<p>{escape(line)}</p>' for line in _report_heading(rep))}
     <table><thead><tr><th>Student</th><th>School</th><th>Class</th><th>Yearly</th><th>Paid</th><th>Pending</th><th>Status</th><th>Next Due</th></tr></thead>
     <tbody>{''.join(body_rows) or '<tr><td colspan=8>No records</td></tr>'}</tbody></table>
-    <div class='tot'><b>Total Yearly:</b> {_format_inr(total_y)} &nbsp; <b>Total Collected:</b> {_format_inr(total_p)} &nbsp; <b>Total Pending:</b> {_format_inr(max(total_y - total_p, 0))}</div>
+    <div class='tot'><b>Total Yearly:</b> {_inr(rep['total_yearly'])} &nbsp; <b>Total Collected:</b> {_inr(rep['total_paid'])} &nbsp; <b>Total Pending:</b> {_inr(rep['total_pending'])}</div>
     </body></html>"""
 
 

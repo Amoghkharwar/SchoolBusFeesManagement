@@ -171,5 +171,31 @@ export async function apiFetch<T = any>(path: string, opts: RequestInit = {}): P
   return data as T;
 }
 
+/**
+ * Fetches a file (PDF, Excel) the way apiFetch fetches JSON: the token goes in
+ * the Authorization header. Downloads used to open `?token=…` URLs, which left
+ * a working login in browser history and server logs, and in any shared link.
+ * Errors come back as the server's own message, so a bad filter says why.
+ */
+export async function apiFileFetch(path: string): Promise<Response> {
+  const t = await AsyncStorage.getItem(TOKEN_KEY);
+  const res = await fetch(`${API}${path}`, {
+    headers: t ? { Authorization: `Bearer ${t}` } : {},
+  });
+  if (res.status === 401) {
+    await AsyncStorage.removeItem(TOKEN_KEY);
+    onSessionExpired?.();
+    router.replace('/(auth)/login');
+    throw new Error('Your session has expired. Please log in again.');
+  }
+  if (!res.ok) {
+    const text = await res.text();
+    let data: any = text;
+    try { data = JSON.parse(text); } catch { /* not JSON */ }
+    throw new Error(extractErrorMessage(data, 'Download failed'));
+  }
+  return res;
+}
+
 export const API_BASE = API;
 export const TOKEN_STORAGE_KEY = TOKEN_KEY;

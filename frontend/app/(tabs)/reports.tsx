@@ -1,19 +1,23 @@
 import React, { useEffect, useState } from 'react';
-import { Linking, Pressable, ScrollView, Text, View } from 'react-native';
+import { Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { apiFetch, API_BASE, TOKEN_STORAGE_KEY, useAuth } from '@/src/auth';
+import { apiFetch, useAuth } from '@/src/auth';
 import { useFY } from '@/src/fy';
 import { useTheme, spacing, fontSize, radii } from '@/src/theme';
-import { Button, Card, TextField } from '@/src/components/ui';
+import { Button, Card, DateTimeField } from '@/src/components/ui';
 import { plural } from '@/src/utils/format';
+import { calendarDateToDisplay, calendarDateToLocalIso, isoToCalendarDate } from '@/src/utils/datetime';
+import { downloadFile } from '@/src/utils/download';
 
 interface School { id: string; name: string }
 
+/** "YYYY-MM-DD" → the Date the picker bounds take, or undefined. */
+const pickerDay = (cd?: string | null) => (cd ? new Date(calendarDateToLocalIso(cd)) : undefined);
+
 export default function Reports() {
   const { palette } = useTheme();
-  const { current: fy } = useFY();
+  const { current: fy, meta: fyInfo } = useFY();
   const { admin } = useAuth();
   const isAdmin = admin?.role === 'admin';
   const [schools, setSchools] = useState<School[]>([]);
@@ -49,27 +53,33 @@ export default function Reports() {
     apiFetch<School[]>('/schools').then(setSchools).catch(() => {});
   }, []);
 
+  // The pickers hold local-midnight instants; the server takes calendar days.
+  const startDay = isoToCalendarDate(start);
+  const endDay = isoToCalendarDate(end);
+  const rangeError = startDay && endDay && startDay > endDay
+    ? 'The "to" date is before the "from" date.'
+    : '';
+  const fyRange = fyInfo?.start_date && fyInfo?.end_date
+    ? `${calendarDateToDisplay(fyInfo.start_date)} – ${calendarDateToDisplay(fyInfo.end_date)}`
+    : '';
+
   const open = async (format: 'pdf' | 'excel') => {
+    if (busy) return;
+    if (rangeError) { setMsg(`Error: ${rangeError}`); return; }
     setMsg('');
     setBusy(format);
     try {
-      const token = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
       const params = new URLSearchParams();
       if (schoolId) params.set('school_id', schoolId);
       if (status !== 'all') params.set('status', status);
-      if (start) params.set('start', start);
-      if (end) params.set('end', end);
+      if (startDay) params.set('start', startDay);
+      if (endDay) params.set('end', endDay);
       if (fy) params.set('fy', fy);
-      if (token) params.set('token', token);
-      const url = `${API_BASE}/reports/${format}?${params.toString()}`;
-      const ok = await Linking.canOpenURL(url);
-      if (!ok) throw new Error('Cannot open URL on this device');
-      await Linking.openURL(url);
-      setMsg(format === 'pdf'
-        ? 'PDF opened in your browser — use Share → Save to keep it.'
-        : 'Excel download started — check your Downloads folder.');
+      const ext = format === 'pdf' ? 'pdf' : 'xlsx';
+      const name = await downloadFile(`/reports/${format}?${params.toString()}`, `bus-fee-report.${ext}`);
+      setMsg(`✓ Downloaded ${name}`);
     } catch (e: any) {
-      setMsg(`Error: ${e.message || 'failed'}`);
+      setMsg(`Error: ${e.message || 'Download failed'}`);
     } finally {
       setBusy(null);
     }
@@ -128,25 +138,56 @@ export default function Reports() {
             })}
           </ScrollView>
 
-          <TextField label="Start Date (DD/MM/YYYY HH:mm)" placeholder="01/04/2026 00:00" value={start} onChangeText={setStart} testID="report-start" />
-          <TextField label="End Date (DD/MM/YYYY HH:mm)" placeholder="31/03/2027 23:59" value={end} onChangeText={setEnd} testID="report-end" />
+          <DateTimeField
+            label="Payments from"
+            mode="date"
+            value={start}
+            onChange={setStart}
+            minDate={pickerDay(fyInfo?.start_date)}
+            maxDate={pickerDay(fyInfo?.end_date)}
+            testID="report-start"
+          />
+          <DateTimeField
+            label="Payments to"
+            mode="date"
+            value={end}
+            onChange={setEnd}
+            minDate={pickerDay(fyInfo?.start_date)}
+            maxDate={pickerDay(fyInfo?.end_date)}
+            error={rangeError || undefined}
+            testID="report-end"
+          />
+          <Text style={{ color: palette.muted, fontSize: fontSize.sm, marginTop: -6 }}>
+            {`These dates only limit the payment list. Leave them empty for the whole year${fyRange ? ` (${fyRange})` : ''}. The fee summary always covers the full year.`}
+          </Text>
+          {start || end ? (
+            <Pressable
+              onPress={() => { setStart(''); setEnd(''); }}
+              testID="report-clear-dates"
+              style={{ alignSelf: 'flex-start', paddingVertical: 6, marginTop: 4 }}
+            >
+              <Text style={{ color: palette.brand, fontSize: fontSize.sm, fontWeight: '600' }}>Clear dates</Text>
+            </Pressable>
+          ) : null}
         </Card>
 
         <View style={{ height: spacing.lg }} />
         <Button
-          title={busy === 'pdf' ? 'Opening PDF…' : 'Download PDF Report'}
+          title={busy === 'pdf' ? 'Preparing PDF…' : 'Download PDF Report'}
           icon="document-text"
           onPress={() => open('pdf')}
           loading={busy === 'pdf'}
+          disabled={!!busy}
           testID="report-generate-pdf"
         />
         <View style={{ height: spacing.md }} />
         <Button
-          title={busy === 'excel' ? 'Opening Excel…' : 'Download Excel (.xlsx)'}
+          title={busy === 'excel' ? 'Preparing Excel…' : 'Download Excel (.xlsx)'}
           icon="grid"
           variant="secondary"
           onPress={() => open('excel')}
           loading={busy === 'excel'}
+          disabled={!!busy}
           testID="report-generate-csv"
         />
 

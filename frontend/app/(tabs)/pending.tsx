@@ -16,7 +16,7 @@ import { useTheme, spacing, radii, fontSize } from '@/src/theme';
 import { Card, EmptyState } from '@/src/components/ui';
 import { SkeletonCard } from '@/src/components/Skeleton';
 import { formatINR, openWhatsApp, reminderMessage } from '@/src/utils/format';
-import { isoToDisplay } from '@/src/utils/datetime';
+import { calendarDateToDisplay, isoToDisplay } from '@/src/utils/datetime';
 
 interface Pending {
   id: string;
@@ -125,7 +125,8 @@ export default function PendingFees() {
                     ) : null}
                     <View style={{ marginTop: spacing.sm, gap: 2 }}>
                       <Row label="Last Payment" value={item.last_payment_date ? isoToDisplay(item.last_payment_date) : '—'} />
-                      <Row label="Next Due" value={isoToDisplay(item.next_due_date || item.due_date) || '—'} />
+                      {/* A due date is a day, shown the way the student screen shows it. */}
+                      <Row label="Next Due" value={calendarDateToDisplay(item.next_due_date || item.due_date) || '—'} />
                       <Row label="Pending" value={formatINR(item.pending_amount)} accent={palette.warning} />
                     </View>
                   </View>

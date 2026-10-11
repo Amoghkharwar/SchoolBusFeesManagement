@@ -1409,11 +1409,17 @@ async def _worker_periods(
     """Every salary cycle for a worker, oldest first, with what has been paid
     against it resolved from the payment allocations and what its absences take
     off it already applied. `payable_salary` — not `total_salary` — is the figure
-    a payment settles against."""
+    a payment settles against.
+
+    Each month also carries the two data problems old months can have, so the
+    worker screen and the PDF flag exactly the same ones: `before_joining`, and
+    `skipped_day` — the single day after it that no month covers."""
     periods = await db.salary_periods.find({"worker_id": worker_id}, {"_id": 0}).to_list(500)
     payments = await db.salary_payments.find({"worker_id": worker_id}, {"_id": 0}).to_list(2000)
     if absences is None:
         absences = await _worker_absence_docs(worker_id)
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0, "join_date": 1})
+    joined = _local_day((worker or {}).get("join_date"))
 
     paid_by_period: Dict[str, float] = {}
     for pay in payments:
@@ -1442,6 +1448,7 @@ async def _worker_periods(
         # Salary matures on the end date itself, so that day already counts as owed.
         matured = bool(end and end <= today)
         overdue_days = max((today - end).days, 0) if (end and matured and pending > 0) else 0
+        start = _period_day(p.get("start_date"))
         out.append({
             **p,
             **calc,
@@ -1451,7 +1458,14 @@ async def _worker_periods(
             "status": "completed" if payable <= 0.0001 or settled else _salary_status(payable, paid),
             "matured": matured,
             "overdue_days": overdue_days,
+            # New months can't start before joining; ones saved before that
+            # check existed still can.
+            "before_joining": bool(joined and start and start < joined),
         })
+    skipped = _skipped_days(out)
+    for p in out:
+        day = skipped.get(p["id"])
+        p["skipped_day"] = day.isoformat() if day else None
     return out
 
 
@@ -2132,9 +2146,9 @@ def _pdf_table(kit, rows: List[List[Any]], widths: List[float],
     return t
 
 
-def _skipped_days(periods: List[Dict[str, Any]]) -> List[Tuple[date, str]]:
-    """Single days a worker's salary months leave out, with the month before
-    each. A one-day hole is what months saved before the date fix look like:
+def _skipped_days(periods: List[Dict[str, Any]]) -> Dict[str, date]:
+    """Single days a worker's salary months leave out, keyed by the id of the
+    month just before each. A one-day hole is what months saved before the date fix look like:
     the picked end date landed a day early, so 31/08 was stored as 30/08. Two
     shapes count — a month starting on the 1st that stops the day before the
     month's last day, and a one-day gap between consecutive months. Longer gaps
@@ -2143,10 +2157,10 @@ def _skipped_days(periods: List[Dict[str, Any]]) -> List[Tuple[date, str]]:
     for p in periods:
         s, e = _period_day(p.get("start_date")), _period_day(p.get("end_date"))
         if s and e:
-            spans.append((s, e, p["label"]))
+            spans.append((s, e, p["id"]))
     spans.sort()
-    out: Dict[date, str] = {}
-    for i, (s, e, label) in enumerate(spans):
+    out: Dict[str, date] = {}
+    for i, (s, e, pid) in enumerate(spans):
         day = e + timedelta(days=1)
         if any(a <= day <= b for a, b, _ in spans):
             continue
@@ -2154,8 +2168,8 @@ def _skipped_days(periods: List[Dict[str, Any]]) -> List[Tuple[date, str]]:
         short_month = s.day == 1 and (s.year, s.month) == (e.year, e.month) and day == month_last
         one_day_gap = i + 1 < len(spans) and spans[i + 1][0] == day + timedelta(days=1)
         if short_month or one_day_gap:
-            out[day] = label
-    return sorted(out.items())
+            out[pid] = day
+    return out
 
 
 async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool) -> List[Any]:
@@ -2222,13 +2236,10 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
         overdue = f" · most overdue by {worker['max_overdue_days']} days" if worker["max_overdue_days"] else ""
         out.append(kit.Paragraph(f"Unpaid: {', '.join(worker['pending_months'])}{overdue}", kit.warn))
 
-    # New months can't start before joining any more, but ones saved before that
-    # check existed still do — name them so they get corrected, not filed.
+    # Old months with bad dates — named so they get corrected, not filed. The
+    # flags come from _worker_periods, the same ones the worker screen shows.
     joined = _local_day(worker.get("join_date"))
-    early = [
-        p["label"] for p in reversed(periods)
-        if joined and _period_day(p.get("start_date")) and _period_day(p["start_date"]) < joined
-    ]
+    early = [p["label"] for p in reversed(periods) if p.get("before_joining")]
     if early:
         # Editing such a month re-runs the joining-date check, so the way to keep
         # one is to move the joining date back first.
@@ -2239,12 +2250,12 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
             kit.warn,
         ))
 
-    skipped = _skipped_days(periods)
+    skipped = [(p["skipped_day"], p["label"]) for p in reversed(periods) if p.get("skipped_day")]
     if skipped:
         out.append(kit.Spacer(1, 5))
         out.append(kit.Paragraph(
             f"{'Day' if len(skipped) == 1 else 'Days'} in no salary month: "
-            + ", ".join(f"{_dmy(d)} (after {label})" for d, label in skipped)
+            + ", ".join(f"{_fmt_day(d)} (after {label})" for d, label in skipped)
             + ". Months saved before the date fix can end a day early — correct the end date in the app.",
             kit.warn,
         ))

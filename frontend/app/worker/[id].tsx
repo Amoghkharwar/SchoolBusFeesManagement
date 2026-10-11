@@ -44,6 +44,11 @@ interface Period {
   matured: boolean;
   overdue_days: number;
   note?: string;
+  /** Starts before the worker's joining date — saved before that was checked. */
+  before_joining?: boolean;
+  /** "YYYY-MM-DD" of a single day right after this month that no month covers:
+   *  the mark of a month saved before the date fix, ending a day early. */
+  skipped_day?: string | null;
 }
 
 interface Absence {
@@ -962,6 +967,7 @@ export default function WorkerDetail() {
             <PeriodCard
               key={p.id}
               period={p}
+              joinedOn={worker?.join_date}
               canDelete={isAdmin}
               onEdit={() => openMonthModal(p)}
               onDelete={() => setConfirmDeletePeriod(p)}
@@ -1496,8 +1502,26 @@ export default function WorkerDetail() {
   );
 }
 
-function PeriodCard({ period, canDelete, onEdit, onDelete }: { period: Period; canDelete: boolean; onEdit: () => void; onDelete: () => void }) {
+function PeriodCard({ period, joinedOn, canDelete, onEdit, onDelete }: {
+  period: Period; joinedOn?: string; canDelete: boolean; onEdit: () => void; onDelete: () => void;
+}) {
   const { palette } = useTheme();
+  // The same two checks the PDF prints, read from the server's flags. Editing a
+  // month that starts before joining is refused, so its fix comes first.
+  const problems: string[] = [];
+  if (period.before_joining) {
+    problems.push(
+      `Starts before the joining date (${calendarDateToDisplay(joinedOn) || '—'}). Delete this month, ` +
+        'or set the joining date earlier first if the work really happened — until then it can’t be edited.',
+    );
+  }
+  if (period.skipped_day) {
+    const day = calendarDateToDisplay(period.skipped_day);
+    problems.push(
+      `${day} is in no salary month — this month probably ends a day early. ` +
+        (period.before_joining ? `Once the joining date is fixed, edit it to end on ${day}.` : `Edit it to end on ${day}.`),
+    );
+  }
   const meta =
     period.status === 'completed'
       ? { color: palette.success, label: 'Paid' }
@@ -1532,6 +1556,23 @@ function PeriodCard({ period, canDelete, onEdit, onDelete }: { period: Period; c
           </Pressable>
         ) : null}
       </View>
+
+      {problems.length > 0 ? (
+        <View
+          testID={`period-warning-${period.id}`}
+          style={{
+            flexDirection: 'row', gap: 8, marginTop: spacing.sm, padding: spacing.sm,
+            backgroundColor: `${palette.warning}18`, borderWidth: 1, borderColor: palette.warning, borderRadius: radii.md,
+          }}
+        >
+          <Ionicons name="warning-outline" size={16} color={palette.warning} style={{ marginTop: 1 }} />
+          <View style={{ flex: 1, gap: 4 }}>
+            {problems.map((text) => (
+              <Text key={text} style={{ color: palette.onSurface, fontSize: fontSize.sm, lineHeight: 18 }}>{text}</Text>
+            ))}
+          </View>
+        </View>
+      ) : null}
 
       <View style={{ height: 6, backgroundColor: palette.surfaceTertiary, borderRadius: 3, marginTop: spacing.md, overflow: 'hidden' }}>
         <View style={{ width: `${pct * 100}%`, height: '100%', backgroundColor: pct >= 1 ? palette.success : palette.brand }} />

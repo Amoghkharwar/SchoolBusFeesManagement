@@ -5,6 +5,7 @@ import * as Sharing from 'expo-sharing';
 import { apiFileFetch } from '@/src/auth';
 
 import { fileNameFrom } from './filename';
+import { once } from './inflight';
 
 /** A blob's contents as base64, via the FileReader React Native provides. */
 function blobToBase64(blob: Blob): Promise<string> {
@@ -21,7 +22,11 @@ function blobToBase64(blob: Blob): Promise<string> {
  * so it can go to Files, Drive or WhatsApp. Fetched with the token in a header —
  * never in the URL. Resolves to the file name.
  */
-export async function downloadFile(path: string, fallbackName: string): Promise<string> {
+export function downloadFile(path: string, fallbackName: string): Promise<string> {
+  return once(path, () => save(path, fallbackName));
+}
+
+async function save(path: string, fallbackName: string): Promise<string> {
   const res = await apiFileFetch(path);
   const name = fileNameFrom(res, fallbackName);
   const blob = await res.blob();

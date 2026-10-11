@@ -649,10 +649,11 @@ async def student_to_out(doc: Dict[str, Any], fy: Optional[str] = None) -> Dict[
         # Nothing left to fall due — a fully paid fee kept showing the year's
         # first due date as "Next Due".
         next_due = None
-    nd = _parse_dt(next_due)
-    if nd:
-        delta = (datetime.now(timezone.utc) - nd).days
-        overdue_days = max(delta, 0)
+    # Calendar days in India, as salary months count them. Elapsed time rounded
+    # down called a fee due 01/10 at 18:06 "9 days" overdue at 14:05 on 11/10.
+    due_day = _local_day(next_due)
+    if due_day:
+        overdue_days = max((_today() - due_day).days, 0)
     return {
         **{k: v for k, v in doc.items() if k != "_id"},
         "school_name": (school or {}).get("name", "—"),
@@ -2131,6 +2132,32 @@ def _pdf_table(kit, rows: List[List[Any]], widths: List[float],
     return t
 
 
+def _skipped_days(periods: List[Dict[str, Any]]) -> List[Tuple[date, str]]:
+    """Single days a worker's salary months leave out, with the month before
+    each. A one-day hole is what months saved before the date fix look like:
+    the picked end date landed a day early, so 31/08 was stored as 30/08. Two
+    shapes count — a month starting on the 1st that stops the day before the
+    month's last day, and a one-day gap between consecutive months. Longer gaps
+    are left alone; those are usually real (unpaid leave, a break in work)."""
+    spans: List[Tuple[date, date, str]] = []
+    for p in periods:
+        s, e = _period_day(p.get("start_date")), _period_day(p.get("end_date"))
+        if s and e:
+            spans.append((s, e, p["label"]))
+    spans.sort()
+    out: Dict[date, str] = {}
+    for i, (s, e, label) in enumerate(spans):
+        day = e + timedelta(days=1)
+        if any(a <= day <= b for a, b, _ in spans):
+            continue
+        month_last = date(e.year + e.month // 12, e.month % 12 + 1, 1) - timedelta(days=1)
+        short_month = s.day == 1 and (s.year, s.month) == (e.year, e.month) and day == month_last
+        one_day_gap = i + 1 < len(spans) and spans[i + 1][0] == day + timedelta(days=1)
+        if short_month or one_day_gap:
+            out[day] = label
+    return sorted(out.items())
+
+
 async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool) -> List[Any]:
     """One worker's full record: summary, every salary month, every payment and
     the months each payment was applied to. Shared by the single-worker report
@@ -2203,10 +2230,22 @@ async def _worker_flowables(kit, doc_worker: Dict[str, Any], with_heading: bool)
         if joined and _period_day(p.get("start_date")) and _period_day(p["start_date"]) < joined
     ]
     if early:
+        # Editing such a month re-runs the joining-date check, so the way to keep
+        # one is to move the joining date back first.
         out.append(kit.Spacer(1, 5))
         out.append(kit.Paragraph(
             f"Recorded before joining on {_dmy(joined)}: {', '.join(early)}. "
-            "Edit or delete these months in the app.",
+            "Delete these months, or set the joining date earlier first if the work really happened.",
+            kit.warn,
+        ))
+
+    skipped = _skipped_days(periods)
+    if skipped:
+        out.append(kit.Spacer(1, 5))
+        out.append(kit.Paragraph(
+            f"{'Day' if len(skipped) == 1 else 'Days'} in no salary month: "
+            + ", ".join(f"{_dmy(d)} (after {label})" for d, label in skipped)
+            + ". Months saved before the date fix can end a day early — correct the end date in the app.",
             kit.warn,
         ))
 

@@ -806,7 +806,7 @@ export default function WorkerDetail() {
           <Ionicons name="chevron-back" size={24} color={palette.onSurface} />
         </Pressable>
         <Text style={{ flex: 1, fontSize: fontSize.lg, fontWeight: '700', color: palette.onSurface, marginLeft: 8 }}>Worker</Text>
-        <Pressable onPress={downloadPdf} testID="worker-download-pdf" style={{ padding: 6 }}>
+        <Pressable onPress={downloadPdf} disabled={downloading} testID="worker-download-pdf" style={{ padding: 6 }}>
           <Ionicons name={downloading ? 'hourglass-outline' : 'download-outline'} size={22} color={palette.onSurface} />
         </Pressable>
         <Pressable onPress={() => router.push(`/worker/edit/${id}` as any)} testID="worker-edit" style={{ padding: 6 }}>
@@ -1065,6 +1065,7 @@ export default function WorkerDetail() {
             <Pressable
               testID="danger-download-pdf"
               onPress={downloadPdf}
+              disabled={downloading}
               style={{
                 flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
                 paddingVertical: 11, borderRadius: radii.md, marginBottom: spacing.md,

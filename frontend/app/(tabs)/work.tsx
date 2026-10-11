@@ -202,7 +202,7 @@ export default function Work() {
             Work Management
           </Text>
           {items.length > 0 ? (
-            <Pressable onPress={downloadAll} testID="download-all-work" style={{ padding: 6 }}>
+            <Pressable onPress={downloadAll} disabled={downloading} testID="download-all-work" style={{ padding: 6 }}>
               <Ionicons
                 name={downloading ? 'hourglass-outline' : 'download-outline'}
                 size={20}
